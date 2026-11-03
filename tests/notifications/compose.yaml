@@ -31,7 +31,8 @@ services:
       test: ["CMD-SHELL", "pg_isready -U notifications_test -d notifications_test_admin"]
 
   mongo:
-    image: mongo:8.0
+    # mongo:8.0 exits on startup on GitHub Actions Linux kernel >= 6.19 (SERVER-121912 / SERVER-136848).
+    image: mongo:7.0
     command: ["mongod", "--replSet", "notifications-test-rs", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
     ports:
       - "127.0.0.1::27017"
@@ -117,7 +118,7 @@ services:
       test: ["CMD", "/mailpit", "readyz"]
 
   shard-one:
-    image: mongo:8.0
+    image: mongo:7.0
     profiles: ["sharded"]
     command: ["mongod", "--shardsvr", "--replSet", "test-shard-one", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25", "--setParameter", "transactionLifetimeLimitSeconds=60"]
     environment:
@@ -130,7 +131,7 @@ services:
       test: ["CMD", "mongosh", "--quiet", "/init.js"]
 
   shard-two:
-    image: mongo:8.0
+    image: mongo:7.0
     profiles: ["sharded"]
     command: ["mongod", "--shardsvr", "--replSet", "test-shard-two", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25", "--setParameter", "transactionLifetimeLimitSeconds=60"]
     environment:
@@ -143,7 +144,7 @@ services:
       test: ["CMD", "mongosh", "--quiet", "/init.js"]
 
   shard-config:
-    image: mongo:8.0
+    image: mongo:7.0
     profiles: ["sharded"]
     command: ["mongod", "--configsvr", "--replSet", "test-config", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25", "--setParameter", "transactionLifetimeLimitSeconds=60"]
     environment:
@@ -156,7 +157,7 @@ services:
       test: ["CMD", "mongosh", "--quiet", "/init.js"]
 
   shard-router:
-    image: mongo:8.0
+    image: mongo:7.0
     profiles: ["sharded"]
     command: ["mongos", "--configdb", "test-config/shard-config:27017", "--port", "27017", "--bind_ip_all"]
     ports: ["127.0.0.1::27017"]
