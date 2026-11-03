@@ -1,0 +1,194 @@
+@startuml sequence-roles-as-is
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Auth — работа RBAC-кэша (AS-IS)
+
+box "Система аутентификации"
+    participant "AuthorizationService" as svc
+    participant "RedisAuthorizationCache" as cache
+end box
+database "PostgreSQL" as pg
+database "Redis" as redis
+
+note over pg, redis
+  PostgreSQL — источник истины: users, roles, permissions и назначения.
+  Redis не хранит справочник ролей. Он хранит только пользовательские
+  снимки, общую ревизию ролевых правил и временные маркеры блокировки.
+end note
+
+== Проверка права через RBAC-кэш ==
+
+svc -> cache: read_snapshot(user_id)
+cache -> redis: MGET roles-revision, roles-changing,\nuser-changing:{user_id}, user:{user_id}
+
+alt Redis недоступен
+    redis --> cache: RedisError
+    cache --> svc: CacheUnavailableError
+    svc -> pg: SELECT user + effective permissions
+    pg --> svc: is_superuser + permissions
+    note right of svc
+      Проверка продолжается по данным PostgreSQL.
+      Кэш в этом запросе не заполняется.
+    end note
+else Redis доступен
+    redis --> cache: ревизия, общий маркер,\nмаркер пользователя, JSON снимка
+
+    alt найден любой маркер
+        cache --> svc: снимок использовать нельзя + ревизия
+        note right of cache
+          Пока изменение в PostgreSQL не завершено,
+          сохранённому снимку доверять нельзя.
+        end note
+    else снимка нет или JSON повреждён
+        cache --> svc: снимка нет + ревизия
+    else ревизия снимка не совпадает с текущей
+        cache --> svc: снимок устарел + текущая ревизия
+        note right of cache
+          Ролевые правила изменились после
+          создания этого снимка.
+        end note
+    else снимок найден и ревизия совпадает
+        cache --> svc: снимок пользователя
+        note right of svc
+          Данные найдены в кэше:
+          PostgreSQL не нужен.
+        end note
+    end
+
+    opt подходящего снимка нет
+        svc -> pg: SELECT user + effective permissions
+        pg --> svc: is_superuser + permissions
+        svc -> cache: store_snapshot(snapshot,\nexpected_roles_revision)
+        cache -> redis: EVALSHA: записать снимок только при\nтой же ревизии и без маркеров
+        alt ревизия не изменилась и маркеров нет
+            redis --> cache: снимок сохранён со сроком жизни
+        else роли успели измениться
+            redis --> cache: запись отклонена
+            note right of cache
+              Ответ использует данные PostgreSQL,
+              но устаревший снимок в Redis не попадёт.
+            end note
+        else Redis стал недоступен
+            redis --> cache: RedisError
+            cache --> svc: CacheUnavailableError
+            note right of svc
+              Ошибка записывается в журнал.
+              Ответ использует данные PostgreSQL.
+            end note
+        end
+    end
+end
+
+svc -> svc: проверить is_superuser и необходимые права
+
+== Изменение прав одного пользователя ==
+
+note over cache, redis
+  Маркер пользователя — временный ключ Redis.
+  Пока он существует, снимок этого пользователя не читается и не записывается.
+end note
+
+svc -> cache: открыть user_mutation(user_id)
+cache -> redis: SET user-changing:{user_id}\nидентификатор владельца, срок жизни, NX
+
+alt маркер уже занят или Redis недоступен
+    redis --> cache: маркер не установлен
+    cache --> svc: CacheUnavailableError
+    note right of svc
+      Изменение PostgreSQL не начинается.
+    end note
+else маркер установлен
+    redis --> cache: маркер установлен
+    cache --> svc: можно менять данные
+    svc -> pg: INSERT или DELETE user_roles, COMMIT
+
+    alt изменение PostgreSQL завершилось ошибкой
+        pg --> svc: ROLLBACK и ошибка
+        svc -> cache: закрыть user_mutation после ошибки
+    else изменение сохранено
+        pg --> svc: изменения сохранены
+        svc -> cache: закрыть user_mutation после успеха
+    end
+
+    cache -> redis: EVALSHA: проверить владельца,\nудалить снимок и маркер пользователя
+    alt очистка выполнена
+        redis --> cache: снимок и маркер удалены
+    else Redis стал недоступен
+        redis --> cache: RedisError
+        cache -> cache: записать ошибку в журнал;
+        note right of cache
+          Результат PostgreSQL сохраняется.
+          Маркер исчезнет по TTL.
+        end note
+    end
+end
+
+== Изменение общих ролевых правил ==
+
+note over cache, redis
+  Общий маркер — временный ключ Redis.
+  Пока он существует, ни один пользовательский снимок не используется.
+end note
+
+svc -> cache: открыть roles_mutation()
+cache -> redis: SET roles-changing\nидентификатор владельца, срок жизни, NX
+
+alt маркер уже занят или Redis недоступен
+    redis --> cache: маркер не установлен
+    cache --> svc: CacheUnavailableError
+    note right of svc
+      Изменение PostgreSQL не начинается.
+    end note
+else маркер установлен
+    redis --> cache: маркер установлен
+    cache --> svc: можно менять данные
+    svc -> pg: UPDATE или DELETE роли и её прав, COMMIT
+
+    alt изменение PostgreSQL завершилось ошибкой
+        pg --> svc: ROLLBACK и ошибка
+        svc -> cache: закрыть roles_mutation после ошибки
+        cache -> redis: EVALSHA: проверить владельца\nи удалить только общий маркер
+        note right of redis
+          Ревизия остаётся прежней.
+        end note
+    else изменение сохранено
+        pg --> svc: изменения сохранены
+        svc -> cache: закрыть roles_mutation после успеха
+        cache -> redis: EVALSHA: записать новую ревизию\nи удалить общий маркер
+        note right of redis
+          Старые снимки не удаляются массово,
+          но их ревизия больше не подходит.
+        end note
+    end
+    note over cache, redis
+      Ошибка финализации Redis записывается в журнал.
+      Она не заменяет результат операции PostgreSQL.
+      Маркер исчезает по TTL.
+    end note
+end
+
+== Следующая проверка прав после изменения ==
+
+note over svc, redis
+  Во время изменения новый снимок не создаётся.
+  Он будет создан при следующей проверке прав пользователя.
+end note
+
+svc -> cache: read_snapshot(user_id)
+cache -> redis: MGET текущую ревизию, маркеры и снимок
+
+alt менялись права одного пользователя
+    redis --> cache: маркеров нет, снимка пользователя нет
+else менялись общие ролевые правила
+    redis --> cache: маркеров нет,\nревизия снимка не совпадает с текущей
+end
+
+cache --> svc: подходящего снимка нет + текущая ревизия
+svc -> pg: SELECT user + effective permissions
+pg --> svc: is_superuser + permissions
+svc -> cache: store_snapshot(snapshot,\nexpected_roles_revision)
+cache -> redis: EVALSHA: проверить ревизию и маркеры,\nзаписать новый снимок
+redis --> cache: новый снимок сохранён
+
+@enduml

@@ -1,0 +1,9 @@
+Django==5.0.4
+psycopg[binary]==3.1.18
+pydantic-settings>=2.9,<3
+split-settings==1.0.0
+uwsgi==2.0.20
+django-extensions==3.2.3
+django-cors-headers==4.3.1
+httpx==0.28.1
+backoff==2.2.1

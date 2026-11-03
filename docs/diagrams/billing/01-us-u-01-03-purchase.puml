@@ -1,0 +1,95 @@
+@startuml 01-us-u-01-03-purchase
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam dpi 110
+skinparam maxMessageSize 250
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign center
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #94A3B8
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+    DividerBackgroundColor #E2E8F0
+    DividerBorderColor #64748B
+}
+
+title Покупка подписки, результат оплаты и повтор при отказе (US-U-01, US-U-02, US-U-03)
+
+autonumber
+
+actor "Пользователь" as user
+participant "Billing" as bil
+participant "ЮKassa" as yk
+participant "Auth" as auth
+participant "Notifications" as ntf
+
+== 1. Основной сценарий (Happy Path) ==
+
+user -> bil: Нажимает «Оформить за 299 ₽»
+bil -> bil: Сохраняет платёж «Ожидает оплаты» (с ключом идемпотентности)
+bil -> yk: Создаёт платёж на 299 ₽
+yk --> bil: Ссылка на страницу оплаты
+bil --> user: Перенаправляет в ЮKassa
+
+user -> yk: Вводит карту и подтверждает оплату
+yk --> user: Возвращает на страницу «Результат оплаты» (/billing/payments/{id})
+yk -> bil: Вебхук о платеже (или фоновая сверка старше X с — единое место проведения)
+bil -> yk: Запрашивает статус платежа через GET (единственный источник истины)
+yk --> bil: Статус: «Оплачен» (succeeded)
+
+bil -> bil: Создаёт подписку на 30 дней (до даты T) и задачи в очередь доставки (outbox)
+bil -> auth: Открывает доступ к новинкам до даты T (версия V+1)
+bil -> ntf: Отправляет письмо об оплате и планирует письмо об окончании на дату T
+
+user -> bil: Открывает «Результат оплаты» (GET /billing/payments/{id})
+bil -> bil: Читает локальный статус из собственной БД (в ЮKassa НЕ ходит)
+bil --> user: Показывает «Оплата прошла, доступ открыт до T»
+
+== 2. Краевые случаи и сбои ==
+
+group Переход на «Продолжить оплату» (/billing/payments/{id}/continue) или повторное нажатие
+    user -> bil: Переходит на /continue (или повторно жмёт покупку)
+    bil -> bil: 1) Сначала проверяет локальный статус платежа в БД
+    bil -> yk: 2) Если локально «Ожидает оплаты» — запрашивает статус в ЮKassa (GET)
+    yk --> bil: Если в ЮKassa pending -> редирект на сохранённую ссылку оплаты;\nесли в ЮKassa canceled -> помечает текущий «Не оплачен», сразу создаёт новый платёж и редиректит на него
+end
+
+group Подписка уже активна (или идёт возврат прошлой подписки)
+    user -> bil: Нажимает «Оформить за 299 ₽»
+    bil --> user: 409 Отказ: «Подписка уже активна» (запрос в ЮKassa не отправляется)
+end
+
+group Оплата по карте не прошла и повторная покупка (US-U-03)
+    bil -> yk: Запрашивает статус платежа (GET)
+    yk --> bil: Статус: «Отменён» (canceled) + причина отказа
+    bil -> bil: Переводит платёж в «Не оплачен»
+    bil -> ntf: Отправляет письмо о неуспешной оплате со ссылкой на повтор
+    bil --> user: Показывает «Оплата не прошла» и кнопку «Повторить» (создаёт новый платёж)
+end
+
+group Пользователь закрыл вкладку ЮKassa (или вебхук не дошёл)
+    bil -> yk: Фоновая сверка (каждые 30 с, для операций старше X с) запрашивает статус (GET)
+    yk --> bil: Статус: «Оплачен»
+    bil -> auth: Открывает доступ до даты T
+    bil -> ntf: Отправляет письмо об оплате
+end
+
+group Сбой связи: ЮKassa не ответила при создании платежа
+    bil -[#DC2626]>x yk: Тайм-аут или ошибка 5xx
+    bil --> user: Экран ошибки «Попробуйте ещё раз» (повтор идёт с тем же ключом)
+end
+
+group Сбой связи: Auth или Notifications временно недоступны после оплаты
+    bil -[#DC2626]>x auth: Ошибка связи при выдаче доступа
+    bil --> user: Показывает «Оплачено, доступ активируется»
+    bil -> auth: Фоновый воркер доставляет доступ сразу после восстановления Auth
+end
+
+@enduml

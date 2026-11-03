@@ -1,0 +1,82 @@
+name: auth-functional
+
+services:
+  auth-tests:
+    profiles: ["test"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: test
+    env_file:
+      - ./functional.env
+    environment:
+      POSTGRES_HOST: auth-db
+      POSTGRES_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      TRACING_ENABLED: "false"
+      RATE_LIMIT_ENABLED: "true"
+      YANDEX_OAUTH_ENABLED: "false"
+    depends_on:
+      auth-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  auth:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    env_file:
+      - ./functional.env
+    environment:
+      POSTGRES_HOST: auth-db
+      POSTGRES_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      TRACING_ENABLED: "false"
+      RATE_LIMIT_ENABLED: "false"
+      YANDEX_OAUTH_ENABLED: "false"
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        alembic upgrade head &&
+        PYTHONPATH=src python -c "import asyncio, os;
+        from cli import _create_superuser;
+        asyncio.run(_create_superuser(
+        os.environ['AUTH_FUNCTIONAL_SUPERUSER_LOGIN'],
+        os.environ['AUTH_FUNCTIONAL_SUPERUSER_PASSWORD'],
+        os.environ['AUTH_FUNCTIONAL_SUPERUSER_TZ']))" &&
+        exec uvicorn main:app --app-dir src --host 0.0.0.0 --port 8000
+    ports:
+      - "${AUTH_FUNCTIONAL_PORT}:8000"
+    depends_on:
+      auth-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  auth-db:
+    image: postgres:16
+    env_file:
+      - ./functional.env
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20

@@ -1,0 +1,49 @@
+@startuml ugc-events-health-sequence-as-is
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam dpi 150
+skinparam maxMessageSize 90
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #64748B
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    BoxBorderColor #94A3B8
+    BoxBackgroundColor #F8FAFC
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+}
+
+title UGC Events API — healthcheck (AS-IS)
+
+autonumber
+
+actor "Система мониторинга" as monitor
+participant "Gateway\nNginx" as gateway
+
+box "Сервис пользовательских действий" #ECFDF5
+    participant "UGC Events API" as ugc
+end box
+
+participant "Kafka\nтопик ugc.events" as kafka
+
+monitor -> gateway: GET /ugc/health
+gateway -> ugc: GET /api/v1/health/\nX-Request-Id
+ugc -> kafka: запросить метаданные топика ugc.events
+
+alt топик существует и брокер отвечает
+    kafka --> ugc: список партиций
+    ugc --> gateway: 200 {status: ok, kafka: ok}
+    gateway --> monitor: 200 тот же ответ
+else брокер недоступен или топик отсутствует
+    kafka --> ugc: ошибка метаданных
+    ugc --> gateway: 503 {status: unavailable, kafka: unavailable}
+    gateway --> monitor: 503 тот же ответ
+end
+
+@enduml

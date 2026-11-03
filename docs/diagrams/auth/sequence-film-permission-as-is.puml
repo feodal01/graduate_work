@@ -1,0 +1,92 @@
+@startuml sequence-film-permission-as-is
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Auth — проверка доступа к фильму (AS-IS)
+
+participant "Movies API" as movies
+box "Сервис Auth"
+    participant "Auth API" as api
+    participant "AuthenticationService /\nAuthorizationService" as svc
+    participant "RedisTokenSessionStore" as sessions
+end box
+database "Auth Redis" as redis
+
+note over movies, redis
+  Movies API передаёт атрибуты фильма.
+  Auth возвращает только решение о доступе.
+  Работа RBAC-кэша описана в sequence-roles-as-is.puml.
+end note
+
+movies -> api: POST /api/v1/auth/permissions/check\n{ resource: film, action: read,\n  attributes: { creation_date: date или null } }\nX-Service-Key, X-Request-Id\nAuthorization: Bearer access (опционально)
+api -> api: проверить X-Service-Key
+
+break сервисный ключ неверен
+    api --> movies: 401 Invalid service credentials
+end
+
+api -> redis: EVALSHA Token Bucket\npolicy=service, identity=movies-api
+
+alt bucket разрешает запрос
+    redis --> api: allowed=1
+else Redis недоступен по соединению или timeout
+    redis --> api: RateLimitStoreUnavailableError
+    api -> api: fail-open; продолжить запрос
+else bucket пуст
+    break запрос завершён
+        redis --> api: allowed=0 + retry_after
+        api --> movies: 429 Too many requests\nRetry-After
+    end
+else Lua или результат Token Bucket неверен
+    break запрос завершён
+        redis --> api: внутренняя ошибка limiter
+        api --> movies: 500 Internal Server Error
+    end
+end
+
+opt Токен доступа передан
+    api -> svc: проверить подпись, срок, type=access\nи обязательный session_epoch=V0
+    svc -> sessions: is_access_valid(user_id, jti, V0)
+    sessions -> redis: EVALSHA: версия == V0 AND блокировка отсутствует\nAND revoked-access:<jti> отсутствует
+
+    break JWT недействителен, версия устарела, блокировка установлена\nили токен доступа отозван
+        api --> movies: 401 Unauthorized
+    end
+
+    break Состояние сессий в Redis недоступно
+        redis --> sessions: RedisError
+        api --> movies: 503 Cache is unavailable
+    end
+end
+
+api -> svc: применить FilmAccessPolicy
+svc -> svc: определить необходимые разрешения\nпо creation_date
+
+alt известная дата подтверждает возраст не меньше 3 лет
+    api --> movies: 200 { allowed: true }
+else дата отсутствует или фильм младше 3 лет
+    svc -> svc: требуется films.early_access:read
+    alt токен доступа отсутствует
+        api --> movies: 200 { allowed: false }
+    else суперпользователь
+        ref over svc, redis
+          Проверка снимка пользователя описана
+          в sequence-roles-as-is.puml
+        end ref
+        api --> movies: 200 { allowed: true }
+    else роль даёт films.early_access:read
+        ref over svc, redis
+          Проверка снимка пользователя описана
+          в sequence-roles-as-is.puml
+        end ref
+        api --> movies: 200 { allowed: true }
+    else права недостаточно
+        ref over svc, redis
+          Проверка снимка пользователя описана
+          в sequence-roles-as-is.puml
+        end ref
+        api --> movies: 200 { allowed: false }
+    end
+end
+
+@enduml

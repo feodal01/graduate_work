@@ -1,0 +1,144 @@
+@startuml auth-yandex-callback-sequence-as-is
+scale 0.62
+skinparam dpi 160
+skinparam maxMessageSize 90
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Auth — callback зарегистрированного провайдера Yandex (AS-IS)
+
+actor "Пользователь" as user
+participant "Браузер" as browser
+participant "Nginx gateway" as gateway
+box "Auth-сервис"
+    participant "GET /api/v1/auth/social/{provider_name}/callback" as api
+    participant "SocialAuthenticationService" as service
+    participant "AuthenticationService" as authentication
+    participant "YandexOAuthClient" as client
+end box
+database "auth-redis\nсостояние OAuth и токены обновления" as redis
+database "auth-db" as postgres
+participant "Яндекс ID" as yandex
+
+note over gateway
+  Текущий лимит Nginx по IP может вернуть HTTP 429
+  до передачи запроса в Auth.
+end note
+
+note over service, redis
+  Connection error или timeout GETDEL возвращает
+  503 OAuth state store is unavailable.
+end note
+
+note over client, yandex
+  Token exchange не повторяется.
+  GET /info повторяется ограниченно для timeout,
+  connection error, HTTP 429 и HTTP 5xx.
+  Неверный контракт Яндекса возвращает HTTP 502.
+end note
+
+note over api
+  Неизвестный provider_name возвращает HTTP 404.
+  Отключённый Yandex OAuth возвращает HTTP 503.
+  Отсутствующий state, одновременно code и error
+  или отсутствие code и error возвращают HTTP 400.
+end note
+
+user -> yandex: войти и подтвердить доступ
+
+alt пользователь отменил вход
+    yandex --> browser: redirect callback?error=access_denied&state=oauth-state
+    browser -> gateway: GET /api/v1/auth/social/yandex/callback
+    gateway -> api: provider_name=yandex + error + state + X-Request-Id
+    api -> api: разрешить зарегистрированный provider=yandex
+    api -> service: отменить OAuth-вход
+    service -> redis: GETDEL oauth-state:<sha256(state)>
+    alt state отсутствует или истёк
+        redis --> service: значение отсутствует
+        service --> api: InvalidOAuthStateError
+        api --> gateway: 400 OAuth state is invalid or expired
+    else state действителен
+        redis --> service: code_verifier удалён
+        service --> api: SocialAuthenticationRejectedError
+        api --> gateway: 400 Yandex authentication was cancelled
+    end
+    gateway --> browser: 400
+else Яндекс выдал code
+    yandex --> browser: redirect callback?code=auth-code&state=oauth-state
+    browser -> gateway: GET /api/v1/auth/social/yandex/callback
+    gateway -> api: provider_name=yandex + code + state + X-Request-Id
+    api -> api: разрешить зарегистрированный provider=yandex
+    api -> service: завершить OAuth-вход
+    service -> redis: GETDEL oauth-state:<sha256(state)>
+
+    alt state отсутствует, истёк или уже использован
+        redis --> service: значение отсутствует
+        service --> api: InvalidOAuthStateError
+        api --> gateway: 400 OAuth state is invalid or expired
+        gateway --> browser: 400
+    else state действителен
+        redis --> service: code_verifier
+        service -> client: exchange_code(code, code_verifier)
+        client -> yandex: POST https://oauth.yandex.ru/token\nBasic client credentials + code + PKCE
+
+        alt code неверен или истёк
+            yandex --> client: invalid_grant
+            client --> service: InvalidOAuthCodeError
+            service --> api: InvalidOAuthCodeError
+            api --> gateway: 400 OAuth code is invalid or expired
+            gateway --> browser: 400
+        else Яндекс недоступен
+            yandex --> client: timeout, connection error или 5xx
+            client --> service: SocialProviderUnavailableError
+            service --> api: SocialProviderUnavailableError
+            api --> gateway: 503 Yandex OAuth is unavailable
+            gateway --> browser: 503
+        else токен получен
+            yandex --> client: access_token
+            client -> yandex: GET https://login.yandex.ru/info\nAuthorization: OAuth access_token
+            yandex --> client: id, login, email, имя, фамилия
+            client --> service: SocialIdentity(provider=yandex)
+            service -> postgres: SELECT social_account по provider + provider_user_id
+
+            alt связь существует
+                postgres --> service: локальный пользователь
+                service -> postgres: обновить имя, фамилию и email связи
+            else связи нет
+                postgres --> service: не найдено
+                service -> postgres: транзакция: INSERT user с password=NULL\nи INSERT social_account без ролей
+                note right of postgres
+                  Совпадение email или login
+                  не связывает аккаунты автоматически.
+                  При конфликте используется
+                  технический login yandex_<id>.
+                end note
+            end
+
+            service -> authentication: issue_session(user, client)
+            authentication -> redis: EVALSHA: блокировка отсутствует;\nGET текущую версию или SET NX новый UUID
+            alt блокировка смены пароля установлена или Redis недоступен
+                redis --> authentication: false / RedisError
+                api --> gateway: 503 Cache is unavailable
+                gateway --> browser: 503
+            else текущая версия V0
+                redis --> authentication: V0
+                authentication -> postgres: INSERT login_history, COMMIT
+                authentication -> authentication: выпустить токены доступа и обновления\nс session_epoch=V0
+                authentication -> redis: EVALSHA: версия == V0 AND блокировка отсутствует;\nSET refresh:<jti> user_id EX срок
+                alt версия изменилась, блокировка появилась или Redis недоступен
+                    redis --> authentication: 0 / RedisError
+                    api --> gateway: 503 Cache is unavailable
+                    gateway --> browser: 503
+                else токен обновления сохранён
+                    redis --> authentication: 1
+                    authentication --> service: IssuedTokenPair
+                    service --> api: TokenPairResponse
+                    api --> gateway: 200 access_token + refresh_token
+                    gateway --> browser: 200 JSON
+                end
+            end
+        end
+    end
+end
+
+@enduml

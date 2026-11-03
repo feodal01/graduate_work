@@ -1,0 +1,38 @@
+[
+  {
+    "event_id": "20000000-0000-4000-8000-000000000001",
+    "event_type": "film.published",
+    "film_id": "30000000-0000-4000-8000-000000000001",
+    "film_version": 1,
+    "catalog_published_at": "2026-10-10T12:00:00Z",
+    "catalog_updated_at": "2026-10-10T12:00:00+00:00",
+    "title": "Новый фильм",
+    "description": null,
+    "creation_date": "2026-10-01",
+    "imdb_rating": null,
+    "genres": [
+      {
+        "id": "40000000-0000-4000-8000-000000000001",
+        "name": "Комедия"
+      }
+    ]
+  },
+  {
+    "event_id": "20000000-0000-4000-8000-000000000002",
+    "event_type": "film.updated",
+    "film_id": "30000000-0000-4000-8000-000000000001",
+    "film_version": 2,
+    "catalog_published_at": "2026-10-10T12:00:00Z",
+    "catalog_updated_at": "2026-10-10T13:00:00Z",
+    "title": "Новый фильм",
+    "description": null,
+    "creation_date": null,
+    "imdb_rating": 7.5,
+    "genres": [
+      {
+        "id": "40000000-0000-4000-8000-000000000001",
+        "name": "Комедия"
+      }
+    ]
+  }
+]

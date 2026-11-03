@@ -1,0 +1,252 @@
+@startuml sequence-authentication-as-is
+scale 0.58
+skinparam dpi 160
+skinparam maxMessageSize 100
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Auth — вход, версия сессий и личный кабинет (AS-IS)
+
+actor "Зритель" as viewer
+participant "Сайт / ЛК" as web
+box "Auth-сервис"
+    participant "Маршрут FastAPI" as api
+    participant "AuthenticationService" as svc
+    participant "RedisTokenSessionStore" as sessions
+end box
+database "auth-db\nPostgreSQL" as pg
+database "auth-redis" as redis
+
+note over api, redis
+  Все маршруты требуют X-Request-Id.
+  Token Bucket и трассировка описаны в отдельных AS-IS схемах.
+  Токены доступа и обновления проверяют session_epoch только через Redis.
+end note
+
+== POST /api/v1/auth/signup ==
+
+viewer -> web: логин и пароль
+web -> api: POST /api/v1/auth/signup
+api -> svc: проверить данные и создать пользователя
+svc -> svc: нормализовать логин, проверить и хешировать пароль
+svc -> pg: INSERT user, COMMIT, REFRESH
+
+alt логин уже занят
+    pg --> svc: unique violation, ROLLBACK
+    api --> web: 409 Login already taken
+else PostgreSQL недоступна
+    pg --> svc: DatabaseUnavailableError
+    api --> web: 503 Database is unavailable
+else пользователь создан
+    pg --> svc: user
+    api --> web: 201 UserResponse
+end
+
+== POST /api/v1/auth/login ==
+
+viewer -> web: логин и пароль
+web -> api: POST /api/v1/auth/login
+api -> svc: проверить учётные данные и выдать пару JWT
+svc -> pg: SELECT user.id по логину
+
+break логин не найден
+    pg --> svc: отсутствует
+    api --> web: 401 Invalid credentials
+end
+
+svc -> sessions: get_or_create_epoch(user_id)
+sessions -> redis: EVALSHA: блокировка отсутствует;\nGET текущую версию или SET NX новый UUID
+
+break блокировка установлена, версия повреждена или Redis недоступен
+    redis --> sessions: false / RedisError
+    api --> web: 503 Cache is unavailable
+end
+
+redis --> sessions: текущая версия V0
+svc -> pg: SELECT user по id
+svc -> svc: проверить логин и хеш пароля
+
+break пользователь удалён, хеш отсутствует или пароль неверен
+    api --> web: 401 Invalid credentials
+end
+
+svc -> pg: INSERT login_history, COMMIT
+svc -> svc: выпустить токены доступа и обновления\nс подписанным session_epoch=V0
+svc -> sessions: store_refresh(jti, user_id, V0, срок)
+sessions -> redis: EVALSHA: версия == V0 AND блокировка отсутствует;\nSET refresh:<jti> user_id EX срок
+
+alt версия изменилась или началась смена пароля
+    redis --> sessions: 0
+    api --> web: 503 Session state changed
+else Redis недоступен
+    redis --> sessions: RedisError
+    api --> web: 503 Cache is unavailable
+else токен обновления сохранён
+    redis --> sessions: 1
+    api --> web: 200 { access_token, refresh_token }
+end
+
+== POST /api/v1/auth/refresh ==
+
+web -> api: POST /api/v1/auth/refresh { refresh_token }
+api -> svc: обменять токен обновления на новую пару
+svc -> svc: проверить подпись, exp, type=refresh\nи обязательный session_epoch=V0
+
+break JWT неверен или истёк
+    api --> web: 401 Invalid refresh token
+end
+
+svc -> svc: выпустить новую пару с V0
+svc -> sessions: rotate_refresh(old_jti, new_jti, user_id, V0, срок)
+sessions -> redis: EVALSHA: блокировка отсутствует, версия == V0;\nпроверить old_jti; DEL old; SET new EX срок
+
+alt блокировка установлена, версия устарела, токен неизвестен или использован повторно
+    redis --> sessions: 0
+    api --> web: 401 Invalid refresh token
+else Redis недоступен
+    redis --> sessions: RedisError
+    api --> web: 503 Cache is unavailable
+else ротация выполнена или повторена с тем же new_jti
+    redis --> sessions: 1
+    api --> web: 200 { access_token, refresh_token }
+end
+
+== Общая проверка токена доступа ==
+
+note over svc, redis
+  GET /profile показан в auth-current-profile-sequence-as-is.puml.
+  PATCH /profile, GET /login-history и POST /logout используют эту проверку.
+  Управление ролями и необязательный токен permissions/check используют её же.
+end note
+
+api -> svc: authenticate_access(JWT доступа)
+svc -> svc: проверить подпись, exp, type=access\nи обязательный session_epoch=V0
+
+break JWT отсутствует, неверен или истёк
+    api --> web: 401 Invalid token / Token expired
+end
+
+svc -> sessions: is_access_valid(user_id, jti, V0)
+sessions -> redis: EVALSHA: версия == V0 AND блокировка отсутствует\nAND revoked-access:<jti> отсутствует
+
+alt версия устарела, блокировка установлена или токен отозван
+    redis --> sessions: 0
+    api --> web: 401 Token revoked
+else Redis недоступен
+    redis --> sessions: RedisError
+    api --> web: 503 Cache is unavailable
+else токен доступа действителен
+    redis --> sessions: 1
+    svc --> api: CurrentUser(user_id, jti, V0, exp)
+end
+
+== PATCH /api/v1/auth/profile: только логин ==
+
+viewer -> web: новый логин
+web -> api: PATCH /api/v1/auth/profile\nAuthorization: Bearer access
+api -> svc: общая проверка токена доступа
+api -> svc: update_profile(new_login, password=None)
+svc -> pg: SELECT user по CurrentUser.user_id
+svc -> pg: UPDATE login, COMMIT, REFRESH
+
+alt логин занят
+    pg --> svc: unique violation, ROLLBACK
+    api --> web: 409 Login already taken
+else PostgreSQL недоступна
+    pg --> svc: DatabaseUnavailableError
+    api --> web: 503 Database is unavailable
+else логин изменён
+    note over svc, redis
+      Смена только логина не меняет версию сессий.
+      Остальные сессии пользователя продолжают работать.
+    end note
+    api --> web: 200 UserResponse
+end
+
+== PATCH /api/v1/auth/profile: новый пароль ==
+
+viewer -> web: новый пароль и необязательный логин
+web -> api: PATCH /api/v1/auth/profile\nAuthorization: Bearer access
+api -> svc: общая проверка токена доступа → CurrentUser(V0)
+svc -> pg: SELECT user по id
+svc -> svc: проверить и хешировать новый пароль
+svc -> sessions: password_change(user_id, expected_epoch=V0)
+sessions -> redis: EVALSHA начала: версия == V0;\nSET changing owner NX EX 120; SET версия V1
+
+alt текущая версия уже не V0
+    redis --> sessions: stale (-1), Redis не изменён
+    api --> web: 401 Token revoked
+else блокировка уже установлена
+    redis --> sessions: busy (0), Redis не изменён
+    api --> web: 503 Password change is already in progress
+else Redis недоступен
+    redis --> sessions: RedisError
+    api --> web: 503 Cache is unavailable
+else блокировка установлена, версия V1
+    note over web, redis
+      Все токены с V0 уже отозваны.
+      Блокировка запрещает вход, проверку токенов и новую смену пароля.
+    end note
+    svc -> pg: UPDATE login? и password_hash, COMMIT, REFRESH
+
+    alt логин занят или PostgreSQL завершил изменение ошибкой
+        pg --> svc: domain error / DatabaseUnavailableError, ROLLBACK
+        sessions -> redis: EVALSHA завершения (ошибка):\nудалить changing своего владельца; оставить версию V1
+        note over svc, redis
+          Ошибка Redis при снятии блокировки записывается в журнал,
+          но не подменяет исходную ошибку PostgreSQL.
+        end note
+        api --> web: 409 Login already taken / 503 Database is unavailable
+    else PostgreSQL успешно зафиксировал изменение
+        pg --> svc: User
+        sessions -> redis: EVALSHA завершения (успех):\nSET версия V2; DEL changing своего владельца
+        alt завершение не подтверждено или сменился владелец
+            redis --> sessions: RedisError / 0
+            api --> web: 503 Cache is unavailable
+        else версия V2, блокировка снята
+            redis --> sessions: 1
+            api --> web: 200 UserResponse
+            note over web
+              Клиент удаляет старую пару и выполняет новый вход.
+            end note
+        end
+    end
+end
+
+== GET /api/v1/auth/login-history ==
+
+viewer -> web: открыть историю входов
+web -> api: GET /api/v1/auth/login-history\nAuthorization: Bearer access
+api -> svc: общая проверка токена доступа
+svc -> pg: SELECT login_history по user_id\nORDER BY logged_at DESC
+
+alt PostgreSQL недоступна
+    pg --> svc: DatabaseUnavailableError
+    api --> web: 503 Database is unavailable
+else успех
+    pg --> svc: записи текущего пользователя
+    api --> web: 200 LoginHistoryResponse[]
+end
+
+== POST /api/v1/auth/logout ==
+
+viewer -> web: выйти из текущей сессии
+web -> api: POST /api/v1/auth/logout { refresh_token }\nAuthorization: Bearer access
+api -> svc: общая проверка токена доступа
+svc -> svc: декодировать токен обновления; принять jti,\nтолько если user_id совпадает
+svc -> sessions: revoke_session(refresh_jti?, access_jti, срок токена доступа)
+sessions -> redis: MULTI/EXEC: DEL refresh:<jti>, если известен;\nSET revoked-access:<access_jti> 1 EX срок токена доступа
+
+alt Redis недоступен
+    redis --> sessions: RedisError
+    api --> web: 503 Cache is unavailable
+else транзакция выполнена
+    redis --> sessions: OK
+    api --> web: 204 No Content
+    note over sessions, redis
+      Выход не меняет версию сессий пользователя.
+      Другие устройства продолжают работать.
+    end note
+end
+
+@enduml

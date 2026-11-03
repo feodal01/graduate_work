@@ -1,0 +1,13 @@
+{
+  "folders": [
+    { "name": "Repository", "path": "." },
+    { "name": "Auth", "path": "services/auth" },
+    { "name": "Notifications", "path": "services/notifications" },
+    { "name": "Movies API", "path": "services/movies-api" },
+    { "name": "Movies ETL", "path": "services/movies-etl" },
+    { "name": "UGC Events", "path": "services/ugc-events" },
+    { "name": "UGC ETL", "path": "services/ugc-etl" },
+    { "name": "UGC API", "path": "services/ugc-api" },
+    { "name": "Admin", "path": "services/admin" }
+  ]
+}

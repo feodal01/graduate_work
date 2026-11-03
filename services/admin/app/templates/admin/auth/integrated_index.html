@@ -1,0 +1,15 @@
+{% extends "admin/index.html" %}
+
+{% block content %}
+<div class="module">
+  <table>
+    <caption>Auth roles</caption>
+    <tr>
+      <th scope="row"><a href="{% url 'admin:auth_role_list' %}">Manage roles</a></th>
+      <td><a href="{% url 'admin:auth_user_role_add' %}">Assign role</a></td>
+      <td><a href="{% url 'admin:auth_user_role_delete' %}">Revoke role</a></td>
+    </tr>
+  </table>
+</div>
+{{ block.super }}
+{% endblock %}

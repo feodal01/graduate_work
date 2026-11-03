@@ -1,0 +1,59 @@
+@startuml admin-logout-sequence-as-is
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam dpi 150
+skinparam maxMessageSize 90
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #64748B
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    BoxBorderColor #94A3B8
+    BoxBackgroundColor #F8FAFC
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+}
+
+title Django Admin — выход (AS-IS)
+
+autonumber
+
+actor "Администратор" as operator
+participant "Gateway\nNginx" as gateway
+
+box "Сервис Admin" #FFF7ED
+    participant "Django Admin" as admin
+    database "Django sessions\nв theatre-db" as sessions
+end box
+
+participant "Auth API" as auth
+
+operator -> gateway: POST /admin/logout/\nsession cookie + CSRF token
+gateway -> admin: POST /admin/logout/
+admin -> sessions: загрузить access и refresh
+sessions --> admin: токены или пустая сессия
+
+opt токены Auth найдены
+    admin -> auth: POST /api/v1/auth/logout\n{refresh_token} + Bearer access\nповтор только при ошибке установки соединения
+    alt Auth принял выход
+        auth --> admin: 204 No Content
+    else Auth отклонил токены
+        auth --> admin: 401 Unauthorized
+    else Auth ограничил запрос
+        auth --> admin: 429 Too many requests\nRetry-After
+    else Auth недоступен или вернул 5xx
+        auth --> admin: допустимый повтор исчерпан\nили ошибка ответа
+    end
+end
+
+admin -> sessions: всегда удалить локальную сессию
+sessions --> admin: сессия удалена
+admin --> gateway: 302 /admin/login/
+gateway --> operator: 302 /admin/login/ + удалить session cookie
+
+@enduml

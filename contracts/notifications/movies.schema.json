@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "event_type": {
+      "enum": [
+        "film.published",
+        "film.updated"
+      ]
+    },
+    "film_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "film_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "catalog_published_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "(Z|\\+00:00)$"
+    },
+    "catalog_updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "(Z|\\+00:00)$"
+    },
+    "title": {
+      "type": "string"
+    },
+    "description": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "creation_date": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date"
+    },
+    "imdb_rating": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "genres": {
+      "type": "array",
+      "items": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "event_id",
+    "event_type",
+    "film_id",
+    "film_version",
+    "catalog_published_at",
+    "catalog_updated_at",
+    "title",
+    "description",
+    "creation_date",
+    "imdb_rating",
+    "genres"
+  ],
+  "additionalProperties": false
+}

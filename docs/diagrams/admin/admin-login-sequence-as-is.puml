@@ -1,0 +1,156 @@
+@startuml admin-login-sequence-as-is
+scale 0.8
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam dpi 85
+skinparam maxMessageSize 90
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #64748B
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    BoxBorderColor #94A3B8
+    BoxBackgroundColor #F8FAFC
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+}
+
+title Django Admin — вход через Auth (AS-IS)
+
+autonumber
+
+actor "Администратор" as operator
+participant "Gateway\nNginx" as gateway
+
+box "Сервис Admin" #FFF7ED
+    participant "Django Admin" as admin
+    participant "AuthServiceBackend" as backend
+    database "User + AuthIdentity\nв theatre-db" as users
+    database "Django sessions\nв theatre-db" as sessions
+end box
+
+participant "Auth API" as auth
+
+note over backend, auth
+  Клиент делает не больше двух попыток с exponential backoff и full jitter.
+  Ошибка установки соединения допускает повтор любого метода.
+  GET также допускает повтор ошибки чтения, удалённого протокола и HTTP 502, 503, 504.
+  POST не повторяется после ошибки ответа.
+end note
+
+note over operator, auth
+  POST /api/v1/auth/signup создаёт пользователя только в Auth.
+  Admin не создаёт локальную запись во время signup.
+end note
+
+operator -> gateway: GET /admin/login/
+gateway -> admin: GET /admin/login/
+admin --> gateway: 200 форма входа + CSRF token
+gateway --> operator: 200 форма входа + CSRF token
+
+operator -> gateway: POST /admin/login/\nlogin + password + CSRF token
+gateway -> admin: POST /admin/login/
+admin -> backend: authenticate(request, login, password)
+backend -> auth: POST /api/v1/auth/login\n{login, password}\nповтор только при ошибке установки соединения
+
+alt неверный логин или пароль
+    auth --> backend: 401 Invalid credentials
+    backend --> admin: вход отклонён
+    admin --> gateway: 200 форма с ошибкой
+    gateway --> operator: 200 форма с ошибкой
+else Auth ограничил вход
+    auth --> backend: 429 Too many requests\nRetry-After
+    backend --> admin: Auth rate limited
+    admin --> gateway: 429 страница ограничения\nRetry-After
+    gateway --> operator: 429 Too many requests\nRetry-After
+else Auth недоступен
+    auth --> backend: допустимый повтор исчерпан,\ntransport error или 5xx
+    backend --> admin: Auth temporarily unavailable
+    admin --> gateway: 503 Auth temporarily unavailable
+    gateway --> operator: 503 Auth temporarily unavailable
+else Auth выдал токены
+    auth --> backend: 200 access_token + refresh_token\n+ token_type
+    backend -> auth: GET /api/v1/auth/profile\nAuthorization: Bearer access\nдопустим безопасный повтор GET
+
+    alt профиль отклонён
+        auth --> backend: 401 Unauthorized
+        backend --> admin: вход отклонён
+        admin --> gateway: 200 форма с ошибкой
+        gateway --> operator: 200 форма с ошибкой
+    else Auth ограничил чтение профиля
+        auth --> backend: 429 Too many requests\nRetry-After
+        backend --> admin: Auth rate limited
+        admin --> gateway: 429 страница ограничения\nRetry-After
+        gateway --> operator: 429 Too many requests\nRetry-After
+    else Auth недоступен при чтении профиля
+        auth --> backend: допустимый повтор исчерпан,\nошибка ответа или HTTP 500
+        backend --> admin: Auth temporarily unavailable
+        admin --> gateway: 503 Auth temporarily unavailable
+        gateway --> operator: 503 Auth temporarily unavailable
+    else профиль получен
+        auth --> backend: 200 id, login, first_name,\nlast_name, created_at
+        backend -> auth: GET /api/v1/auth/roles\nAuthorization: Bearer access\nдопустим безопасный повтор GET
+
+        alt административного права нет
+            auth --> backend: 403 Forbidden
+            backend --> admin: вход отклонён
+            admin --> gateway: 200 форма с ошибкой
+            gateway --> operator: 200 форма с ошибкой
+        else access-токен отклонён
+            auth --> backend: 401 Unauthorized
+            backend --> admin: вход отклонён
+            admin --> gateway: 200 форма с ошибкой
+            gateway --> operator: 200 форма с ошибкой
+        else Auth ограничил проверку права
+            auth --> backend: 429 Too many requests\nRetry-After
+            backend --> admin: Auth rate limited
+            admin --> gateway: 429 страница ограничения\nRetry-After
+            gateway --> operator: 429 Too many requests\nRetry-After
+        else Auth недоступен при проверке права
+            auth --> backend: допустимый повтор исчерпан,\nошибка ответа или HTTP 500
+            backend --> admin: Auth temporarily unavailable
+            admin --> gateway: 503 Auth temporarily unavailable
+            gateway --> operator: 503 Auth temporarily unavailable
+        else административное право подтверждено
+            auth --> backend: 200 список ролей
+            backend -> users: SELECT AuthIdentity\nWHERE auth_user_id = UUID профиля
+
+            alt первый успешный вход в Admin
+                users --> backend: запись не найдена
+                backend -> users: BEGIN\nсоздать технический User\nсоздать AuthIdentity с внешним UUID\nустановить is_active, is_staff, is_superuser\nзадать непригодный локальный пароль\nCOMMIT
+                users --> backend: User с локальным primary key
+            else повторный вход
+                users --> backend: User + AuthIdentity
+                backend -> users: обновить login, имя, фамилию и флаги
+                users --> backend: User с тем же primary key
+            end
+
+            backend -> sessions: сохранить access и refresh\nв request.session
+            sessions --> backend: токены сохранены
+            backend --> admin: технический пользователь Django
+            admin -> sessions: django.login(): сохранить local user_id\nи backend path
+            sessions --> admin: session key
+            admin --> gateway: 302 /admin/ + session cookie
+            gateway --> operator: 302 /admin/ + session cookie
+        end
+    end
+end
+
+note over users, sessions
+  Локальный User не хранит пароль Auth и не определяет право входа.
+  Его primary key нужен Django-сессии, request.user и django_admin_log.user_id.
+  AuthIdentity хранит стабильный UUID пользователя Auth.
+end note
+
+note over operator, sessions
+  Браузер получает только session cookie.
+  Access- и refresh-токены остаются в серверной Django-сессии.
+  Пользователи, которые не входят в Admin, не получают локальную запись.
+end note
+
+@enduml

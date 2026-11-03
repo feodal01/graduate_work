@@ -1,0 +1,8 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "extraPaths": ["src", "tests"],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "standard",
+  "strict": ["src", "migrations"]
+}

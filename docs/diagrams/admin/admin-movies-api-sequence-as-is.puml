@@ -1,0 +1,83 @@
+@startuml admin-movies-api-sequence-as-is
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam dpi 150
+skinparam maxMessageSize 90
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #64748B
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    BoxBorderColor #94A3B8
+    BoxBackgroundColor #F8FAFC
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+}
+
+title Django Admin — внутренний JSON API фильмов (AS-IS)
+
+autonumber
+
+actor "Внутренний клиент" as client
+
+box "Сервис Admin" #FFF7ED
+    participant "Django" as admin
+    database "Каталог\nв theatre-db" as catalog
+end box
+
+note over client, admin
+  Маршруты доступны внутри контейнерной сети по адресу admin:8000.
+  Gateway не публикует эти маршруты сервиса Admin.
+  AuthAuthorizationMiddleware проверяет только маршруты /admin/*.
+end note
+
+== Список фильмов ==
+
+client -> admin: GET /api/v1/movies/\npage
+admin -> admin: проверить номер страницы
+
+break параметр page неверен
+    admin --> client: 404 Invalid page
+end
+
+admin -> catalog: SELECT FilmWork с жанрами и персонами\nLIMIT 50, OFFSET по странице
+
+alt страница существует
+    catalog --> admin: фильмы и общее количество
+    admin --> client: 200 {count, total_pages, prev, next, results}
+else страница не существует
+    catalog --> admin: номер больше последней страницы
+    admin --> client: 404 Invalid page
+else PostgreSQL недоступна
+    catalog --> admin: DatabaseError
+    admin --> client: 500 Internal Server Error
+end
+
+== Карточка фильма ==
+
+client -> admin: GET /api/v1/movies/{id}/
+admin -> admin: проверить формат UUID
+
+break UUID неверен
+    admin --> client: 404 Not Found
+end
+
+admin -> catalog: SELECT FilmWork по UUID\nс жанрами и персонами
+
+alt фильм найден
+    catalog --> admin: фильм
+    admin --> client: 200 полная карточка фильма
+else фильм не найден
+    catalog --> admin: запись не найдена
+    admin --> client: 404 Not Found
+else PostgreSQL недоступна
+    catalog --> admin: DatabaseError
+    admin --> client: 500 Internal Server Error
+end
+
+@enduml

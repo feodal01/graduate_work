@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <listen_host>0.0.0.0</listen_host>
+
+    <remote_servers>
+        <company_cluster>
+            <secret from_env="CLICKHOUSE_PASSWORD"/>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>clickhouse-node1</host>
+                    <port>9000</port>
+                    <user from_env="CLICKHOUSE_USER"/>
+                    <password from_env="CLICKHOUSE_PASSWORD"/>
+                </replica>
+                <replica>
+                    <host>clickhouse-node2</host>
+                    <port>9000</port>
+                    <user from_env="CLICKHOUSE_USER"/>
+                    <password from_env="CLICKHOUSE_PASSWORD"/>
+                </replica>
+            </shard>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>clickhouse-node3</host>
+                    <port>9000</port>
+                    <user from_env="CLICKHOUSE_USER"/>
+                    <password from_env="CLICKHOUSE_PASSWORD"/>
+                </replica>
+                <replica>
+                    <host>clickhouse-node4</host>
+                    <port>9000</port>
+                    <user from_env="CLICKHOUSE_USER"/>
+                    <password from_env="CLICKHOUSE_PASSWORD"/>
+                </replica>
+            </shard>
+        </company_cluster>
+    </remote_servers>
+
+    <zookeeper>
+        <node>
+            <host>zookeeper</host>
+            <port>2181</port>
+        </node>
+    </zookeeper>
+
+    <distributed_ddl>
+        <path>/clickhouse/task_queue/ddl</path>
+    </distributed_ddl>
+</clickhouse>

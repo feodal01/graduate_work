@@ -1,0 +1,69 @@
+@startuml movies-api-film-search-sequence-as-is
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam dpi 150
+skinparam maxMessageSize 90
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #64748B
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    BoxBorderColor #94A3B8
+    BoxBackgroundColor #F8FAFC
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+}
+
+title Movies API — поиск фильмов (AS-IS)
+
+autonumber
+
+actor "Зритель" as viewer
+participant "Gateway\nNginx" as gateway
+
+box "Сервис фильмов" #EFF6FF
+    participant "Movies API" as movies
+    database "Movies Redis" as redis
+    database "Elasticsearch\nиндекс movies" as elastic
+end box
+
+viewer -> gateway: GET /api/v1/films/search/\nquery, page_number, page_size
+gateway -> movies: передать запрос
+
+break параметры запроса неверны
+    movies --> gateway: 422 Validation error
+    gateway --> viewer: 422 Validation error
+end
+
+movies -> redis: GET film-search:{normalized_query}:\n{page_number}:{page_size}
+
+alt результат есть в Redis
+    redis --> movies: найденные фильмы
+else результата нет, данные неверны или Redis недоступен
+    redis --> movies: cache miss
+    movies -> elastic: match title, fuzziness=AUTO
+    alt Elasticsearch недоступен
+        elastic --> movies: storage error
+        movies --> gateway: 503 Storage is unavailable
+        gateway --> viewer: 503 Storage is unavailable
+    else Elasticsearch вернул данные
+        elastic --> movies: найденные фильмы
+        movies -> redis: SET результат, TTL 300 секунд
+        alt запись выполнена
+            redis --> movies: OK
+        else Redis недоступен
+            redis --> movies: RedisError
+            movies -> movies: записать ошибку в журнал и продолжить
+        end
+    end
+end
+
+movies --> gateway: 200 краткие карточки
+gateway --> viewer: 200 краткие карточки
+
+@enduml

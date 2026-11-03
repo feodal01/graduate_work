@@ -1,0 +1,1615 @@
+# Ротация stdout/stderr контейнеров (docker compose logs): до 3 файлов по 10 МБ на контейнер.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-auth-source-env: &auth-source-env
+  PYTHONPATH: /app/src
+  POSTGRES_USER: ${AUTH_POSTGRES_USER}
+  POSTGRES_PASSWORD: ${AUTH_POSTGRES_PASSWORD}
+  POSTGRES_DB: ${AUTH_POSTGRES_DB}
+  POSTGRES_HOST: auth-db
+  POSTGRES_PORT: "5432"
+  KAFKA_BOOTSTRAP_SERVERS: kafka-0:9092,kafka-1:9092,kafka-2:9092
+  AUTH_RELAY_TOPIC: auth.users.v1
+  AUTH_RELAY_BATCH_SIZE: ${AUTH_RELAY_BATCH_SIZE}
+  AUTH_RELAY_POLL_INTERVAL_SECONDS: ${AUTH_RELAY_POLL_INTERVAL_SECONDS}
+
+x-ugc-source-env: &ugc-source-env
+  MONGO_URI: mongodb://mongos1:27017,mongos2:27017
+  MONGO_DB: ugc
+  AUTH_JWT_SECRET: ${JWT_SECRET}
+  KAFKA_BOOTSTRAP_SERVERS: kafka-0:9092,kafka-1:9092,kafka-2:9092
+  KAFKA_LIKES_TOPIC: ugc.reviews.v1
+  RELAY_BATCH_SIZE: ${UGC_RELAY_BATCH_SIZE:-500}
+  BOOTSTRAP_BATCH_SIZE: ${UGC_BOOTSTRAP_BATCH_SIZE:-500}
+  RELAY_MONGO_TRANSACTION_LIFETIME_SECONDS: ${UGC_TRANSACTION_LIFETIME_SECONDS}
+
+x-movies-source-env: &movies-source-env
+  POSTGRES_USER: ${THEATRE_POSTGRES_USER}
+  POSTGRES_PASSWORD: ${THEATRE_POSTGRES_PASSWORD}
+  POSTGRES_DB: ${THEATRE_POSTGRES_DB}
+  SQL_HOST: theatre-db
+  SQL_PORT: "5432"
+  ELASTICSEARCH_URL: http://elasticsearch:9200
+  ELASTICSEARCH_INDEX: ${ELASTICSEARCH_INDEX}
+  KAFKA_BOOTSTRAP_SERVERS: kafka-0:9092,kafka-1:9092,kafka-2:9092
+  KAFKA_MOVIES_TOPIC: movies.films.v1
+  CATALOG_BATCH_SIZE: ${CATALOG_BATCH_SIZE:-500}
+  CATALOG_RELAY_BATCH_SIZE: ${CATALOG_RELAY_BATCH_SIZE:-500}
+  CATALOG_LEGACY_BATCH_SIZE: ${CATALOG_LEGACY_BATCH_SIZE:-500}
+  CATALOG_SCAN_INTERVAL_SECONDS: ${CATALOG_SCAN_INTERVAL_SECONDS}
+  CATALOG_OVERLAP_SECONDS: ${CATALOG_OVERLAP_SECONDS}
+  CATALOG_RECONCILE_INTERVAL_SECONDS: ${CATALOG_RECONCILE_INTERVAL_SECONDS}
+
+x-notifications-env: &notifications-env
+  NOTIFICATIONS_FILMS_PER_DIGEST: ${NOTIFICATIONS_FILMS_PER_DIGEST:-20}
+  NOTIFICATIONS_SEND_WINDOW_START: ${NOTIFICATIONS_SEND_WINDOW_START:-10:00}
+  NOTIFICATIONS_SEND_WINDOW_END: ${NOTIFICATIONS_SEND_WINDOW_END:-20:00}
+  NOTIFICATIONS_DATABASE_URL: postgresql+asyncpg://${NOTIFICATIONS_POSTGRES_USER}:${NOTIFICATIONS_POSTGRES_PASSWORD}@notifications-db:5432/${NOTIFICATIONS_POSTGRES_DB}
+
+x-notifications-limiter-env: &notifications-limiter-env
+  NOTIFICATIONS_LIMITER_REDIS_URL: ${NOTIFICATIONS_LIMITER_REDIS_URL}
+  NOTIFICATIONS_LIMITER_ACCOUNT_ID: ${NOTIFICATIONS_LIMITER_ACCOUNT_ID}
+  NOTIFICATIONS_LIMITER_TOTAL_RATE: ${NOTIFICATIONS_LIMITER_TOTAL_RATE}
+  NOTIFICATIONS_LIMITER_TOTAL_CAPACITY: ${NOTIFICATIONS_LIMITER_TOTAL_CAPACITY}
+  NOTIFICATIONS_LIMITER_TRANSACTIONAL_RATE: ${NOTIFICATIONS_LIMITER_TRANSACTIONAL_RATE}
+  NOTIFICATIONS_LIMITER_TRANSACTIONAL_CAPACITY: ${NOTIFICATIONS_LIMITER_TRANSACTIONAL_CAPACITY}
+  NOTIFICATIONS_LIMITER_SERVICE_RATE: ${NOTIFICATIONS_LIMITER_SERVICE_RATE}
+  NOTIFICATIONS_LIMITER_SERVICE_CAPACITY: ${NOTIFICATIONS_LIMITER_SERVICE_CAPACITY}
+  NOTIFICATIONS_LIMITER_BULK_RATE: ${NOTIFICATIONS_LIMITER_BULK_RATE}
+  NOTIFICATIONS_LIMITER_BULK_CAPACITY: ${NOTIFICATIONS_LIMITER_BULK_CAPACITY}
+  NOTIFICATIONS_LIMITER_UNAVAILABLE_RETRY_SECONDS: ${NOTIFICATIONS_LIMITER_UNAVAILABLE_RETRY_SECONDS}
+  NOTIFICATIONS_LIMITER_REDIS_TIMEOUT_SECONDS: ${NOTIFICATIONS_LIMITER_REDIS_TIMEOUT_SECONDS}
+
+x-notifications-runtime: &notifications-runtime
+  logging: *default-logging
+  build: ./services/notifications
+  restart: unless-stopped
+  depends_on:
+    notifications-migrate:
+      condition: service_completed_successfully
+
+x-notifications-worker: &notifications-worker
+  <<: *notifications-runtime
+  stop_grace_period: 60s
+  env_file:
+    - path: ./infra/notifications/smtp.env
+      required: false
+  environment:
+    <<: [*notifications-env, *notifications-limiter-env]
+    NOTIFICATIONS_PROCESS: worker
+    NOTIFICATIONS_RECOVERY_BATCH_SIZE: ${NOTIFICATIONS_RECOVERY_BATCH_SIZE:-100}
+    NOTIFICATIONS_RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/notifications
+    NOTIFICATIONS_SMTP_HOST: ${NOTIFICATIONS_SMTP_HOST}
+    NOTIFICATIONS_SMTP_PORT: ${NOTIFICATIONS_SMTP_PORT}
+    NOTIFICATIONS_SMTP_FROM: ${NOTIFICATIONS_SMTP_FROM}
+    NOTIFICATIONS_SMTP_STARTTLS: ${NOTIFICATIONS_SMTP_STARTTLS}
+    NOTIFICATIONS_FALLBACK_LOCALE: ${NOTIFICATIONS_FALLBACK_LOCALE}
+    NOTIFICATIONS_FALLBACK_TZ: ${NOTIFICATIONS_FALLBACK_TZ}
+    NOTIFICATIONS_AUTH_CONTACTS_URL: http://auth:8000/api/v1/internal/notification-contacts
+    NOTIFICATIONS_AUTH_CONTACTS_API_KEY: ${SERVICE_API_KEY}
+    NOTIFICATIONS_AUTH_CONTACTS_TIMEOUT_SECONDS: ${NOTIFICATIONS_AUTH_CONTACTS_TIMEOUT_SECONDS}
+    NOTIFICATIONS_AUTH_CONTACTS_RETRY_SECONDS: ${NOTIFICATIONS_AUTH_CONTACTS_RETRY_SECONDS}
+    NOTIFICATIONS_AUTH_CONTACTS_BATCH_SIZE: ${NOTIFICATIONS_AUTH_CONTACTS_BATCH_SIZE}
+  depends_on:
+    notifications-migrate:
+      condition: service_completed_successfully
+    rabbitmq:
+      condition: service_healthy
+    notifications-redis:
+      condition: service_started
+    notifications-mailpit:
+      condition: service_healthy
+    notifications-maintenance:
+      condition: service_started
+
+
+services:
+  theatre-db:
+    logging: *default-logging
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${THEATRE_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${THEATRE_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${THEATRE_POSTGRES_DB}
+    volumes:
+      - ./services/admin/database_dump.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - theatre_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  auth-db:
+    logging: *default-logging
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${AUTH_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${AUTH_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${AUTH_POSTGRES_DB}
+    volumes:
+      - auth_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  auth-redis:
+    logging: *default-logging
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - auth_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  movies-redis:
+    logging: *default-logging
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  elasticsearch:
+    logging: *default-logging
+    image: elasticsearch:8.6.2
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+      path.repo: /usr/share/elasticsearch/snapshots
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+      - ./infra/elasticsearch/snapshots:/usr/share/elasticsearch/snapshots:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  jaeger:
+    logging: *default-logging
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.20.0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${JAEGER_UI_PORT}:16686"
+      - "127.0.0.1:${JAEGER_OTLP_HTTP_PORT}:4318"
+
+  elk-elasticsearch:
+    logging: *default-logging
+    image: elasticsearch:8.10.2
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    volumes:
+      - elk_elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  logstash:
+    logging: *default-logging
+    image: logstash:8.10.2
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment:
+      XPACK_MONITORING_ENABLED: "false"
+      ES_HOST: http://elk-elasticsearch:9200
+      LS_JAVA_OPTS: -Xms256m -Xmx256m
+    volumes:
+      - ./infra/logstash/logstash.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+    depends_on:
+      elk-elasticsearch:
+        condition: service_healthy
+
+  kibana:
+    logging: *default-logging
+    image: kibana:8.10.2
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment:
+      ELASTICSEARCH_HOSTS: http://elk-elasticsearch:9200
+    ports:
+      - "127.0.0.1:${KIBANA_PORT:-5601}:5601"
+    depends_on:
+      elk-elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:5601/api/status | grep -q '\"level\":\"available\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # Data views app-* и nginx-*; повторный запуск ничего не меняет.
+  kibana-bootstrap:
+    logging: *default-logging
+    image: kibana:8.10.2
+    profiles: ["observability"]
+    restart: "no"
+    environment:
+      KIBANA_URL: http://kibana:5601
+    volumes:
+      - ./infra/kibana/bootstrap.js:/bootstrap.js:ro
+    # Node из образа Kibana: curl есть, а jq для разбора ответов API нет.
+    entrypoint: ["/usr/share/kibana/node/bin/node", "/bootstrap.js"]
+    depends_on:
+      kibana:
+        condition: service_healthy
+
+  filebeat:
+    logging: *default-logging
+    image: elastic/filebeat:8.10.2
+    profiles: ["observability"]
+    restart: unless-stopped
+    user: root
+    command: ["filebeat", "-e", "--strict.perms=false"]
+    volumes:
+      - ./infra/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - nginx_logs:/var/log/nginx:ro
+      - filebeat_data:/usr/share/filebeat/data
+    depends_on:
+      - logstash
+      - gateway
+
+  sentry-db:
+    logging: *default-logging
+    image: postgres:17
+    profiles: ["observability"]
+    restart: unless-stopped
+    command: ["postgres", "-c", "max_locks_per_transaction=512"]
+    environment:
+      POSTGRES_USER: ${SENTRY_DB_USER}
+      POSTGRES_PASSWORD: ${SENTRY_DB_PASSWORD}
+      POSTGRES_DB: ${SENTRY_DB_NAME}
+    volumes:
+      - sentry_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  sentry-redis:
+    logging: *default-logging
+    image: redis:7-alpine
+    profiles: ["observability"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Self-hosted сервер, совместимый с Sentry SDK (принимает /envelope/).
+  glitchtip:
+    logging: *default-logging
+    image: glitchtip/glitchtip:6.2.6
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://${SENTRY_DB_USER}:${SENTRY_DB_PASSWORD}@sentry-db:5432/${SENTRY_DB_NAME}
+      VALKEY_URL: redis://sentry-redis:6379/0
+      SECRET_KEY: ${SENTRY_SECRET_KEY}
+      # Миграции при старте + встроенный воркер задач в том же процессе.
+      SERVER_ROLE: all_in_one
+      PORT: "8000"
+      GLITCHTIP_DOMAIN: http://localhost:${SENTRY_PORT:-9000}
+      DEFAULT_FROM_EMAIL: glitchtip@localhost
+    ports:
+      - "127.0.0.1:${SENTRY_PORT:-9000}:8000"
+    depends_on:
+      sentry-db:
+        condition: service_healthy
+      sentry-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "/code/healthcheck.py"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  # Администратор и проект с id и ключом из SENTRY_DSN; повторный запуск ничего не меняет.
+  glitchtip-bootstrap:
+    logging: *default-logging
+    image: glitchtip/glitchtip:6.2.6
+    profiles: ["observability"]
+    restart: "no"
+    environment:
+      DATABASE_URL: postgres://${SENTRY_DB_USER}:${SENTRY_DB_PASSWORD}@sentry-db:5432/${SENTRY_DB_NAME}
+      VALKEY_URL: redis://sentry-redis:6379/0
+      SECRET_KEY: ${SENTRY_SECRET_KEY}
+      SENTRY_ADMIN_EMAIL: ${SENTRY_ADMIN_EMAIL}
+      SENTRY_ADMIN_PASSWORD: ${SENTRY_ADMIN_PASSWORD}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+    volumes:
+      - ./infra/glitchtip/bootstrap.py:/code/bootstrap.py:ro
+      - ./infra/glitchtip/bootstrap_settings.py:/code/bootstrap_settings.py:ro
+    command: ["python", "bootstrap.py"]
+    depends_on:
+      glitchtip:
+        condition: service_healthy
+
+  kafka-0:
+    logging: *default-logging
+    image: bitnamilegacy/kafka:3.4
+    restart: unless-stopped
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_ENABLE_KRAFT: "yes"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+      KAFKA_KRAFT_CLUSTER_ID: abcdefghijklmnopqrstuv
+      KAFKA_CFG_NODE_ID: "0"
+      KAFKA_CFG_PROCESS_ROLES: broker,controller
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka-0:9093,1@kafka-1:9093,2@kafka-2:9093
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka-0:9092,EXTERNAL://127.0.0.1:9094
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
+    volumes:
+      - kafka_0_data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 40s
+
+  kafka-1:
+    logging: *default-logging
+    image: bitnamilegacy/kafka:3.4
+    restart: unless-stopped
+    ports:
+      - "9095:9095"
+    environment:
+      KAFKA_ENABLE_KRAFT: "yes"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+      KAFKA_KRAFT_CLUSTER_ID: abcdefghijklmnopqrstuv
+      KAFKA_CFG_NODE_ID: "1"
+      KAFKA_CFG_PROCESS_ROLES: broker,controller
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka-0:9093,1@kafka-1:9093,2@kafka-2:9093
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9095
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:9092,EXTERNAL://127.0.0.1:9095
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
+    volumes:
+      - kafka_1_data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 40s
+
+  kafka-2:
+    logging: *default-logging
+    image: bitnamilegacy/kafka:3.4
+    restart: unless-stopped
+    ports:
+      - "9096:9096"
+    environment:
+      KAFKA_ENABLE_KRAFT: "yes"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+      KAFKA_KRAFT_CLUSTER_ID: abcdefghijklmnopqrstuv
+      KAFKA_CFG_NODE_ID: "2"
+      KAFKA_CFG_PROCESS_ROLES: broker,controller
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka-0:9093,1@kafka-1:9093,2@kafka-2:9093
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9096
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:9092,EXTERNAL://127.0.0.1:9096
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
+    volumes:
+      - kafka_2_data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 40s
+
+  kafka-init:
+    logging: *default-logging
+    image: bitnamilegacy/kafka:3.4
+    restart: "no"
+    environment:
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    depends_on:
+      kafka-0:
+        condition: service_healthy
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+    command:
+      - bash
+      - -c
+      - |
+        kafka-topics.sh --bootstrap-server kafka-0:9092 --create --if-not-exists --topic ugc.events --partitions 6 --replication-factor 3
+        kafka-topics.sh --bootstrap-server kafka-0:9092 --create --if-not-exists --topic ugc.events.dlq --partitions 6 --replication-factor 3
+        kafka-topics.sh --bootstrap-server kafka-0:9092 --create --if-not-exists --topic auth.users.v1 --partitions 6 --replication-factor 3
+        kafka-topics.sh --bootstrap-server kafka-0:9092 --create --if-not-exists --topic ugc.reviews.v1 --partitions 6 --replication-factor 3
+        kafka-topics.sh --bootstrap-server kafka-0:9092 --create --if-not-exists --topic movies.films.v1 --partitions 6 --replication-factor 3
+
+  zookeeper:
+    logging: *default-logging
+    image: zookeeper:3.8
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/commands/ruok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  clickhouse-node1:
+    logging: *default-logging
+    image: clickhouse/clickhouse-server:24.8
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    ports:
+      - "127.0.0.1:8123:8123"
+    volumes:
+      - clickhouse_node1_data:/var/lib/clickhouse
+      - ./infra/clickhouse/config.d/cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ./infra/clickhouse/node1.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  clickhouse-node2:
+    logging: *default-logging
+    image: clickhouse/clickhouse-server:24.8
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    volumes:
+      - clickhouse_node2_data:/var/lib/clickhouse
+      - ./infra/clickhouse/config.d/cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ./infra/clickhouse/node2.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  clickhouse-node3:
+    logging: *default-logging
+    image: clickhouse/clickhouse-server:24.8
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    volumes:
+      - clickhouse_node3_data:/var/lib/clickhouse
+      - ./infra/clickhouse/config.d/cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ./infra/clickhouse/node3.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  clickhouse-node4:
+    logging: *default-logging
+    image: clickhouse/clickhouse-server:24.8
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    volumes:
+      - clickhouse_node4_data:/var/lib/clickhouse
+      - ./infra/clickhouse/config.d/cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ./infra/clickhouse/node4.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  mongors1n1:
+    logging: *default-logging
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["mongod", "--shardsvr", "--replSet", "mongors1", "--dbpath", "/data/db", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "${MONGO_SHARD_CACHE_SIZE_GB:-0.5}", "--setParameter", "transactionLifetimeLimitSeconds=${UGC_TRANSACTION_LIFETIME_SECONDS}"]
+    volumes:
+      - mongors1n1_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  mongors1n2:
+    logging: *default-logging
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["mongod", "--shardsvr", "--replSet", "mongors1", "--dbpath", "/data/db", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "${MONGO_SHARD_CACHE_SIZE_GB:-0.5}", "--setParameter", "transactionLifetimeLimitSeconds=${UGC_TRANSACTION_LIFETIME_SECONDS}"]
+    volumes:
+      - mongors1n2_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  mongors1n3:
+    logging: *default-logging
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["mongod", "--shardsvr", "--replSet", "mongors1", "--dbpath", "/data/db", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "${MONGO_SHARD_CACHE_SIZE_GB:-0.5}", "--setParameter", "transactionLifetimeLimitSeconds=${UGC_TRANSACTION_LIFETIME_SECONDS}"]
+    volumes:
+      - mongors1n3_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  mongors2n1:
+    logging: *default-logging
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["mongod", "--shardsvr", "--replSet", "mongors2", "--dbpath", "/data/db", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "${MONGO_SHARD_CACHE_SIZE_GB:-0.5}", "--setParameter", "transactionLifetimeLimitSeconds=${UGC_TRANSACTION_LIFETIME_SECONDS}"]
+    volumes:
+      - mongors2n1_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  mongors2n2:
+    logging: *default-logging
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["mongod", "--shardsvr", "--replSet", "mongors2", "--dbpath", "/data/db", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "${MONGO_SHARD_CACHE_SIZE_GB:-0.5}", "--setParameter", "transactionLifetimeLimitSeconds=${UGC_TRANSACTION_LIFETIME_SECONDS}"]
+    volumes:
+      - mongors2n2_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  mongors2n3:
+    logging: *default-logging
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["mongod", "--shardsvr", "--replSet", "mongors2", "--dbpath", "/data/db", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "${MONGO_SHARD_CACHE_SIZE_GB:-0.5}", "--setParameter", "transactionLifetimeLimitSeconds=${UGC_TRANSACTION_LIFETIME_SECONDS}"]
+    volumes:
+      - mongors2n3_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  mongocfg1:
+    logging: *default-logging
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["mongod", "--configsvr", "--replSet", "mongors1conf", "--dbpath", "/data/db", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes:
+      - mongocfg1_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  mongocfg2:
+    logging: *default-logging
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["mongod", "--configsvr", "--replSet", "mongors1conf", "--dbpath", "/data/db", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes:
+      - mongocfg2_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  mongocfg3:
+    logging: *default-logging
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["mongod", "--configsvr", "--replSet", "mongors1conf", "--dbpath", "/data/db", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes:
+      - mongocfg3_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  mongos1:
+    logging: *default-logging
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["mongos", "--configdb", "mongors1conf/mongocfg1:27017,mongocfg2:27017,mongocfg3:27017", "--port", "27017", "--bind_ip_all"]
+    ports:
+      - "127.0.0.1:27019:27017"
+    depends_on:
+      mongocfg1:
+        condition: service_healthy
+      mongocfg2:
+        condition: service_healthy
+      mongocfg3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  mongos2:
+    logging: *default-logging
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["mongos", "--configdb", "mongors1conf/mongocfg1:27017,mongocfg2:27017,mongocfg3:27017", "--port", "27017", "--bind_ip_all"]
+    ports:
+      - "127.0.0.1:27020:27017"
+    depends_on:
+      mongocfg1:
+        condition: service_healthy
+      mongocfg2:
+        condition: service_healthy
+      mongocfg3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  mongo-init:
+    logging: *default-logging
+    image: mongo:8.0
+    restart: "no"
+    volumes:
+      - ./infra/mongo/init-cluster.sh:/init-cluster.sh:ro
+    command: ["bash", "/init-cluster.sh"]
+    depends_on:
+      mongors1n1:
+        condition: service_healthy
+      mongors1n2:
+        condition: service_healthy
+      mongors1n3:
+        condition: service_healthy
+      mongors2n1:
+        condition: service_healthy
+      mongors2n2:
+        condition: service_healthy
+      mongors2n3:
+        condition: service_healthy
+      mongocfg1:
+        condition: service_healthy
+      mongocfg2:
+        condition: service_healthy
+      mongocfg3:
+        condition: service_healthy
+      mongos1:
+        condition: service_started
+      mongos2:
+        condition: service_started
+
+  kafka-ui:
+    logging: *default-logging
+    image: provectuslabs/kafka-ui:v0.7.0
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: kraft
+      KAFKA_CLUSTERS_0_BOOTSTRAP_SERVERS: kafka-0:9092,kafka-1:9092,kafka-2:9092
+    depends_on:
+      kafka-0:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  admin-migrate:
+    logging: *default-logging
+    build:
+      context: ./services/admin
+      dockerfile: Dockerfile
+    restart: "no"
+    environment:
+      DEBUG: ${ADMIN_DEBUG}
+      SECRET_KEY: ${ADMIN_SECRET_KEY}
+      POSTGRES_USER: ${THEATRE_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${THEATRE_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${THEATRE_POSTGRES_DB}
+      SQL_HOST: theatre-db
+      SQL_PORT: "5432"
+      SQL_OPTIONS: ${THEATRE_SQL_OPTIONS}
+    command: ["python", "manage.py", "migrate"]
+    depends_on:
+      theatre-db:
+        condition: service_healthy
+
+  admin-collectstatic:
+    logging: *default-logging
+    build:
+      context: ./services/admin
+      dockerfile: Dockerfile
+    restart: "no"
+    environment:
+      DEBUG: ${ADMIN_DEBUG}
+      SECRET_KEY: ${ADMIN_SECRET_KEY}
+      POSTGRES_USER: ${THEATRE_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${THEATRE_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${THEATRE_POSTGRES_DB}
+      SQL_HOST: theatre-db
+      SQL_PORT: "5432"
+      SQL_OPTIONS: ${THEATRE_SQL_OPTIONS}
+    volumes:
+      - admin_static:/opt/app/static
+    command: ["python", "manage.py", "collectstatic", "--noinput"]
+
+  admin:
+    logging: *default-logging
+    build:
+      context: ./services/admin
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      DEBUG: ${ADMIN_DEBUG}
+      SECRET_KEY: ${ADMIN_SECRET_KEY}
+      POSTGRES_USER: ${THEATRE_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${THEATRE_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${THEATRE_POSTGRES_DB}
+      SQL_HOST: theatre-db
+      SQL_PORT: "5432"
+      SQL_OPTIONS: ${THEATRE_SQL_OPTIONS}
+      AUTH_SERVICE_URL: http://auth:8000/api/v1/auth
+      AUTH_CLIENT_CONNECT_TIMEOUT_SECONDS: ${AUTH_CLIENT_CONNECT_TIMEOUT_SECONDS}
+      AUTH_CLIENT_REQUEST_TIMEOUT_SECONDS: ${AUTH_CLIENT_REQUEST_TIMEOUT_SECONDS}
+      AUTH_CLIENT_BACKOFF_MAX_TRIES: ${AUTH_CLIENT_BACKOFF_MAX_TRIES}
+      AUTH_CLIENT_BACKOFF_MAX_TIME_SECONDS: ${AUTH_CLIENT_BACKOFF_MAX_TIME_SECONDS}
+    volumes:
+      - admin_static:/opt/app/static
+    depends_on:
+      theatre-db:
+        condition: service_healthy
+      admin-migrate:
+        condition: service_completed_successfully
+      admin-collectstatic:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  auth-migrate:
+    logging: *default-logging
+    build:
+      context: ./services/auth
+      dockerfile: Dockerfile
+    restart: "no"
+    environment:
+      POSTGRES_USER: ${AUTH_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${AUTH_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${AUTH_POSTGRES_DB}
+      POSTGRES_HOST: auth-db
+      POSTGRES_PORT: "5432"
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      auth-db:
+        condition: service_healthy
+
+  auth-bootstrap:
+    logging: *default-logging
+    build:
+      context: ./services/auth
+      dockerfile: Dockerfile
+    restart: "no"
+    environment:
+      POSTGRES_USER: ${AUTH_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${AUTH_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${AUTH_POSTGRES_DB}
+      POSTGRES_HOST: auth-db
+      POSTGRES_PORT: "5432"
+      REDIS_HOST: auth-redis
+      REDIS_PORT: "6379"
+      REDIS_SOCKET_CONNECT_TIMEOUT: ${AUTH_REDIS_SOCKET_CONNECT_TIMEOUT}
+      REDIS_SOCKET_TIMEOUT: ${AUTH_REDIS_SOCKET_TIMEOUT}
+      AUTHORIZATION_CACHE_TTL_SECONDS: ${AUTHORIZATION_CACHE_TTL_SECONDS}
+      BACKOFF_MAX_TRIES: ${AUTH_BACKOFF_MAX_TRIES}
+      BACKOFF_MAX_TIME: ${AUTH_BACKOFF_MAX_TIME}
+      PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH}
+      PASSWORD_MIN_SCORE: ${PASSWORD_MIN_SCORE}
+      AUTH_ADMIN_LOGIN: ${AUTH_ADMIN_LOGIN}
+      AUTH_ADMIN_PASSWORD: ${AUTH_ADMIN_PASSWORD}
+      AUTH_ADMIN_TZ: ${AUTH_ADMIN_TZ}
+    command: ["python", "src/bootstrap.py"]
+    depends_on:
+      auth-migrate:
+        condition: service_completed_successfully
+      auth-redis:
+        condition: service_healthy
+
+  auth:
+    logging: *default-logging
+    build:
+      context: ./services/auth
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      AUTH_NOTIFICATION_CONTACTS_BATCH_SIZE: ${AUTH_NOTIFICATION_CONTACTS_BATCH_SIZE}
+      POSTGRES_USER: ${AUTH_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${AUTH_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${AUTH_POSTGRES_DB}
+      POSTGRES_HOST: auth-db
+      POSTGRES_PORT: "5432"
+      REDIS_HOST: auth-redis
+      REDIS_PORT: "6379"
+      REDIS_SOCKET_CONNECT_TIMEOUT: ${AUTH_REDIS_SOCKET_CONNECT_TIMEOUT}
+      REDIS_SOCKET_TIMEOUT: ${AUTH_REDIS_SOCKET_TIMEOUT}
+      AUTHORIZATION_CACHE_TTL_SECONDS: ${AUTHORIZATION_CACHE_TTL_SECONDS}
+      BACKOFF_MAX_TRIES: ${AUTH_BACKOFF_MAX_TRIES}
+      BACKOFF_MAX_TIME: ${AUTH_BACKOFF_MAX_TIME}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALGORITHM: ${JWT_ALGORITHM}
+      ACCESS_TOKEN_TTL_SECONDS: ${ACCESS_TOKEN_TTL_SECONDS}
+      REFRESH_TOKEN_TTL_SECONDS: ${REFRESH_TOKEN_TTL_SECONDS}
+      SERVICE_API_KEY: ${SERVICE_API_KEY}
+      PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH}
+      PASSWORD_MIN_SCORE: ${PASSWORD_MIN_SCORE}
+      TRACING_ENABLED: ${AUTH_TRACING_ENABLED}
+      TRACING_SERVICE_NAME: ${AUTH_TRACING_SERVICE_NAME}
+      TRACING_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
+      TRACING_SAMPLE_RATE: ${AUTH_TRACING_SAMPLE_RATE}
+      YANDEX_OAUTH_ENABLED: ${AUTH_YANDEX_OAUTH_ENABLED}
+      YANDEX_OAUTH_CLIENT_ID: ${AUTH_YANDEX_OAUTH_CLIENT_ID}
+      YANDEX_OAUTH_CLIENT_SECRET: ${AUTH_YANDEX_OAUTH_CLIENT_SECRET}
+      YANDEX_OAUTH_REDIRECT_URI: ${AUTH_YANDEX_OAUTH_REDIRECT_URI}
+      YANDEX_OAUTH_STATE_TTL_SECONDS: ${AUTH_YANDEX_OAUTH_STATE_TTL_SECONDS}
+      YANDEX_OAUTH_CONNECT_TIMEOUT_SECONDS: ${AUTH_YANDEX_OAUTH_CONNECT_TIMEOUT_SECONDS}
+      YANDEX_OAUTH_REQUEST_TIMEOUT_SECONDS: ${AUTH_YANDEX_OAUTH_REQUEST_TIMEOUT_SECONDS}
+      YANDEX_OAUTH_USERINFO_MAX_TRIES: ${AUTH_YANDEX_OAUTH_USERINFO_MAX_TRIES}
+      YANDEX_OAUTH_USERINFO_BACKOFF_MAX_SECONDS: ${AUTH_YANDEX_OAUTH_USERINFO_BACKOFF_MAX_SECONDS}
+      RATE_LIMIT_ENABLED: ${AUTH_RATE_LIMIT_ENABLED}
+      RATE_LIMIT_LOGIN_RATE: ${AUTH_RATE_LIMIT_LOGIN_RATE}
+      RATE_LIMIT_LOGIN_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_LOGIN_WINDOW_SECONDS}
+      RATE_LIMIT_LOGIN_CAPACITY: ${AUTH_RATE_LIMIT_LOGIN_CAPACITY}
+      RATE_LIMIT_SIGNUP_RATE: ${AUTH_RATE_LIMIT_SIGNUP_RATE}
+      RATE_LIMIT_SIGNUP_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_SIGNUP_WINDOW_SECONDS}
+      RATE_LIMIT_SIGNUP_CAPACITY: ${AUTH_RATE_LIMIT_SIGNUP_CAPACITY}
+      RATE_LIMIT_REFRESH_RATE: ${AUTH_RATE_LIMIT_REFRESH_RATE}
+      RATE_LIMIT_REFRESH_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_REFRESH_WINDOW_SECONDS}
+      RATE_LIMIT_REFRESH_CAPACITY: ${AUTH_RATE_LIMIT_REFRESH_CAPACITY}
+      RATE_LIMIT_USER_RATE: ${AUTH_RATE_LIMIT_USER_RATE}
+      RATE_LIMIT_USER_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_USER_WINDOW_SECONDS}
+      RATE_LIMIT_USER_CAPACITY: ${AUTH_RATE_LIMIT_USER_CAPACITY}
+      RATE_LIMIT_ADMIN_RATE: ${AUTH_RATE_LIMIT_ADMIN_RATE}
+      RATE_LIMIT_ADMIN_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_ADMIN_WINDOW_SECONDS}
+      RATE_LIMIT_ADMIN_CAPACITY: ${AUTH_RATE_LIMIT_ADMIN_CAPACITY}
+      RATE_LIMIT_SERVICE_RATE: ${AUTH_RATE_LIMIT_SERVICE_RATE}
+      RATE_LIMIT_SERVICE_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_SERVICE_WINDOW_SECONDS}
+      RATE_LIMIT_SERVICE_CAPACITY: ${AUTH_RATE_LIMIT_SERVICE_CAPACITY}
+      LOGSTASH_HOST: logstash
+      LOGSTASH_PORT: "5044"
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-local}
+      SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-0.0}
+    command: ["uvicorn", "main:app", "--app-dir", "src", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      auth-bootstrap:
+        condition: service_completed_successfully
+      auth-redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          request = urllib.request.Request(
+          'http://127.0.0.1:8000/api/v1/health/',
+          headers={'X-Request-Id': 'auth-compose-health'});
+          urllib.request.urlopen(request, timeout=2)
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  elasticsearch-init:
+    logging: *default-logging
+    image: elasticsearch:8.6.2
+    restart: "no"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - ./infra/elasticsearch/snapshots:/usr/share/elasticsearch/snapshots:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        if [ "$(curl -sS -o /dev/null -w '%{http_code}' "http://elasticsearch:9200/${ELASTICSEARCH_INDEX}")" = "200" ]; then
+          echo "${ELASTICSEARCH_INDEX} already exists; skip restore"
+        else
+          echo "Register snapshot repository sprint3_backup"
+          curl -fsS -X PUT "http://elasticsearch:9200/_snapshot/sprint3_backup" \
+            -H 'Content-Type: application/json' \
+            -d '{"type":"fs","settings":{"location":"/usr/share/elasticsearch/snapshots","readonly":true}}' \
+            > /dev/null
+
+          echo "Restore snapshot movies_20260714_genre_ids"
+          curl -fsS -X POST \
+            "http://elasticsearch:9200/_snapshot/sprint3_backup/movies_20260714_genre_ids/_restore?wait_for_completion=true" \
+            -H 'Content-Type: application/json' \
+            -d '{"indices":"movies","include_global_state":false,"index_settings":{"index.number_of_replicas":0}}' \
+            > /dev/null
+          echo "Index ${ELASTICSEARCH_INDEX} restored"
+        fi
+
+        echo "Ensure creation_date mapping"
+        curl -fsS -X PUT "http://elasticsearch:9200/${ELASTICSEARCH_INDEX}/_mapping" \
+          -H 'Content-Type: application/json' \
+          -d '{"properties":{"creation_date":{"type":"date"}}}' \
+          > /dev/null
+
+  movies-api:
+    logging: *default-logging
+    build:
+      context: ./services/movies-api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      PROJECT_NAME: movies
+      REDIS_HOST: movies-redis
+      REDIS_PORT: "6379"
+      REDIS_SOCKET_CONNECT_TIMEOUT: ${MOVIES_REDIS_SOCKET_CONNECT_TIMEOUT}
+      REDIS_SOCKET_TIMEOUT: ${MOVIES_REDIS_SOCKET_TIMEOUT}
+      ELASTICSEARCH_HOST: elasticsearch
+      ELASTICSEARCH_PORT: "9200"
+      ELASTICSEARCH_INDEX: ${ELASTICSEARCH_INDEX}
+      ELASTICSEARCH_REQUEST_TIMEOUT: ${ELASTICSEARCH_REQUEST_TIMEOUT}
+      BACKOFF_MAX_TRIES: ${MOVIES_BACKOFF_MAX_TRIES}
+      BACKOFF_MAX_TIME: ${MOVIES_BACKOFF_MAX_TIME}
+      MAX_ELASTICSEARCH_RESULT_WINDOW: ${MOVIES_MAX_ELASTICSEARCH_RESULT_WINDOW:-10000}
+      MAX_PAGE_SIZE_API_RESPONSE: ${MOVIES_MAX_PAGE_SIZE_API_RESPONSE:-100}
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      AUTH_JWT_ALGORITHM: ${JWT_ALGORITHM}
+      AUTH_SERVICE_URL: http://auth:8000/api/v1/auth
+      AUTH_SERVICE_API_KEY: ${SERVICE_API_KEY}
+      AUTH_CONNECT_TIMEOUT: ${MOVIES_AUTH_CONNECT_TIMEOUT}
+      AUTH_REQUEST_TIMEOUT: ${MOVIES_AUTH_REQUEST_TIMEOUT}
+      AUTH_BACKOFF_MAX_TRIES: ${MOVIES_AUTH_BACKOFF_MAX_TRIES}
+      AUTH_BACKOFF_MAX_TIME: ${MOVIES_AUTH_BACKOFF_MAX_TIME}
+      LOGSTASH_HOST: logstash
+      LOGSTASH_PORT: "5044"
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-local}
+      SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-0.0}
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      movies-redis:
+        condition: service_healthy
+      elasticsearch-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  ugc-events-redis:
+    logging: *default-logging
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ugc_events_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ugc-events:
+    logging: *default-logging
+    build:
+      context: ./services/ugc-events
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      PROJECT_NAME: ugc-events
+      REDIS_HOST: ugc-events-redis
+      REDIS_PORT: "6379"
+      REDIS_SOCKET_CONNECT_TIMEOUT: ${UGC_EVENTS_REDIS_SOCKET_CONNECT_TIMEOUT:-1}
+      REDIS_SOCKET_TIMEOUT: ${UGC_EVENTS_REDIS_SOCKET_TIMEOUT:-1}
+      EVENTS_RATE_LIMIT_RATE: ${UGC_EVENTS_RATE_LIMIT_RATE:-60}
+      EVENTS_RATE_LIMIT_WINDOW_SECONDS: ${UGC_EVENTS_RATE_LIMIT_WINDOW_SECONDS:-60}
+      EVENTS_RATE_LIMIT_CAPACITY: ${UGC_EVENTS_RATE_LIMIT_CAPACITY:-10}
+      EVENTS_MAX_AGE_SECONDS: ${UGC_EVENTS_MAX_AGE_SECONDS:-604800}
+      EVENTS_MAX_FUTURE_SKEW_SECONDS: ${UGC_EVENTS_MAX_FUTURE_SKEW_SECONDS:-300}
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      AUTH_JWT_ALGORITHM: ${JWT_ALGORITHM}
+      KAFKA_BOOTSTRAP_SERVERS: kafka-0:9092,kafka-1:9092,kafka-2:9092
+      KAFKA_TOPIC: ugc.events
+      LOGSTASH_HOST: logstash
+      LOGSTASH_PORT: "5044"
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-local}
+      SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-0.0}
+    depends_on:
+      kafka-0:
+        condition: service_healthy
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      ugc-events-redis:
+        condition: service_started
+        required: false
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  ugc-api:
+    logging: *default-logging
+    build:
+      context: ./services/ugc-api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      PROJECT_NAME: ugc-api
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      AUTH_JWT_ALGORITHM: ${JWT_ALGORITHM}
+      MONGO_URI: mongodb://mongos1:27017,mongos2:27017
+      MONGO_DB: ugc
+      LOGSTASH_HOST: logstash
+      LOGSTASH_PORT: "5044"
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-local}
+      SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-0.0}
+    depends_on:
+      mongos1:
+        condition: service_healthy
+      mongos2:
+        condition: service_healthy
+      mongo-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  ugc-etl:
+    logging: *default-logging
+    build:
+      context: ./services/ugc-etl
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka-0:9092,kafka-1:9092,kafka-2:9092
+      ETL_STALL_TIMEOUT_SECONDS: ${UGC_ETL_STALL_TIMEOUT_SECONDS:-360}
+      EVENTS_MAX_AGE_SECONDS: ${UGC_EVENTS_MAX_AGE_SECONDS:-604800}
+      EVENTS_MAX_FUTURE_SKEW_SECONDS: ${UGC_EVENTS_MAX_FUTURE_SKEW_SECONDS:-300}
+      CLICKHOUSE_HOST: clickhouse-node1
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      LOGSTASH_HOST: logstash
+      LOGSTASH_PORT: "5044"
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-local}
+      SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-0.0}
+    volumes:
+      - ./infra/clickhouse/init.sql:/app/init.sql:ro
+    depends_on:
+      kafka-0:
+        condition: service_healthy
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      clickhouse-node1:
+        condition: service_healthy
+      clickhouse-node2:
+        condition: service_healthy
+      clickhouse-node3:
+        condition: service_healthy
+      clickhouse-node4:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+
+  movies-etl:
+    logging: *default-logging
+    build:
+      context: ./services/movies-etl
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${THEATRE_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${THEATRE_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${THEATRE_POSTGRES_DB}
+      SQL_HOST: theatre-db
+      SQL_PORT: "5432"
+      STATE_DATABASE_FILE_PATH: ${ETL_STATE_DATABASE_FILE_PATH}
+      PRODUCER_BATCH_SIZE: ${ETL_PRODUCER_BATCH_SIZE}
+      WORKER_LEASE_SECONDS: ${ETL_WORKER_LEASE_SECONDS}
+      JOB_MAX_ATTEMPTS: ${ETL_JOB_MAX_ATTEMPTS}
+      WORKER_POLL_INTERVAL_SECONDS: ${ETL_WORKER_POLL_INTERVAL_SECONDS}
+      LOG_LEVEL: ${ETL_LOG_LEVEL}
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      ELASTICSEARCH_INDEX: ${ELASTICSEARCH_INDEX}
+      ELASTICSEARCH_TIMEOUT_SECONDS: ${ETL_ELASTICSEARCH_TIMEOUT_SECONDS}
+      POSTGRES_BACKOFF__MAX_TRIES: ${ETL_POSTGRES_BACKOFF_MAX_TRIES}
+      POSTGRES_BACKOFF__INITIAL_DELAY: ${ETL_POSTGRES_BACKOFF_INITIAL_DELAY}
+      POSTGRES_BACKOFF__MAX_DELAY: ${ETL_POSTGRES_BACKOFF_MAX_DELAY}
+      POSTGRES_BACKOFF__MULTIPLIER: ${ETL_POSTGRES_BACKOFF_MULTIPLIER}
+      ELASTICSEARCH_BACKOFF__MAX_TRIES: ${ETL_ELASTICSEARCH_BACKOFF_MAX_TRIES}
+      ELASTICSEARCH_BACKOFF__INITIAL_DELAY: ${ETL_ELASTICSEARCH_BACKOFF_INITIAL_DELAY}
+      ELASTICSEARCH_BACKOFF__MAX_DELAY: ${ETL_ELASTICSEARCH_BACKOFF_MAX_DELAY}
+      ELASTICSEARCH_BACKOFF__MULTIPLIER: ${ETL_ELASTICSEARCH_BACKOFF_MULTIPLIER}
+    volumes:
+      - movies_etl_state:/app/state
+    depends_on:
+      theatre-db:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      elasticsearch-init:
+        condition: service_completed_successfully
+
+  # Local email capture: workers use SMTP :1025, reviewers use the web UI :8025.
+  notifications-mailpit:
+    logging: *default-logging
+    image: axllent/mailpit:v1.27.8
+    restart: unless-stopped
+    environment:
+      MP_DATABASE: /data/mailpit.db
+      MP_MAX_MESSAGES: "1000"
+    volumes:
+      - notifications_mailpit_data:/data
+    ports:
+      - "127.0.0.1:${NOTIFICATIONS_MAILPIT_UI_PORT:-8025}:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  notifications-redis:
+    logging: *default-logging
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--no-appendfsync-on-rewrite", "no", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - notifications_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Operator action only. No worker depends on this service; startup never resets tokens.
+  notifications-limiter-init:
+    logging: *default-logging
+    build: ./services/notifications
+    profiles: ["notifications-bootstrap"]
+    restart: "no"
+    environment:
+      <<: *notifications-limiter-env
+    entrypoint: ["python", "-m", "notifications.delivery.rate_limit"]
+    command: ["initialize", "--cooldown-seconds", "${NOTIFICATIONS_LIMITER_COOLDOWN_SECONDS}"]
+    depends_on:
+      notifications-redis:
+        condition: service_healthy
+
+  notifications-db:
+    logging: *default-logging
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${NOTIFICATIONS_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${NOTIFICATIONS_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${NOTIFICATIONS_POSTGRES_DB}
+    volumes:
+      - notifications_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  rabbitmq:
+    logging: *default-logging
+    image: rabbitmq:4.1.4-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: notifications
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping && rabbitmq-diagnostics -q check_port_connectivity"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  notifications-migrate:
+    logging: *default-logging
+    build: ./services/notifications
+    restart: "no"
+    environment:
+      <<: *notifications-env
+      NOTIFICATIONS_PROCESS: bootstrap
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      notifications-db:
+        condition: service_healthy
+
+  notifications-maintenance:
+    <<: *notifications-runtime
+    environment:
+      NOTIFICATIONS_DATABASE_URL: postgresql+asyncpg://${NOTIFICATIONS_POSTGRES_USER}:${NOTIFICATIONS_POSTGRES_PASSWORD}@notifications-db:5432/${NOTIFICATIONS_POSTGRES_DB}
+      NOTIFICATIONS_MAINTENANCE_BATCH_SIZE: ${NOTIFICATIONS_MAINTENANCE_BATCH_SIZE}
+      NOTIFICATIONS_MAINTENANCE_POLL_SECONDS: ${NOTIFICATIONS_MAINTENANCE_POLL_SECONDS}
+      NOTIFICATIONS_DELIVERY_PAYLOAD_RETENTION_SECONDS: ${NOTIFICATIONS_DELIVERY_PAYLOAD_RETENTION_SECONDS}
+    command: ["python", "-m", "notifications.maintenance"]
+
+  notifications-api:
+    <<: *notifications-runtime
+    environment:
+      <<: *notifications-env
+      NOTIFICATIONS_PROCESS: api
+      NOTIFICATIONS_JWT_SECRET: ${JWT_SECRET}
+      NOTIFICATIONS_JWT_ALGORITHM: ${JWT_ALGORITHM}
+      NOTIFICATIONS_AUTH_INTROSPECTION_URL: http://auth:8000/api/v1/internal/introspect
+      NOTIFICATIONS_AUTH_INTROSPECTION_API_KEY: ${SERVICE_API_KEY}
+      NOTIFICATIONS_AUTH_INTROSPECTION_TIMEOUT_SECONDS: ${NOTIFICATIONS_AUTH_INTROSPECTION_TIMEOUT_SECONDS}
+    command: ["uvicorn", "notifications.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=2)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Opt-in internal process with required service-key authentication.
+  notifications-campaign-api:
+    <<: *notifications-runtime
+    profiles: ["notifications-campaigns"]
+    environment:
+      <<: *notifications-env
+      NOTIFICATIONS_PROCESS: campaign-api
+      NOTIFICATIONS_CAMPAIGN_BATCH_SIZE: ${NOTIFICATIONS_CAMPAIGN_BATCH_SIZE:-100}
+      NOTIFICATIONS_CAMPAIGN_API_KEY: ${NOTIFICATIONS_CAMPAIGN_API_KEY}
+    command: ["uvicorn", "notifications.campaigns.app:create_campaign_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=2)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  notifications-consumer:
+    <<: *notifications-runtime
+    environment:
+      <<: *notifications-env
+      NOTIFICATIONS_PROCESS: consumer
+      NOTIFICATIONS_CONSUMER_BATCH_SIZE: ${NOTIFICATIONS_CONSUMER_BATCH_SIZE:-500}
+      NOTIFICATIONS_KAFKA_BOOTSTRAP_SERVERS: kafka-0:9092,kafka-1:9092,kafka-2:9092
+      NOTIFICATIONS_INITIAL_LIKES: ${NOTIFICATIONS_INITIAL_LIKES}
+      NOTIFICATIONS_INITIAL_NEW_FILMS: ${NOTIFICATIONS_INITIAL_NEW_FILMS}
+      NOTIFICATIONS_INITIAL_MARKETING: ${NOTIFICATIONS_INITIAL_MARKETING}
+    command: ["python", "-m", "notifications", "--group", "notifications-v1"]
+    depends_on:
+      notifications-migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+
+  notifications-scheduler:
+    <<: *notifications-runtime
+    profiles: ["notifications-scheduling"]
+    environment:
+      <<: *notifications-env
+      NOTIFICATIONS_PROCESS: scheduler
+      NOTIFICATIONS_SCHEDULER_BATCH_SIZE: ${NOTIFICATIONS_SCHEDULER_BATCH_SIZE:-500}
+      NOTIFICATIONS_LIKES_MIN_DELTA: ${NOTIFICATIONS_LIKES_MIN_DELTA}
+      NOTIFICATIONS_LIKES_SCHEDULE_ANCHOR_UTC: ${NOTIFICATIONS_LIKES_SCHEDULE_ANCHOR_UTC:-1970-01-01T00:00:00Z}
+      NOTIFICATIONS_FILMS_SCHEDULE_ANCHOR_UTC: ${NOTIFICATIONS_FILMS_SCHEDULE_ANCHOR_UTC:-1970-01-01T00:00:00Z}
+      NOTIFICATIONS_LIKES_INTERVAL_SECONDS: ${NOTIFICATIONS_LIKES_INTERVAL_SECONDS}
+      NOTIFICATIONS_FILMS_INTERVAL_SECONDS: ${NOTIFICATIONS_FILMS_INTERVAL_SECONDS}
+      NOTIFICATIONS_LIKES_BOOTSTRAP_LOAD_ID: ${NOTIFICATIONS_LIKES_BOOTSTRAP_LOAD_ID}
+    command: ["python", "-m", "notifications.scheduling.scheduler"]
+
+  notifications-publisher:
+    <<: *notifications-runtime
+    environment:
+      <<: *notifications-env
+      NOTIFICATIONS_PROCESS: publisher
+      NOTIFICATIONS_TRANSACTIONAL_BATCH_SIZE: ${NOTIFICATIONS_TRANSACTIONAL_BATCH_SIZE}
+      NOTIFICATIONS_SERVICE_BATCH_SIZE: ${NOTIFICATIONS_SERVICE_BATCH_SIZE}
+      NOTIFICATIONS_BULK_BATCH_SIZE: ${NOTIFICATIONS_BULK_BATCH_SIZE}
+      NOTIFICATIONS_RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/notifications
+    command: ["python", "-m", "notifications.delivery.publisher", "--poll-seconds", "${NOTIFICATIONS_PUBLISHER_POLL_SECONDS}"]
+    depends_on:
+      notifications-migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  notifications-worker-transactional:
+    <<: *notifications-worker
+    command: ["python", "-m", "notifications.delivery.worker", "--send-class", "transactional", "--max-concurrency", "${NOTIFICATIONS_TRANSACTIONAL_CONCURRENCY}", "--retry-seconds", "${NOTIFICATIONS_RETRY_SECONDS}", "--max-attempts", "${NOTIFICATIONS_MAX_ATTEMPTS}"]
+
+  notifications-worker-service:
+    <<: *notifications-worker
+    command: ["python", "-m", "notifications.delivery.worker", "--send-class", "service", "--max-concurrency", "${NOTIFICATIONS_SERVICE_CONCURRENCY}", "--retry-seconds", "${NOTIFICATIONS_RETRY_SECONDS}", "--max-attempts", "${NOTIFICATIONS_MAX_ATTEMPTS}"]
+
+  notifications-worker-bulk:
+    <<: *notifications-worker
+    command: ["python", "-m", "notifications.delivery.worker", "--send-class", "bulk", "--max-concurrency", "${NOTIFICATIONS_BULK_CONCURRENCY}", "--retry-seconds", "${NOTIFICATIONS_RETRY_SECONDS}", "--max-attempts", "${NOTIFICATIONS_MAX_ATTEMPTS}"]
+
+  notifications-bootstrap:
+    <<: *notifications-runtime
+    profiles: ["notifications-bootstrap"]
+    restart: "no"
+    environment:
+      <<: *notifications-env
+      NOTIFICATIONS_PROCESS: bootstrap
+    volumes:
+      - ./infra/notifications:/bootstrap:ro
+    entrypoint: ["python", "-m", "notifications.ingest.bootstrap"]
+    command: ["register", "--manifest", "/bootstrap/ugc-manifest.json"]
+
+  auth-relay:
+    logging: *default-logging
+    build: ./services/auth
+    restart: unless-stopped
+    environment: *auth-source-env
+    healthcheck: {disable: true}
+    command: ["python", "-m", "relay"]
+    depends_on:
+      auth-migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+
+  auth-notifications-bootstrap:
+    logging: *default-logging
+    build: ./services/auth
+    profiles: ["notifications-bootstrap"]
+    restart: "no"
+    environment: *auth-source-env
+    healthcheck: {disable: true}
+    entrypoint: ["python", "-m", "bootstrap_notifications"]
+    command: ["--load-id", "${AUTH_NOTIFICATIONS_LOAD_ID}"]
+    depends_on:
+      auth-migrate:
+        condition: service_completed_successfully
+
+  ugc-relay:
+    logging: *default-logging
+    build: ./services/ugc-api
+    restart: unless-stopped
+    environment: *ugc-source-env
+    healthcheck: {disable: true}
+    command: ["python", "-m", "relay"]
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+
+  ugc-notifications-bootstrap:
+    logging: *default-logging
+    build: ./services/ugc-api
+    profiles: ["notifications-bootstrap"]
+    restart: "no"
+    environment: *ugc-source-env
+    healthcheck: {disable: true}
+    entrypoint: ["python", "-m", "bootstrap_notifications"]
+    command: ["status", "--load-id", "${NOTIFICATIONS_LIKES_BOOTSTRAP_LOAD_ID}"]
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+
+  movies-detector:
+    logging: *default-logging
+    build: ./services/movies-etl
+    profiles: ["notifications-detection"]
+    restart: unless-stopped
+    environment: *movies-source-env
+    command: ["python", "-m", "postgres_to_es.catalog_events", "detect"]
+    depends_on:
+      admin-migrate:
+        condition: service_completed_successfully
+      elasticsearch-init:
+        condition: service_completed_successfully
+
+  movies-relay:
+    logging: *default-logging
+    build: ./services/movies-etl
+    restart: unless-stopped
+    environment: *movies-source-env
+    command: ["python", "-m", "postgres_to_es.catalog_events", "relay"]
+    depends_on:
+      admin-migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+
+  movies-notifications-bootstrap:
+    logging: *default-logging
+    build: ./services/movies-etl
+    profiles: ["notifications-bootstrap"]
+    restart: "no"
+    environment: *movies-source-env
+    entrypoint: ["python", "-m", "postgres_to_es.catalog_events"]
+    command: ["bootstrap", "status", "--load-id", "${MOVIES_NOTIFICATIONS_LOAD_ID}"]
+    depends_on:
+      admin-migrate:
+        condition: service_completed_successfully
+      elasticsearch-init:
+        condition: service_completed_successfully
+
+  gateway:
+    logging: *default-logging
+    image: nginx:latest
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT}:80"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infra/nginx/conf.d:/etc/nginx/conf.d:ro
+      - admin_static:/opt/app/static:ro
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      notifications-api:
+        condition: service_healthy
+      admin:
+        condition: service_healthy
+      movies-api:
+        condition: service_healthy
+      ugc-events:
+        condition: service_healthy
+      ugc-api:
+        condition: service_healthy
+
+  # Ротация файлов nginx для filebeat; stdout контейнеров ротирует сам Docker (x-logging).
+  nginx-logrotate:
+    logging: *default-logging
+    build: ./infra/logrotate
+    restart: unless-stopped
+    init: true
+    volumes:
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - gateway
+
+  auth-rate-limit-load-test:
+    logging: *default-logging
+    build:
+      context: ./services/auth
+      dockerfile: Dockerfile
+    profiles: ["load-test"]
+    environment:
+      AUTH_BASE_URL: http://auth:8000
+      GATEWAY_BASE_URL: http://gateway
+    volumes:
+      - ./tests/load:/load:ro
+    command: ["python", "/load/auth_rate_limit.py"]
+    depends_on:
+      auth:
+        condition: service_healthy
+      gateway:
+        condition: service_started
+
+volumes:
+  notifications_mailpit_data:
+  notifications_db_data:
+  notifications_redis_data:
+  rabbitmq_data:
+  theatre_db_data:
+  auth_db_data:
+  auth_redis_data:
+  ugc_events_redis_data:
+  elasticsearch_data:
+  movies_etl_state:
+  admin_static:
+  kafka_0_data:
+  kafka_1_data:
+  kafka_2_data:
+  clickhouse_node1_data:
+  clickhouse_node2_data:
+  clickhouse_node3_data:
+  clickhouse_node4_data:
+  mongors1n1_data:
+  mongors1n2_data:
+  mongors1n3_data:
+  mongors2n1_data:
+  mongors2n2_data:
+  mongors2n3_data:
+  mongocfg1_data:
+  mongocfg2_data:
+  mongocfg3_data:
+  elk_elasticsearch_data:
+  filebeat_data:
+  nginx_logs:
+  sentry_db_data:

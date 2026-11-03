@@ -1,0 +1,56 @@
+@startuml ugc-etl-restart-sequence-as-is
+scale 0.8
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam dpi 150
+skinparam maxMessageSize 90
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #64748B
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    BoxBorderColor #94A3B8
+    BoxBackgroundColor #F8FAFC
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+}
+
+title UGC ETL — рестарт после падения (AS-IS)
+
+autonumber
+
+box "Сервис ETL" #EFF6FF
+    participant "UGC ETL\nэкземпляр 1" as etl1
+    participant "UGC ETL\nэкземпляр 2" as etl2
+end box
+
+participant "Kafka\ngroup ugc-etl" as kafka
+participant "ClickHouse" as ch
+
+etl1 -> ch: INSERT ugc.events батча N
+ch --> etl1: ok
+note over etl1, kafka
+  Процесс умер до Commit.
+  Офсет group не сдвинулся.
+  View уже мог записать
+  film_watches_local и page_events_local.
+end note
+
+etl2 -> kafka: join group = ugc-etl
+kafka --> etl2: те же офсеты батча N
+etl2 -> ch: INSERT тех же event_id
+ch --> etl2: ok\nReplicatedReplacingMergeTree
+etl2 -> kafka: Commit offsets
+
+note over ch
+  uniq(user_id) не растёт от дубля.
+  count() FINAL даёт одну строку
+  на event_id.
+end note
+
+@enduml

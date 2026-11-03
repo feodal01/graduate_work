@@ -1,0 +1,25 @@
+@startuml c4-container
+!include <C4/C4_Container>
+
+LAYOUT_WITH_LEGEND()
+
+title C4 уровень 2 — контейнеры Auth service
+
+Person(viewer, "Зритель", "Регистрируется, входит, обновляет пару токенов, выходит, меняет логин/пароль без email, смотрит историю входов")
+
+System_Ext(web, "Сайт и личный кабинет", "Клиент кинотеатра")
+System_Ext(movies, "Бэкенд кинотеатра", "Передаёт атрибуты фильма в /permissions/check и применяет решение")
+
+System_Boundary(authentication, "Система аутентификации") {
+    Container(auth_api, "Auth API", "FastAPI, REST, OpenAPI", "Аутентификация, RBAC, управление ролями и централизованная проверка доступа")
+    ContainerDb(postgres, "PostgreSQL", "PostgreSQL 16", "Источник истины RBAC: users, roles, permissions, role_permissions и user_roles. Также хранит login_history.")
+    ContainerDb(redis, "Redis", "Redis 7", "Производный cache-aside слой: пользовательские снимки прав, UUID-ревизия и mutation marker-ы. Справочник ролей не хранит. Также хранит refresh/denylist токенов.")
+}
+
+Rel(viewer, web, "Использует", "HTTPS")
+Rel(web, auth_api, "auth, profile, history, roles", "JSON / HTTPS")
+Rel(movies, auth_api, "permission check", "JSON / HTTPS")
+Rel(auth_api, postgres, "Читает и изменяет исходные RBAC-данные;\nпри cache miss вычисляет эффективные permissions", "SQL")
+Rel(auth_api, redis, "Читает и заполняет снимки; ставит marker-ы;\nлокально инвалидирует снимок или меняет общую ревизию", "Redis protocol / Lua")
+
+@enduml

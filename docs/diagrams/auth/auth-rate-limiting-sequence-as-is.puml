@@ -1,0 +1,130 @@
+@startuml auth-rate-limiting-sequence-as-is
+scale 0.55
+skinparam dpi 160
+skinparam maxMessageSize 90
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Auth — ограничение запросов (AS-IS)
+
+actor "Внешний клиент" as client
+participant "Nginx gateway" as gateway
+participant "Django Admin" as admin
+participant "Movies API" as movies
+box "Auth-сервис"
+    participant "FastAPI route" as auth
+    participant "Rate limiter" as limiter
+end box
+database "auth-redis" as redis
+
+note over gateway, auth
+  Маршруты с Token Bucket:
+  POST /api/v1/auth/signup — policy=signup, identity=login
+  POST /api/v1/auth/login — policy=login, identity=login
+  POST /api/v1/auth/refresh — policy=refresh, identity=UUID из проверенного JWT
+  GET /api/v1/auth/profile — policy=user, identity=UUID пользователя
+  PATCH /api/v1/auth/profile — policy=user, identity=UUID пользователя
+  GET /api/v1/auth/login-history — policy=user, identity=UUID пользователя
+  POST /api/v1/auth/logout — policy=user, identity=UUID пользователя
+  GET /api/v1/auth/roles — policy=admin, identity=UUID администратора
+  POST /api/v1/auth/roles — policy=admin, identity=UUID администратора
+  PATCH /api/v1/auth/roles/{role_id} — policy=admin, identity=UUID администратора
+  DELETE /api/v1/auth/roles/{role_id} — policy=admin, identity=UUID администратора
+  POST /api/v1/auth/users/{user_id}/roles — policy=admin, identity=UUID администратора
+  DELETE /api/v1/auth/users/{user_id}/roles/{role_id} — policy=admin, identity=UUID администратора
+  POST /api/v1/auth/permissions/check — policy=service, identity=movies-api
+end note
+
+note over gateway, auth
+  Маршруты без Token Bucket:
+  GET /api/v1/auth/social/{provider_name}/login
+  GET /api/v1/auth/social/{provider_name}/callback
+  GET /api/v1/health/
+  GET|HEAD /auth/docs
+  GET|HEAD /auth/openapi.json
+  GET|HEAD /docs/oauth2-redirect
+  GET|HEAD /redoc
+end note
+
+== Внешний запрос к Auth ==
+
+client -> gateway: запрос к /api/v1/auth/*
+gateway -> gateway: Leaky Bucket по IP\nrate=20r/s, burst=20, nodelay
+
+alt внешний лимит исчерпан
+    gateway --> client: 429 {"detail":"Too many requests"}\nRetry-After: 1
+else внешний лимит разрешает запрос
+    gateway -> auth: запрос Auth\nX-Request-Id
+    alt маршрут использует Token Bucket
+        auth -> auth: проверить HTTP-схему\nи обязательные credentials
+        auth -> limiter: policy + identity
+    else маршрут социального входа
+        auth -> auth: выполнить OAuth-маршрут\nбез внутреннего Token Bucket
+    end
+end
+
+== Прямые внутренние вызовы ==
+
+client -> gateway: /admin/*
+gateway -> admin: запрос Admin\nX-Request-Id
+admin -> auth: login, profile, refresh, logout,\nroles или role mutation\nX-Request-Id
+auth -> auth: проверить схему и credentials
+auth -> limiter: login, refresh, user или admin policy\nбез внешнего Nginx bucket
+
+client -> gateway: GET /api/v1/films/{film_id}/
+gateway -> movies: запрос карточки\nX-Request-Id
+movies -> auth: POST /api/v1/auth/permissions/check\nX-Service-Key, X-Request-Id
+auth -> auth: проверить X-Service-Key
+auth -> limiter: service policy, identity=movies-api\nбез внешнего Nginx bucket
+
+== Атомарный Token Bucket Auth ==
+
+note over auth, redis
+  Каждый запрос маршрута с Token Bucket выполняет
+  этот переход ровно один раз.
+end note
+
+limiter -> redis: один EVALSHA\nrate, window_seconds, capacity
+redis -> redis: TIME; refill; расход 1 token; EXPIRE
+
+alt token доступен
+    redis --> limiter: allowed=1, remaining, retry_after=0
+    limiter --> auth: продолжить бизнес-операцию
+    auth -> auth: вернуть бизнес-ответ\nтекущему вызывающему компоненту
+else bucket пуст
+    redis --> limiter: allowed=0, remaining=0, retry_after>=1
+    limiter --> auth: RateLimitExceededError
+    auth -> auth: вернуть текущему вызывающему компоненту\n429 {"detail":"Too many requests"} + Retry-After
+else connection error или timeout Redis
+    redis --> limiter: RateLimitStoreUnavailableError
+    limiter -> limiter: записать request_id и policy\nrate_limit.store_available=false
+    limiter --> auth: fail-open; продолжить бизнес-операцию
+else ошибка Lua или нарушение контракта
+    redis --> limiter: ResponseError или неверный результат
+    limiter --> auth: не применять fail-open
+end
+
+== Обработка 429 вызывающими сервисами ==
+
+alt Admin получает 429
+    admin -> admin: не повторять запрос\nсохранить Retry-After
+    alt Auth ограничил logout
+        admin -> admin: удалить локальную Django-сессию
+        admin --> gateway: 302 /admin/login/
+        gateway --> client: 302 /admin/login/
+    else Auth ограничил другой вызов Admin
+        admin --> gateway: страница 429\nRetry-After
+        gateway --> client: 429 Too many requests\nRetry-After
+    end
+else Movies API получает 429
+    movies -> movies: создать AuthRateLimitedError\nсохранить Retry-After
+    movies -> movies: не задерживать запрос\nприменить возрастную деградацию
+    alt фильму не меньше трёх лет
+        movies --> gateway: 200 карточка фильма
+    else дата отсутствует или фильму меньше трёх лет
+        movies --> gateway: 403 Film access denied
+    end
+    gateway --> client: ответ Movies API
+end
+
+@enduml

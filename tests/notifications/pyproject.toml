@@ -1,0 +1,24 @@
+[project]
+name = "notifications-integration-tests"
+version = "0.1.0"
+requires-python = ">=3.12,<3.14"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "pytest==8.4.2",
+  "jsonschema[format]==4.25.1",
+  "psycopg[binary]==3.2.10",
+  "pymongo==4.15.3",
+  "pika==1.3.2",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+addopts = "-ra"
+
+[tool.ruff]
+extend = "../../services/notifications/pyproject.toml"

@@ -1,0 +1,44 @@
+@startuml c4-component
+!include <C4/C4_Component>
+
+LAYOUT_WITH_LEGEND()
+
+title C4 уровень 3 — компоненты Auth API и RBAC-кэша
+
+Container_Ext(web, "Сайт и админка", "HTTPS-клиент", "Управляет ролями и назначениями пользователей")
+Container_Ext(movies, "Бэкенд кинотеатра", "Внутренний HTTPS-клиент", "Передаёт атрибуты фильма в POST /permissions/check и применяет решение")
+
+Container_Boundary(auth_api, "Auth API — FastAPI") {
+    Component(api, "RBAC API routers", "FastAPI", "HTTP-методы ролей, назначений и POST /permissions/check.")
+    Component(authz, "AuthorizationService", "Python service", "Политика доступа, проверка permissions и управление ролями. PostgreSQL остаётся источником истины.")
+    Component(repositories, "PostgreSQL repositories", "SQLAlchemy", "Читают и изменяют users, roles, permissions, role_permissions и user_roles.")
+    Component(authz_cache, "RedisAuthorizationCache", "redis-py facade", "Публичная граница RBAC-кэша и перевод RedisError в CacheUnavailableError.")
+    Component(snapshot_store, "RedisAuthorizationSnapshotStore", "MGET, SET, Lua", "Читает снимок и ревизию; условно сохраняет снимок после cache miss.")
+    Component(user_mutation, "RedisUserAuthorizationMutation", "SET NX, Lua", "Marker и локальная инвалидация снимка одного пользователя.")
+    Component(role_mutation, "RedisRoleAuthorizationMutation", "SET NX, Lua", "Глобальный marker и смена UUID-ревизии ролевых правил.")
+}
+
+ContainerDb(postgres, "PostgreSQL", "PostgreSQL 16", "Источник истины RBAC: users, roles, permissions, role_permissions и user_roles.")
+ContainerDb(redis, "Redis", "Redis 7", "Производные пользовательские снимки, per-user/global marker-ы и UUID-ревизия. Справочник ролей не хранит.")
+
+Rel(web, api, "Управление ролями и назначениями", "HTTPS / JSON")
+Rel(movies, api, "POST /permissions/check", "HTTPS / JSON")
+Rel(api, authz, "Делегирует RBAC-команды и permission check")
+Rel(authz, repositories, "При miss читает эффективные права; изменяет RBAC")
+Rel(authz, authz_cache, "read/store snapshot; user/roles mutation contexts")
+Rel(repositories, postgres, "Исходные данные RBAC", "SQL")
+Rel(authz_cache, snapshot_store, "Чтение и условная запись снимков")
+Rel(authz_cache, user_mutation, "Локальная инвалидация")
+Rel(authz_cache, role_mutation, "Глобальная инвалидация")
+Rel(snapshot_store, redis, "Revision, markers, snapshot", "MGET / SET / Lua")
+Rel(user_mutation, redis, "User marker и удаление снимка", "SET NX / Lua")
+Rel(role_mutation, redis, "Roles marker и смена revision", "SET NX / Lua")
+
+Lay_D(api, authz)
+Lay_L(authz, repositories)
+Lay_R(authz, authz_cache)
+Lay_D(authz_cache, snapshot_store)
+Lay_R(authz_cache, user_mutation)
+Lay_R(user_mutation, role_mutation)
+
+@enduml

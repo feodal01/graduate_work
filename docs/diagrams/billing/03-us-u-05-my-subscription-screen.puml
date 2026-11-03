@@ -1,0 +1,65 @@
+@startuml 03-us-u-05-my-subscription-screen
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam dpi 110
+skinparam maxMessageSize 250
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign center
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #94A3B8
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+    DividerBackgroundColor #E2E8F0
+    DividerBorderColor #64748B
+}
+
+title Вход пользователя и просмотр экрана «Моя подписка» (US-U-05)
+
+autonumber
+
+actor "Пользователь" as user
+participant "Billing" as bil
+participant "Auth" as auth
+
+== 1. Основной сценарий (Happy Path) ==
+
+user -> bil: Вводит логин и пароль на экране входа (/billing/login)
+bil -> auth: Проверяет логин и пароль
+auth --> bil: Токены доступа пользователя
+bil --> user: Сохраняет сессию (HttpOnly cookie) и перенаправляет на «Мою подписку»
+
+user -> bil: Открывает экран «Моя подписка» (/billing/)
+bil -> auth: Проверяет токен и получает часовой пояс пользователя (tz)
+auth --> bil: Токен подтверждён (user_id, логин, часовой пояс)
+
+bil -> bil: Читает подписки и платежи пользователя из своей БД,\nпереводит даты в часовой пояс пользователя и вычисляет единый статус\n(см. схему выбора статуса 04-us-u-05-status-priority-flowchart)
+bil --> user: Показывает текущий статус подписки, доступную кнопку\nи таблицу истории всех платежей (включая неуспешные и возвраты)
+
+== 2. Краевые случаи и сбои ==
+
+group Пользователь открыл «Мою подписку» без входа (или токен истёк)
+    user -> bil: Открывает /billing/ без действующей сессии
+    bil --> user: Перенаправляет на экран входа (/billing/login)
+end
+
+group Неверный логин/пароль или превышен лимит попыток входа
+    user -> bil: Отправляет форму входа
+    bil -> auth: Проверяет учётные данные
+    auth --> bil: 401 Неверные данные (или 429 Слишком много попыток)
+    bil --> user: Показывает понятное сообщение об ошибке на экране входа
+end
+
+group Сбой связи: сервис Auth временно недоступен при проверке пользователя
+    user -> bil: Открывает «Мою подписку» или «Результат оплаты»
+    bil -[#DC2626]>x auth: Ошибка связи или 5xx
+    bil --> user: 503 Экран ошибки «Сервис авторизации временно недоступен»\n(данные подписки и платежей не раскрываются без подтверждения личности)
+end
+
+@enduml

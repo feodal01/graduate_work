@@ -1,0 +1,7 @@
+[
+  {
+    "load_id": "initial-users-v1",
+    "expected_count": 2,
+    "manifest_hash": "16e4e672d167a790af6327012fec111a7a8e9b834c371afb62c472cd36a55fbd"
+  }
+]

@@ -1,0 +1,142 @@
+@startuml 14-er-notifications-db-target
+
+hide circle
+skinparam linetype ortho
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam dpi 120
+skinparam nodesep 55
+skinparam ranksep 55
+skinparam packageStyle rectangle
+
+skinparam class {
+    BackgroundColor #F8FAFC
+    HeaderBackgroundColor #E2E8F0
+    BorderColor #64748B
+    ArrowColor #334155
+}
+
+title Целевая ER-диаграмма БД сервиса Notifications (контур кампаний и доставок — выделены изменения)
+
+legend top left
+  |<#DCFCE7> **Зелёный** | **Новая таблица** (добавляется в проекте Биллинг) |
+  |<#FEF9C3> **Жёлтый** | **Дорабатываемая таблица** (новое ограничение CHECK / логика отмены) |
+  |<#F8FAFC> **Серый** | Существующая таблица Notifications без изменений схемы |
+endlegend
+
+package "1 — Контур внешних рассылок и отмены писем (Campaign API)" {
+
+    entity "cancelled_campaigns\n[НОВАЯ ТАБЛИЦА — инвариант 12]" as cancelled_campaigns #DCFCE7 {
+        * **campaign_id** : UUID <<PK>>
+        --
+        * **[NEW] cancelled_at** : TIMESTAMPTZ NOT NULL
+        --
+        Записывается при вызове POST /campaigns/{id}/cancel\n(ON CONFLICT DO NOTHING).\nПозволяет запомнить отмену письма об окончании подписки,\nдаже если запрос отмены пришёл РАНЬШЕ планирования батча.
+    }
+
+    entity "campaigns\n[Используется при приёме и отмене]" as campaigns #F8FAFC {
+        * **campaign_id** : UUID <<PK>>
+        --
+        created_by_user_id : UUID NULL
+        * intake_status : TEXT ['open', 'closed']
+        expected_batches : INTEGER NULL
+        * created_at : TIMESTAMPTZ
+        closed_at : TIMESTAMPTZ NULL
+    }
+
+    entity "campaign_batches" as campaign_batches #F8FAFC {
+        * **campaign_id** : UUID <<PK, FK campaigns.campaign_id>>
+        * **batch_id** : UUID <<PK>>
+        --
+        * request_hash : VARCHAR(64)
+        * item_count : INTEGER
+        * accepted_at : TIMESTAMPTZ
+    }
+
+    entity "campaign_recipients" as campaign_recipients #F8FAFC {
+        * **campaign_id** : UUID <<PK, FK>>
+        * **user_id** : UUID <<PK, FK profiles.user_id>>
+        --
+        * batch_id : UUID <<FK>>
+        delivery_id : UUID <<FK deliveries.delivery_id, UNIQUE NULL>>
+        * template_id : VARCHAR(64) ('billing_notification', 'personal_offer')
+        * channel : TEXT ('email')
+        subject : TEXT NULL
+        text : TEXT NULL
+        source_available_at : TIMESTAMPTZ NULL
+        * effective_available_at : TIMESTAMPTZ
+        skip_reason : TEXT NULL
+    }
+}
+
+package "2 — Ядро доставки писем и профили получателей" {
+
+    entity "deliveries\n[ДОРАБАТЫВАЕТСЯ — причина отмены и шаблон без подписки]" as deliveries #FEF9C3 {
+        * **delivery_id** : UUID <<PK>>
+        --
+        * logical_key : TEXT <<UNIQUE>>
+        * user_id : UUID <<FK profiles.user_id>>
+        run_id : UUID <<FK schedule_runs.run_id NULL>>
+        * kind : TEXT ['welcome', 'likes', 'new_films', 'external']
+        external_send_class : TEXT NULL ['transactional', 'service', 'bulk']
+        **[CHANGE] required_subscription** : TEXT NULL\n  (NULL разрешён для внешнего шаблона 'billing_notification')
+        **[CHANGE] terminal_reason** : TEXT NULL\n  **[NEW]** добавлено значение **'cancelled_by_sender'**\n  в CHECK (terminal_reason IN (...))
+        * send_class : TEXT <<GENERATED>>
+        * status : TEXT\n  ['pending', 'prepared', 'sending', 'retry',\n   'sent', 'cancelled', 'skipped', 'failed']
+        payload : JSONB NULL
+        message_id : TEXT <<UNIQUE NULL>>
+        prepared_at : TIMESTAMPTZ NULL
+        terminal_at : TIMESTAMPTZ NULL
+        sent_at : TIMESTAMPTZ NULL
+        * next_attempt_at : TIMESTAMPTZ
+        * attempt_count : INTEGER
+        lease_token : UUID NULL
+        lease_until : TIMESTAMPTZ NULL
+    }
+
+    entity "outbox\n(Очередь публикации в RabbitMQ с available_at)" as outbox #F8FAFC {
+        * **outbox_id** : UUID <<PK>>
+        --
+        * delivery_id : UUID <<FK deliveries.delivery_id>>
+        * created_at : TIMESTAMPTZ
+        * available_at : TIMESTAMPTZ (ждёт конца подписки T)
+        published_at : TIMESTAMPTZ NULL
+        lease_token : UUID NULL
+        lease_until : TIMESTAMPTZ NULL
+    }
+
+    entity "delivery_attempts" as delivery_attempts #F8FAFC {
+        * **attempt_id** : UUID <<PK>>
+        --
+        * delivery_id : UUID <<FK deliveries.delivery_id>>
+        * attempt_number : INTEGER
+        * started_at : TIMESTAMPTZ
+        finished_at : TIMESTAMPTZ NULL
+        * outcome : TEXT
+        error : TEXT NULL
+        * duplicate_risk : BOOLEAN
+    }
+
+    entity "profiles\n(Локальная проекция из Auth)" as profiles #F8FAFC {
+        * **user_id** : UUID <<PK>>
+        --
+        * user_version : BIGINT
+        tz : TEXT NULL
+        * likes : BOOLEAN
+        * new_films : BOOLEAN
+        * marketing : BOOLEAN
+        deleted_at : TIMESTAMPTZ NULL
+    }
+}
+
+cancelled_campaigns |o..o| campaigns : "campaign_id (может появиться до создания кампании)"
+campaigns ||--o{ campaign_batches : "campaign_id"
+campaign_batches ||--o{ campaign_recipients : "campaign_id, batch_id"
+profiles ||--o{ campaign_recipients : "user_id"
+profiles ||--o{ deliveries : "user_id"
+deliveries |o--o| campaign_recipients : "delivery_id (1:1)"
+deliveries ||--o{ outbox : "delivery_id"
+deliveries ||--o{ delivery_attempts : "delivery_id"
+
+@enduml

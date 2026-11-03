@@ -1,0 +1,33 @@
+[project]
+name = "notifications-des"
+version = "0.1.0"
+description = "Дискретно-событийная модель (SimPy) архитектуры сервиса уведомлений, дизайн v4"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.10",
+    "numpy>=2.3",
+    "simpy>=4.1",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP"]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.mypy]
+python_version = "3.12"
+files = ["model.py"]
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+pretty = true
+show_error_codes = true

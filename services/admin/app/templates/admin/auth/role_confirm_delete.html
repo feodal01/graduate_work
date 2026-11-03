@@ -1,0 +1,12 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}Delete role{% endblock %}
+
+{% block content %}
+<h1>Delete role</h1>
+<p>Delete role {{ role.name }}?</p>
+<form method="post">
+  {% csrf_token %}
+  <button type="submit">Delete</button>
+</form>
+{% endblock %}

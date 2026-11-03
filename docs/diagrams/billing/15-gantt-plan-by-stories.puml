@@ -1,0 +1,218 @@
+@startgantt 15-gantt-plan-by-stories
+
+title Диаграмма Ганта проекта «Биллинг»: задачи в разрезе сторей (1 исполнитель, 8 ч/день, пн–сб)
+
+<style>
+ganttDiagram {
+  task {
+    FontName Arial
+    FontSize 11
+    LineColor #475569
+  }
+  separator {
+    FontSize 12
+    FontStyle bold
+    LineColor #94A3B8
+    BackGroundColor #F1F5F9
+  }
+  milestone {
+    FontStyle bold
+    BackGroundColor #DC2626
+    LineColor #DC2626
+  }
+  arrow {
+    LineColor #94A3B8
+  }
+}
+</style>
+
+language ru
+Project starts 2026-10-26
+printscale daily zoom 2
+sunday are closed
+today is 2026-11-02 and is colored in #FEF3C7
+
+legend top left
+  |<back:#CBD5E1>        </back>| Неделя 1 — выполнено |
+  |<back:#BFDBFE>        </back>| **FEAT-01** Покупка подписки и открытие доступа |
+  |<back:#BBF7D0>        </back>| **FEAT-02** Личный кабинет, уведомления, истечение срока |
+  |<back:#FDE68A>        </back>| **FEAT-03** История и возврат через Django-админку |
+  |<back:#DDD6FE>        </back>| **FEAT-04** Контроль сбоев и аудит поддержки |
+  |<back:#FCA5A5>        </back>| Рисковая задача: интеграция с ЮKassa или координация воркера outbox (8.4) |
+  |<back:#E2E8F0>        </back>| Стабилизация и релиз |
+  | | Длина полосы = оценка в рабочих часах (8 ч = 1 день); воскресенье — выходной, суббота — контрольная отсечка 8.4 |
+  | | Ёмкость: 48 ч в неделю; план по неделям: 48 / 48 / 48 / 48 ч; итого 192 ч |
+endlegend
+
+-- Неделя 1 · Проектирование и защита архитектуры (выполнено) · 48 ч --
+[T-01 Разбор задания, груминг корнер-кейсов · 8 ч] as [T-01] requires 24 hours
+[T-01] is colored in #CBD5E1/#475569
+[T-01] is 100% completed
+[T-02 ТЗ: предметная область, сценарии, требования сервисов · 16 ч] as [T-02] requires 48 hours
+[T-02] is colored in #CBD5E1/#475569
+[T-02] is 100% completed
+[T-03 Sequence-схемы сценариев и C4 L2/L3 · 12 ч] as [T-03] requires 36 hours
+[T-03] is colored in #CBD5E1/#475569
+[T-03] is 100% completed
+[T-04 ER-диаграммы Billing, Auth, Notifications · 6 ч] as [T-04] requires 18 hours
+[T-04] is colored in #CBD5E1/#475569
+[T-04] is 100% completed
+[T-05 Декомпозиция, оценки и диаграмма Ганта · 6 ч] as [T-05] requires 18 hours
+[T-05] is colored in #CBD5E1/#475569
+[T-05] is 100% completed
+
+-- Общий каркас (нужен всем сторям) · 7 ч --
+[T-06 Каркас services/billing, health, Docker Compose, маршруты nginx · 4 ч] as [T-06] requires 12 hours
+[T-06] is colored in #BFDBFE/#475569
+[T-07 Миграции billing-db: таблицы, индексы, справочники tariffs и payment_providers · 3 ч] as [T-07] requires 9 hours
+[T-07] is colored in #BFDBFE/#475569
+
+-- FEAT-01 · US-U-01 Покупка подписки · 13 ч --
+[T-08 Экран входа Э1 через Auth, токены в HttpOnly-cookie · 3 ч] as [T-08] requires 9 hours
+[T-08] is colored in #BFDBFE/#475569
+[T-09 Адаптер ЮKassa (ACL): POST/GET платежа, Idempotence-Key, metadata, перевод статусов · 6 ч] as [T-09] requires 18 hours
+[T-09] is colored in #FCA5A5/#475569
+[T-10 Создание покупки: pending, идемпотентность, запрет при активной подписке · 4 ч] as [T-10] requires 12 hours
+[T-10] is colored in #BFDBFE/#475569
+
+-- FEAT-01 · US-U-02 Итог оплаты · 9 ч --
+[T-11 Сверка GET и атомарная фиксация итога: подписка, журнал, outbox, версия доступа · 6 ч] as [T-11] requires 18 hours
+[T-11] is colored in #FCA5A5/#475569
+[T-12 Экран «Результат оплаты» Э3: чтение локального статуса в БД, 4 блока, автообновление · 3 ч] as [T-12] requires 9 hours
+[T-12] is colored in #BFDBFE/#475569
+
+-- FEAT-01 · US-U-03 Повтор после неудачной оплаты · 2 ч --
+[T-13 Фиксация «Не оплачен», /continue (локальный статус + GET в ЮKassa + пересоздание при отмене) · 2 ч] as [T-13] requires 6 hours
+[T-13] is colored in #BFDBFE/#475569
+
+-- FEAT-01 · US-U-04 Просмотр новинок · 10 ч --
+[T-14 Auth: миграция expires_at и access_state, PUT subscription-access с версией · 4 ч] as [T-14] requires 12 hours
+[T-14] is colored in #BFDBFE/#475569
+[T-15 Auth: игнор истёкших ролей, TTL кэша прав до expires_at · 2 ч] as [T-15] requires 6 hours
+[T-15] is colored in #BFDBFE/#475569
+[T-16 Billing: клиент Auth и немедленная отправка доступа из outbox · 4 ч] as [T-16] requires 12 hours
+[T-16] is colored in #FCA5A5/#475569
+
+-- FEAT-01 · US-S-01 Получение итога операции у ЮKassa · 7 ч --
+[T-17 billing-worker: фоновая сверка с отступом RECONCILE_MIN_AGE_SECONDS, досоздание 24 ч, 4xx · 5 ч] as [T-17] requires 15 hours
+[T-17] is colored in #FCA5A5/#475569
+[T-18 Обработчик вебхука ЮKassa и локальный эмулятор · 2 ч] as [T-18] requires 6 hours
+[T-18] is colored in #BFDBFE/#475569
+
+-- FEAT-02 · US-S-02 Доставка последствий в Auth и Notifications · 9 ч --
+[T-19 Воркер outbox: SKIP LOCKED, backoff, «Требует вмешательства», устаревшие версии · 6 ч] as [T-19] requires 18 hours
+[T-19] is colored in #FCA5A5/#475569
+[T-20 Клиент Notifications, письма «Оплата прошла» и «Оплата не прошла» · 3 ч] as [T-20] requires 9 hours
+[T-20] is colored in #BBF7D0/#475569
+
+-- FEAT-02 · US-S-03 Окончание подписки по сроку · 6 ч --
+[T-21 Notifications: шаблон billing_notification, transactional, available_at · 4 ч] as [T-21] requires 12 hours
+[T-21] is colored in #BBF7D0/#475569
+[T-22 Billing: планирование письма об окончании на дату T · 2 ч] as [T-22] requires 6 hours
+[T-22] is colored in #BBF7D0/#475569
+
+-- FEAT-02 · US-U-05 Статус и история · 5 ч --
+[T-23 Экран «Моя подписка»: статус по 7 правилам, история, часовой пояс · 5 ч] as [T-23] requires 15 hours
+[T-23] is colored in #BBF7D0/#475569
+
+-- FEAT-02 · US-U-06 Потеря доступа · 3 ч --
+[T-24 Notifications: отмена кампании, cancelled_campaigns, cancelled_by_sender · 3 ч] as [T-24] requires 9 hours
+[T-24] is colored in #BBF7D0/#475569
+
+-- FEAT-03 · US-A-01 Найти пользователя и его историю · 9 ч --
+[T-25 Auth: внутренний lookup по login и списку user_ids · 2 ч] as [T-25] requires 6 hours
+[T-25] is colored in #FDE68A/#475569
+[T-26 Billing: внутренние списки подписок и платежей, X-Service-Api-Key · 3 ч] as [T-26] requires 9 hours
+[T-26] is colored in #FDE68A/#475569
+[T-27 Админка: списки, поиск по UUID и логину, UTC и пояс пользователя · 4 ч] as [T-27] requires 12 hours
+[T-27] is colored in #FDE68A/#475569
+
+-- FEAT-03 · US-A-03 Карточка платежа · 3 ч --
+[T-28 Карточка платежа: возвраты, переходы, задачи доставки · 3 ч] as [T-28] requires 9 hours
+[T-28] is colored in #FDE68A/#475569
+
+-- FEAT-03 · US-A-04 Оформить возврат · 9 ч --
+[T-29 Возврат: ACL refunds, розыск по metadata, отзыв доступа, отмена письма · 7 ч] as [T-29] requires 21 hours
+[T-29] is colored in #FCA5A5/#475569
+[T-30 Админка: страница подтверждения возврата с причиной · 2 ч] as [T-30] requires 6 hours
+[T-30] is colored in #FDE68A/#475569
+
+-- FEAT-04 · US-A-02 Найти проблемные операции · 8 ч --
+[T-31 Фильтры «Зависшие операции» и «Не доставлено в Auth или Notifications» · 4 ч] as [T-31] requires 12 hours
+[T-31] is colored in #DDD6FE/#475569
+[T-32 Кнопки «Повторить» и «Закрыть с причиной» · 4 ч] as [T-32] requires 12 hours
+[T-32] is colored in #DDD6FE/#475569
+
+-- FEAT-04 · US-A-05 Журнал действий администраторов · 3 ч --
+[T-33 Журнал admin_actions: API и экран с фильтрами · 3 ч] as [T-33] requires 9 hours
+[T-33] is colored in #DDD6FE/#475569
+
+-- FEAT-04 · US-A-06 Проверить статус в ЮKassa сейчас · 3 ч --
+[T-34 Принудительная сверка без лимита 5 с и кнопка в карточке · 3 ч] as [T-34] requires 9 hours
+[T-34] is colored in #DDD6FE/#475569
+
+-- Стабилизация и релиз (все стори) · 38 ч --
+[T-35 Метрики и сигналы мониторинга · 3 ч] as [T-35] requires 9 hours
+[T-35] is colored in #E2E8F0/#475569
+[T-36 E2E-тесты сквозных сценариев на тестовом магазине ЮKassa · 8 ч] as [T-36] requires 24 hours
+[T-36] is colored in #E2E8F0/#475569
+[T-37 Стаб-тесты матрицы деградации · 8 ч] as [T-37] requires 24 hours
+[T-37] is colored in #FCA5A5/#475569
+[T-38 Устранение замечаний код-ревьюера · 8 ч] as [T-38] requires 24 hours
+[T-38] is colored in #E2E8F0/#475569
+[T-39 README и инструкция запуска · 2 ч] as [T-39] requires 6 hours
+[T-39] is colored in #E2E8F0/#475569
+[T-40 Подготовка защиты: презентация, прогон демо 9.2 · 5 ч] as [T-40] requires 15 hours
+[T-40] is colored in #E2E8F0/#475569
+[T-41 Резерв на риски · 4 ч] as [T-41] requires 12 hours
+[T-41] is colored in #E2E8F0/#475569
+
+' Последовательность работ одного исполнителя
+[T-02] starts at [T-01]'s end
+[T-03] starts at [T-02]'s end
+[T-04] starts at [T-03]'s end
+[T-05] starts at [T-04]'s end
+[T-06] starts at [T-05]'s end
+[T-07] starts at [T-06]'s end
+[T-08] starts at [T-07]'s end
+[T-09] starts at [T-08]'s end
+[T-10] starts at [T-09]'s end
+[T-11] starts at [T-10]'s end
+[T-12] starts at [T-11]'s end
+[T-13] starts at [T-12]'s end
+[T-14] starts at [T-13]'s end
+[T-15] starts at [T-14]'s end
+[T-16] starts at [T-15]'s end
+[T-17] starts at [T-16]'s end
+[T-18] starts at [T-17]'s end
+[T-19] starts at [T-18]'s end
+[T-20] starts at [T-19]'s end
+[T-21] starts at [T-20]'s end
+[T-22] starts at [T-21]'s end
+[T-23] starts at [T-22]'s end
+[T-24] starts at [T-23]'s end
+[T-25] starts at [T-24]'s end
+[T-26] starts at [T-25]'s end
+[T-27] starts at [T-26]'s end
+[T-28] starts at [T-27]'s end
+[T-29] starts at [T-28]'s end
+[T-30] starts at [T-29]'s end
+[T-31] starts at [T-30]'s end
+[T-32] starts at [T-31]'s end
+[T-33] starts at [T-32]'s end
+[T-34] starts at [T-33]'s end
+[T-35] starts at [T-34]'s end
+[T-36] starts at [T-35]'s end
+[T-37] starts at [T-36]'s end
+[T-38] starts at [T-37]'s end
+[T-39] starts at [T-38]'s end
+[T-40] starts at [T-39]'s end
+[T-41] starts at [T-40]'s end
+
+' Контрольные точки курса (8.2)
+[Демо недели 1 · архитектура и план] happens 2026-11-01
+[FEAT-01 выпущена] happens at [T-18]'s end
+[Демо перед код-ревьюером · FEAT-02, FEAT-03] happens 2026-11-15
+[Финальный релиз MVP и защита] happens 2026-11-22
+
+@endgantt

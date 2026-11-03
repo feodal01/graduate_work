@@ -1,0 +1,77 @@
+@startuml 09-us-s-02-outbox-and-ordering-mechanics
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam dpi 110
+skinparam maxMessageSize 250
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign center
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #94A3B8
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+    DividerBackgroundColor #E2E8F0
+    DividerBorderColor #64748B
+}
+
+title Системная механика: надёжная доставка в Auth и Notifications (US-S-02)
+
+autonumber
+
+participant "Billing\n(API и фоновый воркер)" as bil
+participant "Auth\n(Доступ к новинкам)" as auth
+participant "Notifications\n(Campaign API)" as ntf
+participant "Мониторинг и Админка\n(GlitchTip / Поддержка)" as mon
+
+== 1. Основной сценарий доставки (сразу после записи в БД или воркером каждые 2 с) ==
+
+bil -> bil: Берёт готовые задачи из таблицы outbox\n(с построчной блокировкой, чтобы два воркера не взяли одну задачу)
+
+bil -> auth: Передаёт желаемое состояние доступа (версия V, срок до T или «доступа нет»)
+auth -> auth: Проверяет, что версия V новее сохранённой,\nобновляет роль и сразу сбрасывает кэш прав пользователя в Redis
+auth --> bil: 200 OK (доступ обновлён мгновенно)
+
+bil -> ntf: Отправляет задачу письма (шаблон billing_notification) или отмену письма по campaign_id
+ntf -> ntf: Сохраняет письмо в свою очередь (без проверки рекламных согласий и дневного окна)
+ntf --> bil: 202 / 200 OK
+
+bil -> bil: Помечает задачи в outbox выполненными (completed)
+
+== 2. Защита от перестановки запросов и обработка сбоев ==
+
+group Гонка в сети: старая задача доступа в Auth пришла ПОСЛЕ более новой
+    bil -> auth: Сначала дошла версия V=2 («доступа нет» после возврата)
+    auth --> bil: 200 OK (сохранена версия 2, доступ закрыт)
+    bil -> auth: Запоздало дошла старая версия V=1 («доступ открыт до T»)
+    auth -> auth: Видит V=1 <= сохранённой версии 2 -> игнорирует старую запись
+    auth --> bil: 200 OK (доступ остаётся закрытым, задача в Billing закрывается)
+end
+
+group Гонка в сети: отмена письма об окончании пришла РАНЬШЕ его планирования
+    bil -> ntf: Сначала дошёл запрос отменить письмо об окончании (campaign_id)
+    ntf -> ntf: Запоминает campaign_id в таблице отменённых кампаний
+    ntf --> bil: 200 OK
+    bil -> ntf: Запоздало дошёл запрос запланировать письмо с тем же campaign_id
+    ntf -> ntf: Видит campaign_id в отменённых -> сразу сохраняет как «Отменено» без отправки
+    ntf --> bil: 202 OK (ложное письмо об окончании не уйдёт)
+end
+
+group Временный сбой (тайм-аут, 5xx, 429 или профиль в Notifications ещё не готов 409)
+    bil -[#DC2626]>x auth: Временная ошибка связи или 5xx
+    bil -> bil: Откладывает задачу на повтор с растущей паузой (экспоненциальный backoff, до 20 попыток)
+    bil -> auth: Доставляет задачу после восстановления сервиса
+end
+
+group Постоянная ошибка (400/401/404/422) или исчерпаны все 20 попыток повтора
+    bil -[#DC2626]>x auth: Постоянная ошибка или 20-й сбой подряд
+    bil -> bil: Останавливает автоповторы и переводит задачу в «Требует вмешательства»
+    bil -> mon: Отправляет сигнал ERROR в GlitchTip и показывает задачу в админке\n(админ может нажать «Повторить» или «Закрыть с причиной»)
+end
+
+@enduml

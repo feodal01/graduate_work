@@ -1,0 +1,31 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}Auth roles{% endblock %}
+
+{% block content %}
+<h1>Auth roles</h1>
+<p>
+  <a href="{% url 'admin:auth_role_add' %}">Create role</a> |
+  <a href="{% url 'admin:auth_user_role_add' %}">Assign role</a> |
+  <a href="{% url 'admin:auth_user_role_delete' %}">Revoke role</a>
+</p>
+<table>
+  <thead>
+    <tr><th>Name</th><th>Permissions</th><th>Actions</th></tr>
+  </thead>
+  <tbody>
+  {% for role in roles %}
+    <tr>
+      <td>{{ role.name }}</td>
+      <td>{{ role.permissions|join:", " }}</td>
+      <td>
+        <a href="{% url 'admin:auth_role_change' role.id %}">Change</a>
+        <a href="{% url 'admin:auth_role_delete' role.id %}">Delete</a>
+      </td>
+    </tr>
+  {% empty %}
+    <tr><td colspan="3">No roles.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

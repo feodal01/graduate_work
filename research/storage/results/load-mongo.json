@@ -1,0 +1,19 @@
+{
+  "store": "mongo",
+  "workers": 6,
+  "ratings_seconds": 34.089487249962986,
+  "bookmarks_seconds": 6.341230916092172,
+  "index_seconds": 35.7079321249621,
+  "sizes": {
+    "ratings": {
+      "rows": 10000000,
+      "data_bytes": 758665216,
+      "index_bytes": 808275968
+    },
+    "bookmarks": {
+      "rows": 2000000,
+      "data_bytes": 124620800,
+      "index_bytes": 137621504
+    }
+  }
+}

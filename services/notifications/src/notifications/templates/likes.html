@@ -1,0 +1,1 @@
+<!doctype html><html><body><h1>Новые лайки{% if first_name %}, {{ first_name }}{% endif %}</h1>{% for review in reviews %}<p>Комментарий {{ review.review_id }}: {{ review.likes_count }} лайков.</p>{% endfor %}</body></html>

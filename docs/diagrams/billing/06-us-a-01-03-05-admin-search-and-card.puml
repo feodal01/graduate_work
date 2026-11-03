@@ -1,0 +1,80 @@
+@startuml 06-us-a-01-03-05-admin-search-and-card
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam dpi 110
+skinparam maxMessageSize 250
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign center
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #94A3B8
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+    DividerBackgroundColor #E2E8F0
+    DividerBorderColor #64748B
+}
+
+title Поиск пользователя, карточка платежа и журнал действий в Админке (US-A-01, US-A-03, US-A-05)
+
+autonumber
+
+actor "Администратор" as admin_user
+participant "Django-админка" as adm
+participant "Auth" as auth
+participant "Billing" as bil
+
+== 1. Поиск подписок пользователя по логину или UUID (US-A-01) ==
+
+admin_user -> adm: Вводит логин или UUID пользователя в разделе «Подписки»
+adm -> auth: Если введён логин — запрашивает UUID и часовой пояс пользователя
+auth --> adm: Найдены user_id, логин и часовой пояс (tz)
+
+adm -> bil: Запрашивает список подписок пользователя (по user_id)
+bil --> adm: Список подписок (период, вычисленный статус, сумма, ссылка на платёж)
+
+adm -> auth: Запрашивает логины и часовые пояса для уникальных пользователей страницы (1 пакетный запрос)
+auth --> adm: Логины и часовые пояса
+adm --> admin_user: Показывает таблицу подписок (только чтение, даты в UTC и в поясе пользователя)
+
+== 2. Просмотр карточки платежа и журнала действий (US-A-03, US-A-05) ==
+
+admin_user -> adm: Открывает карточку платежа
+adm -> bil: Запрашивает полные данные платежа
+bil --> adm: Платёж, подписка, попытки возврата, история переходов статусов и задачи outbox
+adm -> auth: Запрашивает логин и часовой пояс пользователя
+auth --> adm: Логин и часовой пояс
+adm --> admin_user: Показывает полную хронологию операции и доступные кнопки («Вернуть», «Проверить в ЮKassa»)
+
+admin_user -> adm: Открывает «Журнал действий администраторов»
+adm -> bil: Запрашивает историю ручных действий поддержки
+bil --> adm: Список возвратов, повторов и закрытий задач (кто, когда, причина)
+adm --> admin_user: Показывает неизменяемый журнал аудита (только чтение)
+
+== 3. Краевые случаи и сбои ==
+
+group Логин пользователя не найден в Auth
+    admin_user -> adm: Ищет несуществующий логин
+    adm -> auth: Запрашивает пользователя по логину
+    auth --> adm: Пользователь не найден
+    adm --> admin_user: Показывает пустой список результатов
+end
+
+group Сбой связи: сервис Auth временно недоступен (деградация без падения админки)
+    adm -[#DC2626]>x auth: Ошибка связи или 5xx при поиске / обогащении профилей
+    adm -> bil: Читает подписки и карточку платежа из Billing по UUID
+    bil --> adm: Данные операций
+    adm --> admin_user: Списки и карточка работают: вместо логина виден UUID, даты показаны в UTC\n(для поиска по логину выводится подсказка использовать UUID)
+end
+
+group Сбой связи: сервис Billing временно недоступен
+    adm -[#DC2626]>x bil: Ошибка связи или 5xx
+    adm --> admin_user: 503 Понятное сообщение «Сервис биллинга временно недоступен»
+end
+
+@enduml

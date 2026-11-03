@@ -1,0 +1,62 @@
+@startuml auth-yandex-login-start-sequence-as-is
+scale 0.9
+skinparam dpi 160
+skinparam maxMessageSize 90
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Auth — начало входа через зарегистрированного провайдера Yandex (AS-IS)
+
+actor "Пользователь" as user
+participant "Браузер" as browser
+participant "Nginx gateway" as gateway
+box "Auth-сервис"
+    participant "GET /api/v1/auth/social/{provider_name}/login" as api
+    participant "SocialAuthenticationService" as service
+end box
+database "auth-redis" as redis
+participant "Яндекс ID" as yandex
+
+note over gateway
+  Текущий лимит Nginx по IP может вернуть HTTP 429
+  до передачи запроса в Auth.
+end note
+
+user -> browser: открыть вход через Яндекс
+browser -> gateway: GET /api/v1/auth/social/yandex/login
+gateway -> api: provider_name=yandex + X-Request-Id
+api -> api: найти provider resolver по provider_name
+
+alt provider_name не зарегистрирован
+    api --> gateway: 404 Social provider is not supported
+    gateway --> browser: 404
+else Yandex OAuth отключён
+    api --> gateway: 503 Yandex OAuth is not configured
+    gateway --> browser: 503
+else Yandex OAuth включён
+    api -> service: начать OAuth-вход
+    service -> service: создать state, code_verifier\nи code_challenge S256
+    service -> redis: SET NX oauth-state:<sha256(state)>\ncode_verifier EX 600
+
+    alt Redis недоступен
+        redis --> service: OAuthStateStoreUnavailableError
+        service --> api: ошибка безопасного состояния
+        api --> gateway: 503 OAuth state store is unavailable
+        gateway --> browser: 503
+    else состояние сохранено
+        redis --> service: OK
+        service --> api: URL Яндекс OAuth
+        api --> gateway: 307 Location: https://oauth.yandex.ru/authorize
+        gateway --> browser: 307
+        browser -> yandex: GET /authorize\nclient_id, redirect_uri, state, PKCE, scopes
+        yandex --> browser: форма входа и согласия
+        browser --> user: показать форму Яндекс ID
+    end
+end
+
+note over service, redis
+  Три последовательных конфликта SET NX возвращают
+  503 OAuth state could not be created.
+end note
+
+@enduml

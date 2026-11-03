@@ -1,0 +1,109 @@
+name: Python service
+
+# Проверки одного сервиса из services/: ruff, mypy и pytest на каждой версии
+# Python из matrix. Вызывается из ci.yml для каждого сервиса со своим списком
+# версий: они различаются, потому что у сервисов разный requires-python.
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: Каталог сервиса внутри services/
+        required: true
+        type: string
+      python-versions:
+        description: JSON-список версий Python для matrix
+        required: true
+        type: string
+      mongo:
+        description: Поднять MongoDB для тестов
+        required: false
+        type: boolean
+        default: false
+      integration-stack:
+        description: Use isolated Notifications stack and real transactions
+        required: false
+        type: boolean
+        default: false
+      redis:
+        description: Поднять Redis для тестов
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ${{ fromJSON(inputs.python-versions) }}
+    # С пустым image контейнер не запускается: базы поднимаются только для
+    # сервисов, чьи тесты с ними работают.
+    services:
+      redis:
+        image: ${{ inputs.redis && 'redis:7-alpine' || '' }}
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      # UV_PYTHON важнее .python-version сервиса: без него uv run пересоздаёт
+      # окружение на версии из файла, и все задачи matrix проверяют одну версию.
+      UV_PYTHON: ${{ matrix.python }}
+    defaults:
+      run:
+        working-directory: services/${{ inputs.service }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: services/${{ inputs.service }}/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Ruff lint
+        run: uv run ruff check --output-format=github .
+
+      - name: Ruff format
+        run: uv run ruff format --check --diff .
+
+      - name: Mypy
+        run: uv run mypy --python-version ${{ matrix.python }}
+
+      - name: Integration dependencies
+        if: inputs.integration-stack || inputs.mongo
+        working-directory: .
+        run: docker compose -f tests/notifications/compose.yaml up -d --wait
+
+      - name: Pytest with real stores
+        if: inputs.integration-stack || inputs.mongo
+        working-directory: .
+        run: uv run --directory tests/notifications python run_service_checks.py ${{ inputs.service }}
+        env:
+          UV_PYTHON: "3.12"
+          SERVICE_TEST_PYTHON: ${{ matrix.python }}
+
+      - name: Pytest
+        if: '!inputs.integration-stack && !inputs.mongo'
+        run: uv run pytest
+
+      - name: Integration logs
+        if: failure() && (inputs.integration-stack || inputs.mongo)
+        working-directory: .
+        run: docker compose -f tests/notifications/compose.yaml logs --no-color
+
+      - name: Stop isolated dependencies
+        if: always() && (inputs.integration-stack || inputs.mongo)
+        working-directory: .
+        run: docker compose -f tests/notifications/compose.yaml down -v

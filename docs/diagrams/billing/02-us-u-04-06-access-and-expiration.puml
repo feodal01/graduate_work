@@ -1,0 +1,80 @@
+@startuml 02-us-u-04-06-access-and-expiration
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam dpi 110
+skinparam maxMessageSize 250
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign center
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #94A3B8
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+    DividerBackgroundColor #E2E8F0
+    DividerBorderColor #64748B
+}
+
+title Просмотр новинок и автоматическое окончание подписки (US-U-04, US-U-06, US-S-03)
+
+autonumber
+
+actor "Пользователь" as user
+participant "movies-api\n(Каталог фильмов)" as movies
+participant "Auth\n(Права и кэш Redis)" as auth
+participant "Notifications" as ntf
+participant "Billing" as bil
+
+== 1. Просмотр новинки при активной подписке (US-U-04) ==
+
+user -> movies: Запрашивает фильм младше 3 лет (новинку)
+movies -> auth: Проверяет право на просмотр новинки (films.early_access:read)
+auth -> auth: Находит роль «подписчик» со сроком expires_at > сейчас\n(кэширует снимок прав в Redis, но не дольше чем до expires_at)
+auth --> movies: Доступ разрешён (allowed: true)
+movies --> user: Отдаёт данные фильма (Billing в проверке не участвует)
+
+== 2. Автоматическое окончание подписки в дату T (US-S-03, US-U-06) ==
+
+note over auth, bil
+  В момент T (конец оплаченного периода) фоновые задачи в Billing не нужны:
+  все сервисы заранее знают дату окончания T.
+end note
+
+auth -> auth: В секунду T автоматически истекает кэш прав в Redis,\nа БД игнорирует роль с прошедшим сроком expires_at
+user -> movies: Запрашивает новинку после наступления даты T
+movies -> auth: Проверяет право на просмотр новинки
+auth --> movies: Доступ запрещён (allowed: false, задержка закрытия — 0 секунд)
+movies --> user: 403 Доступ к новинке закрыт
+
+ntf -> ntf: Наступило запланированное время отправки письма (available_at = T)
+ntf -> user: Отправляет письмо «Срок подписки закончился» со ссылкой на покупку
+
+user -> bil: Открывает экран «Моя подписка»
+bil -> bil: Вычисляет статус на лету: сейчас >= T -> «Завершена»
+bil --> user: Показывает «Завершена <дата>» и кнопку «Оформить за 299 ₽»
+
+== 3. Краевые случаи и сбои ==
+
+group Сервис Billing остановлен в момент окончания подписки T
+    user -> movies: Запрашивает новинку после даты T
+    movies -> auth: Проверяет право в Auth
+    auth --> movies: Доступ запрещён (закрытие доступа не зависит от работы Billing)
+end
+
+group Кэш Redis в Auth временно недоступен при просмотре фильма
+    movies -> auth: Проверяет право на просмотр новинки
+    auth -> auth: Автоматически читает роли напрямую из БД PostgreSQL (с учётом expires_at)
+    auth --> movies: Возвращает корректное решение о доступе без ошибки
+end
+
+group Почтовый сервер (SMTP) или Auth временно недоступны в момент отправки письма T
+    ntf -[#DC2626]>x user: Временная ошибка отправки письма об окончании
+    ntf -> user: Воркер Notifications повторяет и доставляет письмо после восстановления связи
+end
+
+@enduml

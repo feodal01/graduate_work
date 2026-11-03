@@ -1,0 +1,81 @@
+@startuml 11-c4-l3-billing-components
+!include <C4/C4_Component>
+
+skinparam dpi 120
+skinparam defaultFontName Arial
+skinparam nodesep 60
+skinparam ranksep 75
+LAYOUT_WITH_LEGEND()
+
+title C4 Level 3 — Диаграмма компонентов сервиса Billing (services/billing)
+
+Container(nginx, "Шлюз Nginx", "Nginx", "Проксирует запросы пользователя и вебхуки")
+Container(admin_app, "Django-админка", "Django", "Вызывает внутреннее API биллинга по сервисному ключу")
+
+Container_Boundary(billing_service, "Сервис Billing (billing-api + billing-worker)") {
+
+    Boundary(tier_in, "1. Входной слой (HTTP-роутеры и фоновый запуск)") {
+        Component(ui_router, "Экраны пользователя и публичное API", "FastAPI, Jinja2", "Вход (Э1), «Моя подписка» (Э2), «Результат оплаты» (Э3), страница ошибки (Э4), покупка")
+        Component(webhook_router, "Обработчик вебхуков ЮKassa", "FastAPI Router", "Принимает уведомление, берёт из него только ID операции и запускает сверку")
+        Component(admin_router, "Внутреннее API для Админки", "FastAPI Router", "Списки, карточка платежа, оформление возврата, ручная сверка, управление outbox")
+        Component(worker_scheduler, "Фоновый планировщик (billing-worker)", "Background Runner", "При старте и по таймеру запускает сверку операций старше X с (каждые 30 с) и доставку outbox (каждые 2 с)")
+    }
+
+    Boundary(tier_domain, "2. Доменное ядро (Бизнес-логика)") {
+        Component(purchase_refund_svc, "Сервис покупок, подписок и возвратов", "Domain Service", "Проверяет правила и инварианты, создаёт платежи и возвраты с ключом идемпотентности, вычисляет статус подписки на лету")
+        Component(reconciler_svc, "Единый сервис сверки (Reconciler)", "Domain Service", "Единое место проведения: запрашивает статус через GET в ЮKassa, проверяет сумму и metadata, атомарно фиксирует итог и ставит задачи в outbox")
+        Component(outbox_dispatcher, "Диспетчер доставки (Outbox Dispatcher)", "Domain Service", "Доставляет версию доступа в Auth и письма в Notifications, управляет повторами с backoff и статусом «Требует вмешательства»")
+    }
+
+    Boundary(tier_infra, "3. Инфраструктурный слой (Адаптеры и работа с БД)") {
+        Component(yookassa_client, "Адаптер ЮKassa (ACL)", "HTTPX Client", "Вызовы POST/GET к ЮKassa с Idempotence-Key и перевод внешних статусов во внутреннюю модель")
+        Component(repos, "Репозитории БД", "SQLAlchemy Async", "Транзакционная запись операций, подписок, журналов и выборка задач FOR UPDATE SKIP LOCKED")
+        Component(internal_clients, "Клиенты Auth и Notifications", "HTTPX Clients", "Проверка токенов, запись состояния доступа (версия V) и отправка/отмена писем по сервисным ключам")
+    }
+}
+
+System_Ext(yookassa, "ЮKassa API", "Проведение платежей и возвратов, выдача статуса по GET")
+ContainerDb(billing_db, "Billing DB", "PostgreSQL 16", "Таблицы: tariffs, payments, subscriptions, refunds, operation_events, admin_actions, user_access_versions, outbox_tasks")
+Container(auth_api, "Auth API", "FastAPI", "Проверка токенов и хранение текущего доступа к новинкам")
+Container(ntf_api, "Notifications Campaign API", "FastAPI", "Отправка, планирование и отмена писем")
+System_Ext(glitchtip, "Мониторинг (GlitchTip)", "Сигналы об ошибках и аномалиях")
+
+' Внешние вызовы во входной слой
+Rel_D(nginx, ui_router, "Запросы /billing/*", "HTTP")
+Rel_D(nginx, webhook_router, "POST /webhooks/yookassa", "HTTP")
+Rel_D(admin_app, admin_router, "Запросы /internal/billing/*", "HTTP / X-Service-Api-Key")
+
+' Входной слой -> Доменное ядро
+Rel_D(ui_router, purchase_refund_svc, "Покупка, чтение локального статуса и истории")
+Rel_D(ui_router, reconciler_svc, "Проверка статуса в ЮKassa при переходе на /continue")
+Rel_D(webhook_router, reconciler_svc, "Сверка по ID из вебхука")
+Rel_D(admin_router, purchase_refund_svc, "Чтение списков/карточки и возврат")
+Rel_D(admin_router, reconciler_svc, "Ручная сверка по кнопке админа")
+Rel_D(admin_router, outbox_dispatcher, "Повтор или закрытие сбойной задачи")
+Rel_D(worker_scheduler, reconciler_svc, "Фоновая сверка (каждые 30 с)")
+Rel_D(worker_scheduler, outbox_dispatcher, "Фоновый обход outbox (каждые 2 с)")
+
+' Связи внутри доменного ядра
+Rel_R(purchase_refund_svc, reconciler_svc, "Немедленная сверка после создания возврата")
+Rel_R(reconciler_svc, outbox_dispatcher, "Немедленная первая доставка после коммита")
+
+' Доменное ядро -> Инфраструктурный слой
+Rel_D(purchase_refund_svc, yookassa_client, "Создание платежа / возврата (POST)")
+Rel_D(purchase_refund_svc, repos, "Чтение и создание записей")
+Rel_D(purchase_refund_svc, internal_clients, "Проверка JWT и часового пояса пользователя")
+
+Rel_D(reconciler_svc, yookassa_client, "Чтение статуса (GET), досоздание, розыск")
+Rel_D(reconciler_svc, repos, "Атомарная фиксация итога и задач outbox")
+Rel_D(reconciler_svc, glitchtip, "Сигналы об аномалиях ответа ЮKassa")
+
+Rel_D(outbox_dispatcher, repos, "Выборка задач SKIP LOCKED и смена статуса")
+Rel_D(outbox_dispatcher, internal_clients, "Доставка доступа и писем")
+Rel_D(outbox_dispatcher, glitchtip, "Сигнал «Требует вмешательства»")
+
+' Инфраструктурный слой -> Внешние системы и БД
+Rel_D(yookassa_client, yookassa, "POST / GET /v3/payments, /v3/refunds", "HTTPS")
+Rel_D(repos, billing_db, "SQL-транзакции", "AsyncPG")
+Rel_D(internal_clients, auth_api, "Проверка токенов и PUT /subscription-access", "HTTP")
+Rel_D(internal_clients, ntf_api, "POST /batches и POST /cancel", "HTTP")
+
+@enduml

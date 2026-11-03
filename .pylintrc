@@ -1,0 +1,3 @@
+[MAIN]
+# Pylint's IDE cwd is the monorepo root, so src layouts must be listed here.
+source-roots=services/auth/src,services/movies-api/src

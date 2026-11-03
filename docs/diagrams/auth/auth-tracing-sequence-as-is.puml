@@ -1,0 +1,111 @@
+@startuml auth-tracing-sequence-as-is
+scale 0.85
+skinparam dpi 160
+skinparam maxMessageSize 80
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Auth — идентификатор запроса и трассировка (AS-IS)
+
+actor "Клиент" as client
+participant "Nginx gateway" as gateway
+participant "Admin или\nMovies API" as caller
+collections "Nginx access-log" as access_log
+box "Auth-сервис"
+    participant "OpenTelemetry\nFastAPI" as otel
+    participant "Проверка\nX-Request-Id" as request_id
+    participant "Обработчик API" as api
+    participant "OTLP HTTP\nэкспортёр" as exporter
+end box
+participant "Jaeger" as jaeger
+
+note over gateway, api
+  Маршруты Auth-сервиса:
+  POST /api/v1/auth/signup
+  POST /api/v1/auth/login
+  POST /api/v1/auth/refresh
+  GET /api/v1/auth/profile
+  PATCH /api/v1/auth/profile
+  GET /api/v1/auth/login-history
+  POST /api/v1/auth/logout
+  GET /api/v1/auth/social/{provider_name}/login
+  GET /api/v1/auth/social/{provider_name}/callback
+  GET /api/v1/auth/roles
+  POST /api/v1/auth/roles
+  PATCH /api/v1/auth/roles/{role_id}
+  DELETE /api/v1/auth/roles/{role_id}
+  POST /api/v1/auth/users/{user_id}/roles
+  DELETE /api/v1/auth/users/{user_id}/roles/{role_id}
+  POST /api/v1/auth/permissions/check
+  GET /api/v1/health/
+  GET|HEAD /auth/docs
+  GET|HEAD /auth/openapi.json
+  GET|HEAD /docs/oauth2-redirect
+  GET|HEAD /redoc
+end note
+
+note over api, exporter
+  YandexOAuthClient создаёт дочерние спаны
+  yandex.oauth.token и yandex.oauth.userinfo.
+  Спаны не содержат OAuth-коды, токены и client secret.
+end note
+
+== Формирование и передача идентификатора ==
+
+client -> gateway: HTTP-запрос
+gateway -> gateway: создать $request_id
+
+alt запрос направлен в Auth
+    gateway -> otel: HTTP-запрос\nX-Request-Id: $request_id
+else Admin или Movies API вызывает Auth
+    gateway -> caller: HTTP-запрос\nX-Request-Id: $request_id
+    caller -> otel: HTTP-запрос к Auth\nX-Request-Id: тот же идентификатор
+end
+
+== Обработка и сэмплинг ==
+
+otel -> otel: создать серверный спан
+alt есть родительский traceparent
+    otel -> otel: наследовать решение родителя
+else новая трасса
+    otel -> otel: применить TraceIdRatioBased(0.05)
+end
+
+otel -> otel: для записываемого спана добавить\nhttp.request_id из X-Request-Id
+otel -> request_id: передать запрос
+
+alt X-Request-Id отсутствует
+    request_id --> otel: 400 { detail: "X-Request-Id is required" }
+else X-Request-Id присутствует
+    request_id -> api: выполнить выбранный маршрут
+    api --> request_id: HTTP-ответ маршрута
+    request_id --> otel: HTTP-ответ
+end
+
+otel -> otel: завершить серверный спан
+
+alt спан выбран для записи
+    otel -> exporter: поставить спан в пакет
+    exporter ->> jaeger: асинхронно отправить\nPOST /v1/traces по OTLP/HTTP
+    jaeger --> exporter: пакет принят
+else спан не выбран
+    otel -> otel: не экспортировать спан
+end
+
+alt запрос пришёл через gateway прямо в Auth
+    otel --> gateway: HTTP-ответ
+else Admin или Movies API вызвал Auth
+    otel --> caller: HTTP-ответ Auth
+    caller --> gateway: HTTP-ответ приложения
+end
+
+gateway -> access_log: записать запрос, статус и $request_id
+gateway --> client: HTTP-ответ
+
+note over exporter, jaeger
+  BatchSpanProcessor не блокирует HTTP-ответ.
+  Ошибка экспорта не меняет HTTP-ответ Auth.
+  Jaeger UI: http://127.0.0.1:16686/
+end note
+
+@enduml

@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Версии Python для каждого сервиса: три версии, которые поддерживает его
+# requires-python. Код auth и movies-api использует синтаксис 3.12 (PEP 695),
+# поэтому 3.10 и 3.11 для них недоступны.
+jobs:
+  auth:
+    uses: ./.github/workflows/python-service.yml
+    with:
+      service: auth
+      python-versions: '["3.12", "3.13", "3.14"]'
+
+  auth-integration:
+    uses: ./.github/workflows/python-service.yml
+    with:
+      service: auth
+      python-versions: '["3.12", "3.13", "3.14"]'
+      integration-stack: true
+
+  notifications:
+    uses: ./.github/workflows/python-service.yml
+    with:
+      service: notifications
+      python-versions: '["3.12", "3.13", "3.14"]'
+      integration-stack: true
+
+  notifications-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - name: Dependencies and configuration
+        run: |
+          docker compose --env-file .env.example --profile notifications-campaigns config --quiet
+          docker compose -f tests/notifications/compose.yaml --profile sharded up -d --wait
+          for service in auth ugc-api movies-etl notifications; do
+            uv sync --directory "services/$service" --locked --all-groups
+          done
+      - name: Integration harness formatting
+        run: |
+          uv run --directory services/notifications ruff check ../../tests/notifications ../../infra/notifications/review_smoke.py
+          uv run --directory services/notifications ruff format --check ../../tests/notifications ../../infra/notifications/review_smoke.py
+      - name: Real processes and SMTP
+        run: uv run --directory tests/notifications pytest test_stack_endpoints.py test_contracts.py test_sharded.py test_end_to_end.py test_delivery_classes.py test_campaigns_end_to_end.py test_transactional_latency.py test_token_revocation.py -q -s
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: notifications-transactional-latency
+          path: /tmp/pytest-of-*/pytest-*/*/latency-results.json
+          if-no-files-found: ignore
+      - name: Isolated dependency logs
+        if: failure()
+        run: docker compose -f tests/notifications/compose.yaml logs --no-color
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: notifications-e2e-process-logs
+          path: /tmp/pytest-of-*/pytest-*/*/process-*.log
+      - name: Stop test stack
+        if: always()
+        run: docker compose -f tests/notifications/compose.yaml --profile sharded down -v
+
+  movies-api:
+    uses: ./.github/workflows/python-service.yml
+    with:
+      service: movies-api
+      python-versions: '["3.12", "3.13", "3.14"]'
+
+  movies-etl:
+    uses: ./.github/workflows/python-service.yml
+    with:
+      service: movies-etl
+      integration-stack: true
+      python-versions: '["3.10", "3.11", "3.12"]'
+
+  ugc-api:
+    uses: ./.github/workflows/python-service.yml
+    with:
+      service: ugc-api
+      python-versions: '["3.10", "3.11", "3.12"]'
+      mongo: true
+
+  ugc-events:
+    uses: ./.github/workflows/python-service.yml
+    with:
+      service: ugc-events
+      python-versions: '["3.11", "3.12", "3.14"]'
+      redis: true
+
+  ugc-etl:
+    uses: ./.github/workflows/python-service.yml
+    with:
+      service: ugc-etl
+      python-versions: '["3.11", "3.12", "3.14"]'
+
+  # Сообщение в Telegram о результате CI для push в main. !cancelled(): при
+  # отмене run (новый push в ту же ветку) сообщение не отправляется.
+  notify:
+    name: Telegram
+    needs:
+      - auth
+      - auth-integration
+      - notifications
+      - notifications-e2e
+      - movies-api
+      - movies-etl
+      - ugc-api
+      - ugc-events
+      - ugc-etl
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send message
+        # Данные события передаются через env, а не подстановкой в скрипт:
+        # сообщение коммита может содержать кавычки и $(...).
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NEEDS: ${{ toJSON(needs) }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Секреты TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID не заданы, сообщение не отправлено"
+            exit 0
+          fi
+          failed=$(jq -r 'to_entries[] | select(.value.result != "success") | .key' <<<"$NEEDS" | paste -sd, - | sed 's/,/, /g')
+          if [ -z "$failed" ]; then
+            status="✅ CI прошёл"
+          else
+            status="❌ CI упал: $failed"
+          fi
+          text=$(printf '%s\n%s @ main (%s)\n%s\nАвтор: %s\n%s' \
+            "$status" "$REPO" "${SHA:0:7}" "${COMMIT_MESSAGE%%$'\n'*}" "$ACTOR" "$RUN_URL")
+          curl --fail-with-body --silent --show-error \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${text}" \
+            --data "disable_web_page_preview=true" \
+            > /dev/null

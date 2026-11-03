@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <interserver_http_host>clickhouse-node3</interserver_http_host>
+    <macros>
+        <cluster>company_cluster</cluster>
+        <shard>2</shard>
+        <replica>clickhouse-node3</replica>
+    </macros>
+</clickhouse>

@@ -1,0 +1,28 @@
+{
+  "users": 100000,
+  "films": 10000,
+  "ratings": 10000000,
+  "bookmarks": 2000000,
+  "likes_share": 0.349773,
+  "dislikes_share": 0.15009,
+  "ratings_per_film": {
+    "min": 286,
+    "median": 546,
+    "max": 73804
+  },
+  "ratings_per_popular_film": {
+    "min": 8026,
+    "median": 12331,
+    "max": 73804
+  },
+  "ratings_per_user": {
+    "min": 41,
+    "median": 89,
+    "max": 1560
+  },
+  "bookmarks_per_user": {
+    "min": 2,
+    "median": 18,
+    "max": 396
+  }
+}

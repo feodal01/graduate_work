@@ -1,0 +1,23 @@
+filebeat.inputs:
+  # Файлы nginx из тома nginx_logs. access.log и error.log в образе nginx —
+  # симлинки на stdout/stderr, поэтому пути указаны явно, без маски.
+  - type: filestream
+    id: nginx-access
+    paths:
+      - /var/log/nginx/access-log.json
+    parsers:
+      - ndjson:
+          target: ""
+          add_error_key: true
+    tags: ["nginx", "nginx-access"]
+
+  # Формат error_log у nginx фиксированный текстовый; поля разбирает grok в logstash.
+  - type: filestream
+    id: nginx-error
+    paths:
+      - /var/log/nginx/error-log.log
+    tags: ["nginx", "nginx-error"]
+
+output.logstash:
+  enabled: true
+  hosts: ["logstash:5045"]

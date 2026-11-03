@@ -1,0 +1,136 @@
+@startuml 13-er-auth-db-target
+
+hide circle
+skinparam linetype ortho
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam dpi 120
+skinparam nodesep 55
+skinparam ranksep 55
+skinparam packageStyle rectangle
+
+skinparam class {
+    BackgroundColor #F8FAFC
+    HeaderBackgroundColor #E2E8F0
+    BorderColor #64748B
+    ArrowColor #334155
+}
+
+title Целевая ER-диаграмма БД сервиса Auth (auth-db — выделены изменения для Биллинга)
+
+legend top left
+  |<#DCFCE7> **Зелёный** | **Новая таблица** (добавляется в проекте Биллинг) |
+  |<#FEF9C3> **Жёлтый** | **Дорабатываемая таблица** (добавляется колонка expires_at) |
+  |<#F8FAFC> **Серый** | Существующая таблица Auth без изменений схемы |
+endlegend
+
+package "1 — Контур пользователей и прав доступа (RBAC)" {
+
+    entity "users\n(Используется для поиска по login и чтения tz)" as users #F8FAFC {
+        * **id** : UUID <<PK>>
+        --
+        * login : VARCHAR(255) <<UNIQUE>>
+        password : VARCHAR(255) NULL
+        email : VARCHAR(255) NULL
+        locale : VARCHAR(64) NULL
+        tz : VARCHAR(64) NULL
+        * user_version : BIGINT (>= 1)
+        first_name : VARCHAR(50) NULL
+        last_name : VARCHAR(50) NULL
+        * is_superuser : BOOLEAN
+        * created_at : TIMESTAMPTZ
+    }
+
+    entity "user_subscription_access_state\n[НОВАЯ ТАБЛИЦА — инвариант 11]" as access_state #DCFCE7 {
+        * **user_id** : UUID <<PK, FK users.id ON DELETE CASCADE>>
+        --
+        * **[NEW] access_version** : BIGINT NOT NULL
+        * **[NEW] updated_at** : TIMESTAMPTZ NOT NULL
+        --
+        Хранит последнюю применённую версию доступа от Billing\n(в т.ч. когда доступа нет и строка в user_roles удалена).\nЗапрос с version <= access_version игнорируется (200 OK).
+    }
+
+    entity "user_roles\n[ДОРАБАТЫВАЕТСЯ — срок действия роли]" as user_roles #FEF9C3 {
+        * **user_id** : UUID <<PK, FK users.id>>
+        * **role_id** : UUID <<PK, FK roles.id ON DELETE CASCADE>>
+        --
+        **[NEW] expires_at** : TIMESTAMPTZ NULL
+        --
+        • NULL — бессрочная роль (admin и все старые назначения)\n• Дата T — роль действует только пока expires_at > now()\n• Для роли 'subscriber' заполняется и удаляется из Billing
+    }
+
+    entity "roles\n(Уже содержит роль 'subscriber')" as roles #F8FAFC {
+        * **id** : UUID <<PK>>
+        --
+        * name : VARCHAR(100) <<UNIQUE>> ('admin', 'subscriber')
+        * created_at : TIMESTAMPTZ
+    }
+
+    entity "role_permissions\n('subscriber' -> 'films.early_access:read')" as role_permissions #F8FAFC {
+        * **role_id** : UUID <<PK, FK roles.id>>
+        * **permission_code** : VARCHAR(100) <<PK, FK permissions.code>>
+    }
+
+    entity "permissions" as permissions #F8FAFC {
+        * **code** : VARCHAR(100) <<PK>>\n  ('films.early_access:read',\n   'roles:manage', 'user_roles:manage')
+    }
+}
+
+package "2 — Существующие таблицы сессий и синхронизации профилей (без изменений)" {
+
+    entity "social_accounts" as social_accounts #F8FAFC {
+        * **id** : UUID <<PK>>
+        --
+        * user_id : UUID <<FK users.id>>
+        * provider : VARCHAR(32)
+        * provider_user_id : VARCHAR(255)
+        email : VARCHAR(255) NULL
+        * created_at : TIMESTAMPTZ
+        * updated_at : TIMESTAMPTZ
+    }
+
+    entity "login_history" as login_history #F8FAFC {
+        * **user_id** : UUID <<PK, FK users.id>>
+        * **id** : UUID <<PK>>
+        --
+        * logged_at : TIMESTAMPTZ
+        ip_address : VARCHAR(45) NULL
+        user_agent : VARCHAR(512) NULL
+    }
+
+    entity "notification_outbox" as notification_outbox #F8FAFC {
+        * **event_id** : UUID <<PK>>
+        --
+        * user_id : UUID
+        * user_version : BIGINT
+        * event_type : VARCHAR(32)
+        * payload : JSONB
+        * created_at : TIMESTAMPTZ
+        published_at : TIMESTAMPTZ NULL
+        load_id : VARCHAR(255) NULL
+    }
+
+    entity "notification_load_markers" as load_markers #F8FAFC {
+        * **load_id** : VARCHAR(255) <<PK>>
+        * **user_id** : UUID <<PK>>
+        --
+        * created_at : TIMESTAMPTZ
+    }
+}
+
+users ||--o| access_state : "1:1 версия доступа"
+users ||--o{ user_roles : "user_id"
+roles ||--o{ user_roles : "role_id"
+roles ||--o{ role_permissions : "role_id"
+permissions ||--o{ role_permissions : "permission_code"
+
+user_roles -[hidden]down-> social_accounts
+access_state -[hidden]down-> login_history
+users -[hidden]down-> notification_outbox
+
+users ||..o{ social_accounts : "user_id"
+users ||..o{ login_history : "user_id"
+users ||..o{ notification_outbox : "user_id"
+
+@enduml

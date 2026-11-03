@@ -1,0 +1,16 @@
+flowchart LR
+    A[Auth: outbox и relay] --> K[Kafka]
+    U[UGC: outbox и relay] --> K
+    E[Рабочий Elasticsearch] --> M[Movies: detector, outbox и relay]
+    M --> K
+    K --> C[Consumer]
+    C --> DB[(PostgreSQL Notifications)]
+    API[API подписок и Campaign API] --> DB
+    DB <--> S[Scheduler]
+    DB --> P[Publisher]
+    P --> R[RabbitMQ: три очереди]
+    R --> W[Три группы worker]
+    W <--> DB
+    W --> AC[Внутренний API контактов Auth]
+    W --> L[Redis: общий лимитер]
+    W --> SMTP[SMTP / локальный Mailpit]

@@ -1,0 +1,77 @@
+@startuml 08-us-s-01-reconcile-mechanics
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam dpi 110
+skinparam maxMessageSize 250
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign center
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #94A3B8
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+    DividerBackgroundColor #E2E8F0
+    DividerBorderColor #64748B
+}
+
+title Системная механика: как Billing узнаёт итог операции у ЮKassa (US-S-01)
+
+autonumber
+
+participant "Триггер сверки:\n• Вебхук ЮKassa (основной)\n• Фоновый воркер (старше X с / старт)\n• Переход на /continue\n• Создание возврата\n• Кнопка админа «Проверить»" as trigger
+participant "Billing" as bil
+participant "ЮKassa" as yk
+participant "Очередь доставки\n(Outbox -> Auth / Notifications)" as outbox
+participant "Мониторинг\n(GlitchTip)" as mon
+
+== 1. Основной сценарий сверки (GET — единственный источник истины) ==
+
+trigger -> bil: Сигнал проверить незавершённую операцию (платёж или возврат)
+bil -> yk: Запрашивает объект операции через GET по его ID
+yk --> bil: Возвращает статус, сумму, валюту и наш UUID в metadata
+
+bil -> bil: Проверяет совпадение суммы, валюты (RUB) и нашего UUID в metadata
+bil -> bil: В одной транзакции БД (ровно 1 раз):\n• переводит операцию в итоговый статус\n• записывает переход в историю\n• создаёт подписку (при оплате) и задачи в outbox
+bil -> outbox: Немедленно запускает доставку доступа в Auth и писем в Notifications
+bil --> trigger: Итог зафиксирован
+
+== 2. Краевые случаи, защита и самовосстановление ==
+
+group Входящий вебхук от ЮKassa (не имеет криптографической подписи)
+    trigger -> bil: Приходит POST вебхука со статусом операции
+    bil -> bil: Не доверяет телу вебхука — берёт из него ТОЛЬКО ID операции
+    bil -> yk: Перепроверяет статус через GET в ЮKassa (поддельный вебхук не сработает)
+    bil --> trigger: Отдаёт 200 OK вебхуку только после сохранения в БД
+end
+
+group Разделение чтения и проведения (отсутствие гонки между экраном и вебхуком)
+    trigger -> bil: Открытие экрана результата GET /billing/payments/{id} (в т.ч. автообновление)
+    bil --> trigger: Читает ТОЛЬКО локальную БД без вызова ЮKassa (при /continue — лимит 1 раз в 5 с)
+end
+
+group Защита от гонок: отступ воркера X с и условное обновление в БД
+    trigger -> bil: Воркер проверяет только операции старше RECONCILE_MIN_AGE_SECONDS (не гоняется с вебхуком)
+    bil -> bil: Если вебхук и воркер всё же пересеклись — условное обновление в БД срабатывает\nтолько у первого процесса; второй видит завершённый статус и не создаёт дублей
+end
+
+group Обрыв связи до сохранения номера операции ЮKassa (до 24 ч и после 24 ч)
+    bil -> yk: До 24 ч: повторяет создание (POST) с тем же ключом идемпотентности
+    yk --> bil: Возвращает ранее созданный объект без повторного списания
+    bil -> yk: После 24 ч (для возврата): ищет возврат в списке возвратов платежа по нашему UUID в metadata
+    yk --> bil: Если найден — привязывает номер; если не найден — закрывает попытку как «Отклонён»
+end
+
+group Аномалия в ответе ЮKassa (не совпала сумма / waiting_for_capture / ошибка ключей 401)
+    bil -> yk: Запрашивает операцию (GET)
+    yk --> bil: Несовпадение суммы/metadata, двухстадийный статус или 401/403
+    bil -> mon: Отправляет сигнал об ошибке (ERROR) разработчику и поддержке
+    bil --> trigger: Блокирует смену статуса (операция видна в «Зависших операциях»)
+end
+
+@enduml

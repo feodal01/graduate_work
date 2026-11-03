@@ -1,0 +1,67 @@
+@startuml ugc-etl-pipeline-sequence-as-is
+scale 0.8
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam dpi 150
+skinparam maxMessageSize 90
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #64748B
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    BoxBorderColor #94A3B8
+    BoxBackgroundColor #F8FAFC
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+}
+
+title UGC ETL — путь просмотра до ClickHouse (AS-IS)
+
+autonumber
+
+actor "Зритель" as viewer
+participant "Gateway\nNginx" as gateway
+
+box "Сервис пользовательских действий" #ECFDF5
+    participant "UGC Events API" as ugc
+end box
+
+participant "Kafka\nтопик ugc.events" as kafka
+
+box "Сервис ETL" #EFF6FF
+    participant "UGC ETL" as etl
+end box
+
+participant "ClickHouse" as ch
+
+viewer -> gateway: POST /api/v1/ugc/events\nAuthorization: Bearer access JWT\nJSON-пакет с просмотром
+gateway -> ugc: передать запрос
+ugc -> kafka: Produce key = user_id
+kafka --> ugc: ack
+ugc --> gateway: 202 {"accepted": N}
+gateway --> viewer: 202 Accepted
+
+note over etl, ch
+  Зритель уже не ждёт аналитическое хранилище.
+  Auth в этом пути не вызывается.
+end note
+
+etl -> kafka: Fetch group = ugc-etl
+kafka --> etl: батч сообщений
+etl -> etl: разобрать конверт и разложить колонки
+etl -> ch: INSERT ugc.events
+note over ch
+  Views пишут в film_watches_local
+  и page_events_local в том же INSERT.
+  Аналитик читает Distributed
+  ugc.film_watches и ugc.page_events.
+end note
+ch --> etl: ok
+etl -> kafka: Commit offsets
+
+@enduml

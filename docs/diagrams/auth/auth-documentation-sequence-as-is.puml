@@ -1,0 +1,63 @@
+@startuml auth-documentation-sequence-as-is
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam dpi 150
+skinparam maxMessageSize 90
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #64748B
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    BoxBorderColor #94A3B8
+    BoxBackgroundColor #F8FAFC
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+}
+
+title Auth — документация API (AS-IS)
+
+autonumber
+
+actor "Ревьюер" as reviewer
+actor "Внутренний клиент" as internal
+participant "Gateway\nNginx" as gateway
+
+box "Сервис Auth" #F0FDF4
+    participant "Auth API" as auth
+end box
+
+note over reviewer, auth
+  Сервис принимает GET и HEAD для четырёх маршрутов.
+  Gateway публикует /auth/docs и /auth/openapi.json.
+  /docs/oauth2-redirect и /redoc доступны только внутри контейнерной сети.
+  Все запросы требуют X-Request-Id и участвуют в трассировке.
+end note
+
+reviewer -> gateway: GET /auth/docs
+gateway -> auth: GET /auth/docs\nX-Request-Id
+auth --> gateway: 200 Swagger UI HTML
+gateway --> reviewer: 200 Swagger UI HTML
+
+reviewer -> gateway: GET /auth/openapi.json
+gateway -> auth: GET /auth/openapi.json\nX-Request-Id
+auth -> auth: получить OpenAPI-схему
+alt схема уже находится в кэше FastAPI
+    auth -> auth: использовать готовую схему
+else первый запрос схемы
+    auth -> auth: сформировать и сохранить схему\nпо текущим маршрутам и моделям
+end
+auth --> gateway: 200 OpenAPI JSON
+gateway --> reviewer: 200 OpenAPI JSON
+
+internal -> auth: GET /docs/oauth2-redirect\nX-Request-Id
+auth --> internal: 200 Swagger UI OAuth2 redirect HTML
+
+internal -> auth: GET /redoc\nX-Request-Id
+auth --> internal: 200 ReDoc HTML
+
+@enduml

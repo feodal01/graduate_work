@@ -1,0 +1,7 @@
+pytest>=8.4,<10
+pytest-asyncio>=1.2
+aiohttp>=3.9
+pydantic-settings>=2
+aiokafka>=0.14
+clickhouse-connect>=1.8
+docker>=7.1

@@ -1,0 +1,41 @@
+[project]
+name = "ugc-storage-research"
+version = "0.1.0"
+description = "Сравнение MongoDB и PostgreSQL для лайков и закладок UGC"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.3",
+    "psycopg[binary]>=3.2",
+    "pymongo>=4.13",
+    "pydantic-settings>=2.13.1",
+]
+
+[dependency-groups]
+lint = [
+    "mypy>=1.17.0",
+    "ruff>=0.12.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP"]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.mypy]
+python_version = "3.12"
+files = ["bench"]
+warn_return_any = true
+warn_unused_configs = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+pretty = true
+show_error_codes = true

@@ -1,0 +1,80 @@
+@startuml auth-current-profile-sequence-as-is
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam dpi 150
+skinparam maxMessageSize 90
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #64748B
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    BoxBorderColor #94A3B8
+    BoxBackgroundColor #F8FAFC
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+}
+
+title Auth — чтение текущего профиля (AS-IS)
+
+autonumber
+
+participant "Django Admin" as admin
+
+box "Сервис Auth" #F0FDF4
+    participant "Auth API" as api
+    participant "AuthenticationService" as svc
+    participant "RedisTokenSessionStore" as sessions
+    database "auth-db\nPostgreSQL" as pg
+    database "Auth Redis" as redis
+end box
+
+note over api, redis
+  X-Request-Id, трассировка и Token Bucket описаны
+  в auth-tracing-sequence-as-is.puml
+  и auth-rate-limiting-sequence-as-is.puml.
+end note
+
+admin -> api: GET /api/v1/auth/profile\nAuthorization: Bearer access
+api -> svc: проверить токен доступа
+svc -> svc: проверить подпись, exp, type=access\nи обязательный session_epoch=V0
+
+break токен доступа отсутствует, неверен или истёк
+    api --> admin: 401 Unauthorized
+end
+
+svc -> sessions: is_access_valid(user_id, jti, V0)
+sessions -> redis: EVALSHA: версия == V0 AND блокировка отсутствует\nAND revoked-access:<jti> отсутствует
+
+break версия устарела, блокировка установлена или токен отозван
+    redis --> sessions: 0
+    api --> admin: 401 Token revoked
+end
+
+break Redis недоступен
+    redis --> sessions: RedisError
+    api --> admin: 503 Cache is unavailable
+end
+
+redis --> sessions: 1
+sessions --> svc: токен доступа действителен
+api -> svc: получить пользователя по CurrentUser.user_id
+svc -> pg: SELECT user по id
+
+alt пользователь существует
+    pg --> svc: пользователь
+    svc --> api: пользователь
+    api --> admin: 200 {id, login, first_name,\nlast_name, created_at}
+else пользователь удалён
+    pg --> svc: пользователь не найден
+    api --> admin: 401 Invalid token
+else PostgreSQL недоступна
+    pg --> svc: DatabaseUnavailableError
+    api --> admin: 503 Database is unavailable
+end
+
+@enduml

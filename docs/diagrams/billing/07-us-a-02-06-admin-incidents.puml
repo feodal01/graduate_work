@@ -1,0 +1,84 @@
+@startuml 07-us-a-02-06-admin-incidents
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam dpi 110
+skinparam maxMessageSize 250
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign center
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #94A3B8
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+    DividerBackgroundColor #E2E8F0
+    DividerBorderColor #64748B
+}
+
+title Поиск сбоев в Админке, ручная сверка с ЮKassa и управление Outbox (US-A-02, US-A-06)
+
+autonumber
+
+actor "Администратор" as admin_user
+participant "Django-админка" as adm
+participant "Billing" as bil
+participant "ЮKassa" as yk
+participant "Auth / Notifications" as targets
+
+== 1. Поиск проблемных операций (US-A-02) ==
+
+admin_user -> adm: Открывает вкладку «Зависшие операции»
+adm -> bil: Запрашивает платежи и возвраты в промежуточном статусе старше 10 минут
+bil --> adm: Список зависших операций (в штатном режиме пуст)
+adm --> admin_user: Показывает зависшие операции
+
+admin_user -> adm: Открывает вкладку «Не доставлено в Auth или Notifications»
+adm -> bil: Запрашивает задачи outbox старше 10 мин и задачи «Требует вмешательства»
+bil --> adm: Список проблемных задач с числом попыток и текстом последней ошибки
+adm --> admin_user: Показывает задачи с кнопками «Повторить» и «Закрыть с причиной»
+
+== 2. Ручная сверка «Проверить в ЮKassa» (US-A-06) ==
+
+admin_user -> adm: В карточке зависшего платежа или возврата нажимает «Проверить в ЮKassa»
+adm -> bil: Запрашивает принудительную сверку операции
+bil -> yk: Немедленно запрашивает статус через GET (в обход 5-секундного лимита)
+yk --> bil: Актуальный статус операции
+bil -> bil: Обновляет статус с пометкой источника «admin» (при успехе ставит задачи в outbox)
+bil --> adm: Обновлённый статус операции
+adm --> admin_user: Показывает актуальный статус и новую запись в истории переходов
+
+== 3. Управление задачами «Требует вмешательства» (US-A-02) ==
+
+admin_user -> adm: Нажимает «Повторить» у сбойной задачи outbox
+adm -> bil: Запрашивает повтор задачи
+bil -> bil: Сбрасывает счётчик попыток, пишет действие в журнал админов
+bil -> targets: Немедленно отправляет задачу в Auth или Notifications
+targets --> bil: 200 / 202 Успешно доставлено
+bil --> adm: Задача выполнена
+adm --> admin_user: Задача исчезает из списка сбоев
+
+admin_user -> adm: Нажимает «Закрыть с причиной» и указывает причину
+adm -> bil: Запрашивает закрытие задачи с причиной
+bil -> bil: Переводит задачу в «Закрыта», сохраняет автора и причину в журнал админов\n(повторы прекращаются; сам факт оплаты или возврата НЕ меняется)
+bil --> adm: Задача закрыта
+adm --> admin_user: Отображает закрытие задачи
+
+== 4. Краевые случаи и сбои ==
+
+group ЮKassa недоступна при нажатии «Проверить в ЮKassa»
+    bil -[#DC2626]>x yk: Тайм-аут или ошибка 5xx
+    bil --> adm: 503 Ошибка связи с ЮKassa (статус операции не меняется)
+    adm --> admin_user: Показывает сообщение о недоступности провайдера
+end
+
+group Попытка закрыть задачу без указания причины
+    admin_user -> adm: Отправляет форму закрытия с пустой причиной
+    adm --> admin_user: 422 Ошибка формы «Укажите причину закрытия»
+end
+
+@enduml

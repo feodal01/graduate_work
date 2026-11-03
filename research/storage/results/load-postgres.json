@@ -1,0 +1,19 @@
+{
+  "store": "postgres",
+  "workers": 6,
+  "ratings_seconds": 8.027292832965031,
+  "bookmarks_seconds": 1.67155075003393,
+  "index_seconds": 19.06638529105112,
+  "sizes": {
+    "ratings": {
+      "rows": 10000000,
+      "data_bytes": 845250560,
+      "index_bytes": 1068195840
+    },
+    "bookmarks": {
+      "rows": 2000000,
+      "data_bytes": 136609792,
+      "index_bytes": 180715520
+    }
+  }
+}

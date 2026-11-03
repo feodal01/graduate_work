@@ -1,0 +1,12 @@
+target-version = "py312"
+line-length = 100
+include = ["bootstrap.py", "bootstrap_settings.py", "tests/test_settings.py"]
+
+[lint]
+select = ["E", "F", "I", "UP"]
+
+[lint.isort]
+known-first-party = ["apps", "bootstrap_settings"]
+
+[format]
+quote-style = "single"

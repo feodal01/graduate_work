@@ -1,0 +1,183 @@
+@startuml 12-er-billing-db
+
+hide circle
+skinparam linetype ortho
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam dpi 120
+skinparam nodesep 60
+skinparam ranksep 55
+skinparam packageStyle rectangle
+
+skinparam class {
+    BackgroundColor #EFF6FF
+    HeaderBackgroundColor #DBEAFE
+    BorderColor #2563EB
+    ArrowColor #334155
+}
+
+title ER-диаграмма БД сервиса Billing (billing-db — все таблицы новые)
+
+legend top left
+  |<#E0E7FF> **Сиреневый** | Независимость от платёжного провайдера: справочник **payment_providers** и ссылки **provider_code** |
+  | | Название провайдера (ЮKassa) хранится только как строка справочника 'yookassa', а не в именах таблиц и колонок. |
+  | | Смена или добавление провайдера = INSERT в payment_providers + новый класс-адаптер (ACL), **без миграций схемы**. |
+endlegend
+
+package "1 — Ядро продаж и возвратов (ON DELETE RESTRICT, суммы в копейках)" #F8FAFC {
+
+    entity "payment_providers\n(Справочник платёжных провайдеров)" as providers #E0E7FF {
+        * **code** : VARCHAR(32) <<PK>> ('yookassa')
+        --
+        * title : VARCHAR(128) ('ЮKassa')
+        * is_active : BOOLEAN
+        * created_at : TIMESTAMPTZ
+        --
+        Новые покупки создаются через активного провайдера;\nсверка и возвраты по старым платежам идут\nчерез провайдера, записанного в самом платеже.\nКлючи доступа к API — в переменных окружения, не в БД
+    }
+
+    entity "tariffs\n(Справочник тарифов)" as tariffs {
+        * **id** : UUID <<PK>>
+        --
+        * code : VARCHAR(64) <<UNIQUE>>
+        * title : VARCHAR(128)
+        * price_kopeks : INTEGER (> 0)
+        * currency : CHAR(3) ('RUB')
+        * duration_days : INTEGER (30)
+        * is_active : BOOLEAN
+        * created_at : TIMESTAMPTZ
+    }
+
+    entity "payments\n(Попытки оплаты)" as payments {
+        * **id** : UUID <<PK>>
+        --
+        * user_id : UUID <<INDEX>>
+        * tariff_id : UUID <<FK>>
+        * **provider_code** : VARCHAR(32) <<FK payment_providers.code>>
+        * amount_kopeks : INTEGER (> 0)
+        * currency : CHAR(3) ('RUB')
+        * **status** : VARCHAR(16) ['pending', 'succeeded', 'failed']
+        * idempotency_key : UUID <<UNIQUE>>
+        provider_payment_id : VARCHAR(128) NULL
+        confirmation_url : TEXT NULL
+        failure_reason : TEXT NULL
+        provider_details : JSONB NULL\n  (специфичные поля провайдера, напр. cancellation_details)
+        last_checked_at : TIMESTAMPTZ NULL
+        * created_at : TIMESTAMPTZ
+        * updated_at : TIMESTAMPTZ
+        --
+        **[UNIQUE] (user_id) WHERE status = 'pending'**\n(инвариант 1: не более 1 ожидающего платежа)
+        **[UNIQUE] (provider_code, provider_payment_id)**\n(номер уникален в пределах провайдера)
+        **[UNIQUE] (id, provider_code)**\n(цель составного FK из refunds)
+    }
+
+    entity "subscriptions\n(Оплаченные периоды — неизменяемая)" as subscriptions {
+        * **id** : UUID <<PK>>
+        --
+        * user_id : UUID <<INDEX>>
+        * tariff_id : UUID <<FK>>
+        * payment_id : UUID <<FK, UNIQUE>>
+        * starts_at : TIMESTAMPTZ
+        * ends_at : TIMESTAMPTZ
+        * created_at : TIMESTAMPTZ
+        --
+        Статус («Активна», «Завершена», «Возвращена»)\nне хранится в БД, а вычисляется на лету\nпо ends_at и наличию возврата 'succeeded'
+    }
+
+    entity "refunds\n(Попытки возврата)" as refunds {
+        * **id** : UUID <<PK>>
+        --
+        * payment_id : UUID <<FK>>
+        * subscription_id : UUID <<FK>>
+        * **provider_code** : VARCHAR(32) <<FK>>
+        * amount_kopeks : INTEGER (> 0)
+        * currency : CHAR(3) ('RUB')
+        * **status** : VARCHAR(16) ['processing', 'succeeded', 'rejected']
+        * idempotency_key : UUID <<UNIQUE>>
+        provider_refund_id : VARCHAR(128) NULL
+        rejection_reason : TEXT NULL
+        provider_details : JSONB NULL
+        * admin_user_id : UUID
+        * reason : TEXT (NOT EMPTY)
+        last_checked_at : TIMESTAMPTZ NULL
+        * created_at : TIMESTAMPTZ
+        * updated_at : TIMESTAMPTZ
+        --
+        **[UNIQUE] (payment_id) WHERE status IN ('processing', 'succeeded')**\n(инвариант 4: защита от двойного возврата)
+        **[UNIQUE] (provider_code, provider_refund_id)**
+        **[FK] (payment_id, provider_code) → payments (id, provider_code)**\n(возврат идёт только через провайдера своего платежа)
+    }
+}
+
+package "2 — Доставка в Auth и Notifications (Outbox и версии)" #F0FDF4 {
+
+    entity "user_access_versions\n(Монотонная версия доступа)" as access_versions #DCFCE7 {
+        * **user_id** : UUID <<PK>>
+        --
+        * last_version : BIGINT (>= 1)
+        * updated_at : TIMESTAMPTZ
+        --
+        Инкрементируется в одной транзакции\nс созданием подписки или возврата (инв. 11)
+    }
+
+    entity "outbox_tasks\n(Очередь отложенных действий)" as outbox_tasks #DCFCE7 {
+        * **id** : UUID <<PK>>
+        --
+        * dedup_key : VARCHAR(128) <<UNIQUE>>
+        * target_service : VARCHAR(16) ['auth', 'notifications']
+        * task_type : VARCHAR(32)
+        * payment_id : UUID <<FK>>
+        * user_id : UUID <<INDEX>>
+        access_version : BIGINT NULL
+        * payload : JSONB
+        * **status** : VARCHAR(24)\n  ['pending', 'completed', 'requires_intervention', 'closed']
+        * attempts : INTEGER (default 0)
+        last_error : TEXT NULL
+        * next_retry_at : TIMESTAMPTZ
+        * created_at : TIMESTAMPTZ
+        * updated_at : TIMESTAMPTZ
+    }
+}
+
+package "3 — Неизменяемые журналы аудита (append-only)" #FFF7ED {
+
+    entity "operation_events\n(История переходов статусов)" as op_events #FEF9C3 {
+        * **id** : UUID <<PK>>
+        --
+        * operation_type : VARCHAR(16) ['payment', 'refund']
+        * operation_id : UUID <<INDEX>>
+        from_status : VARCHAR(16) NULL
+        * to_status : VARCHAR(16)
+        * source : VARCHAR(16) ['webhook', 'reconcile', 'continue', 'admin']
+        details : JSONB NULL
+        * created_at : TIMESTAMPTZ
+    }
+
+    entity "admin_actions\n(Решения сотрудников поддержки)" as admin_actions #FEF9C3 {
+        * **id** : UUID <<PK>>
+        --
+        * admin_user_id : UUID <<INDEX>>
+        * action_type : VARCHAR(24)\n  ['refund_requested', 'outbox_retried', 'outbox_closed']
+        * target_type : VARCHAR(16) ['refund', 'outbox_task']
+        * target_id : UUID
+        * reason : TEXT (NOT EMPTY)
+        * created_at : TIMESTAMPTZ
+    }
+}
+
+providers ||--o{ payments : "provider_code"
+providers ||--o{ refunds : "provider_code"
+tariffs ||--o{ payments : "tariff_id"
+tariffs ||--o{ subscriptions : "tariff_id"
+payments ||--o| subscriptions : "payment_id (1:1)"
+payments ||--o{ refunds : "payment_id"
+subscriptions ||--o{ refunds : "subscription_id"
+payments ||--o{ outbox_tasks : "payment_id"
+access_versions ||..o{ outbox_tasks : "user_id / access_version"
+payments ||..o{ op_events : "operation_id"
+refunds ||..o{ op_events : "operation_id"
+refunds ||..o{ admin_actions : "target_id"
+outbox_tasks ||..o{ admin_actions : "target_id"
+
+@enduml

@@ -1,0 +1,73 @@
+# Стенд исследования хранилища: MongoDB и PostgreSQL с одинаковыми лимитами
+# CPU и памяти. Запускается отдельно от основного стека:
+#   docker compose -f research/storage/compose.yaml up -d --wait
+name: ugc-storage-research
+
+services:
+  mongo:
+    image: mongo:8.0
+    # Replica set из одного узла: запись подтверждается с write concern
+    # majority и попадает в журнал, как коммит в PostgreSQL. Standalone mongod
+    # подтверждает запись до сброса журнала на диск.
+    command: [mongod, --replSet, rs0, --bind_ip_all, --wiredTigerCacheSizeGB, "1.5"]
+    cpus: 2
+    mem_limit: 4g
+    ports:
+      - 127.0.0.1:27117:27017
+    volumes:
+      - mongo_data:/data/db
+
+  # Replica set инициализирует отдельный одноразовый контейнер, а не
+  # healthcheck: каждый запуск mongosh — процесс Node.js на ~270 МБ и секунду
+  # CPU. Внутри контейнера mongo он расходовал бы лимиты хранилища и искажал
+  # замеры.
+  mongo-init:
+    image: mongo:8.0
+    depends_on:
+      - mongo
+    restart: "no"
+    command:
+      - bash
+      - -c
+      - >-
+        until mongosh --host mongo --quiet --eval "
+        try { rs.status().ok } catch (e) {
+        rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'localhost:27017' }] }).ok }";
+        do sleep 1; done;
+        until mongosh --host mongo --quiet --eval 'quit(db.hello().isWritablePrimary ? 0 : 1)';
+        do sleep 1; done
+
+  postgres:
+    image: postgres:16
+    # shared_buffers 1 ГБ и страничный кэш ОС в пределах того же лимита 4 ГБ
+    # сопоставимы с кэшем WiredTiger 1,5 ГБ и кэшем ОС у MongoDB.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - effective_cache_size=3GB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - max_wal_size=4GB
+    cpus: 2
+    mem_limit: 4g
+    shm_size: 1g
+    environment:
+      POSTGRES_USER: research
+      POSTGRES_PASSWORD: research
+      POSTGRES_DB: ugc
+    ports:
+      - 127.0.0.1:55432:5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD, pg_isready, -U, research, -d, ugc]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  mongo_data:
+  postgres_data:

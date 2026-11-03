@@ -1,0 +1,75 @@
+@startuml ugc-events-ingest-sequence-as-is
+scale 0.8
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam dpi 120
+skinparam maxMessageSize 90
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #64748B
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    BoxBorderColor #94A3B8
+    BoxBackgroundColor #F8FAFC
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+}
+
+title UGC Events API — приём действий пользователя (AS-IS)
+
+autonumber
+
+actor "Зритель" as viewer
+participant "Gateway\nNginx" as gateway
+
+box "Сервис пользовательских действий" #ECFDF5
+    participant "UGC Events API" as ugc
+end box
+
+participant "Kafka\nтопик ugc.events" as kafka
+
+viewer -> gateway: POST /api/v1/ugc/events\nAuthorization: Bearer access JWT\nJSON-пакет событий
+gateway -> ugc: передать запрос, Authorization\nи X-Request-Id
+
+alt заголовок Authorization отсутствует\nили схема не Bearer
+    ugc --> gateway: 401 + WWW-Authenticate: Bearer
+    gateway --> viewer: 401 Unauthorized
+else access JWT неверен, истёк\nили type не access
+    ugc -> ugc: локально проверить подпись,\nсрок и type JWT
+    ugc --> gateway: 401 + WWW-Authenticate: Bearer
+    gateway --> viewer: 401 Unauthorized
+else тело не проходит схему:\nпустой пакет, больше 100 событий\nили поля не соответствуют event_type
+    ugc -> ugc: проверить JSON-схему пакета
+    ugc --> gateway: 422 Validation Error
+    gateway --> viewer: 422 Validation Error
+else пакет валиден и JWT принят
+    ugc -> ugc: взять user_id из JWT sub.\nНе читать user_id из тела запроса
+    loop каждое событие пакета
+        ugc -> kafka: Produce ugc.events\nkey = user_id\nvalue = конверт события
+    end
+
+    alt Kafka подтвердила все записи
+        kafka --> ugc: ack для каждой записи
+        ugc --> gateway: 202 {"accepted": N}
+        gateway --> viewer: 202 Accepted
+    else Kafka недоступна, timeout\nили хотя бы одна запись не подтверждена
+        kafka --> ugc: ошибка публикации
+        ugc --> gateway: 503 Event broker is unavailable
+        gateway --> viewer: 503 Event broker is unavailable
+    end
+end
+
+note over ugc
+  Auth API в этом запросе не вызывается.
+  Проверка JWT совпадает с локальной проверкой
+  Movies API: подпись, exp и type=access.
+  session_epoch и отзыв сессий в Redis Auth
+  здесь не проверяются.
+end note
+
+@enduml

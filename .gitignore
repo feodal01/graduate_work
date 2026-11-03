@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+infra/notifications/smtp.env
+.DS_Store
+.ruff_cache/
+.vscode/
+.idea/
+.mypy_cache/
+Untitled
+
+# Local service runtime state.
+**/.env
+!services/movies-api/tests/functional/.env
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/state.sqlite
+**docs/superpowers/
+
+# Набор данных исследования хранилища: генерируется bench.generate.
+research/storage/data/
+
+# Local agent plans, reports and scratch files.
+.superpowers/

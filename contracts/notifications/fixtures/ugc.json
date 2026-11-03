@@ -1,0 +1,19 @@
+[
+  {
+    "event_id": "20000000-0000-4000-8000-000000000001",
+    "event_type": "review.likes_updated",
+    "review_id": "507f1f77bcf86cd799439011",
+    "user_id": "10000000-0000-4000-8000-000000000002",
+    "likes_count": 12,
+    "likes_version": 2
+  },
+  {
+    "event_id": "20000000-0000-4000-8000-000000000002",
+    "event_type": "review.likes_updated",
+    "review_id": "507f1f77bcf86cd799439012",
+    "user_id": "10000000-0000-4000-8000-000000000002",
+    "likes_count": 0,
+    "likes_version": 0,
+    "load_id": "initial-reviews-v1"
+  }
+]

@@ -1,0 +1,221 @@
+@startuml sequence-role-management-as-is
+scale 0.75
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Auth — управление ролями (AS-IS)
+
+actor "Администратор" as admin
+participant "Админка" as web
+box "Система аутентификации"
+    participant "api" as api
+    participant "AuthenticationService /\nAuthorizationService" as svc
+    participant "RedisAuthorizationCache" as cache
+end box
+database "PostgreSQL" as pg
+database "Redis" as redis
+
+note over svc, redis
+  Каждый маршрут сначала проверяет подпись, exp и session_epoch токена доступа.
+  Один скрипт Lua требует совпадение версии, отсутствие блокировки смены пароля
+  и отсутствие jti в списке отозванных токенов.
+  Каждый маршрут использует административный Token Bucket.
+  Ветка HTTP 429 описана в auth-rate-limiting-sequence-as-is.puml.
+  Недействительный или отозванный токен даёт 401.
+  Недоступное состояние сессий в Redis даёт 503.
+  Проверка административного права читает пользовательский снимок.
+  Установка маркеров, изменение PostgreSQL и обновление снимков
+  подробно описаны в sequence-roles-as-is.puml.
+end note
+
+== Просмотр ролей ==
+
+admin -> web: открыть роли
+web -> api: GET /api/v1/auth/roles\nAuthorization: Bearer access
+api -> svc: проверить токен доступа и право roles:manage
+svc -> svc: проверить подпись, exp, type=access\nи session_epoch=V0
+svc -> redis: EVALSHA: версия == V0 AND блокировка отсутствует\nAND revoked-access:<jti> отсутствует
+
+alt токен доступа истёк
+    api --> web: 401 Token expired
+else подпись неверная
+    api --> web: 401 Invalid token
+else версия устарела, блокировка установлена или токен отозван
+    redis --> svc: 0
+    api --> web: 401 Token revoked
+else состояние сессий в Redis недоступно
+    redis --> svc: RedisError
+    api --> web: 503 Cache is unavailable
+else права недостаточно
+    ref over svc, redis
+      Проверка права через RBAC-кэш описана в sequence-roles-as-is.puml
+    end ref
+    api --> web: 403 Forbidden
+else суперпользователь или право есть
+    svc -> pg: SELECT roles
+    api --> web: 200 список ролей
+end
+
+== Создание роли ==
+
+web -> api: POST /api/v1/auth/roles { name, permissions }\nAuthorization: Bearer access
+api -> svc: проверить токен доступа и право roles:manage
+svc -> svc: общая проверка версии, блокировки и отзыва токена
+
+alt токен доступа недействителен или отозван
+    api --> web: 401
+else права недостаточно
+    api --> web: 403 Forbidden
+else право есть
+    svc -> pg: INSERT role, COMMIT
+    alt имя роли занято
+        pg --> svc: unique violation, ROLLBACK
+        api --> web: 409 Role already exists
+    else роль создана
+        api --> web: 201 роль создана
+    end
+end
+
+== Изменение роли ==
+
+web -> api: PATCH /api/v1/auth/roles/{role_id}\n{ name?, permissions? }\nAuthorization: Bearer access
+api -> svc: проверить токен доступа и право roles:manage
+
+alt токен доступа недействителен или отозван
+    api --> web: 401
+else права недостаточно
+    api --> web: 403 Forbidden
+else право есть
+    opt меняется состав прав роли
+        ref over svc, redis
+          Общий маркер: установить → изменить PostgreSQL →
+          сменить ревизию → снять маркер. См. sequence-roles-as-is.puml
+        end ref
+        svc -> cache: roles_mutation()
+        cache -> redis: установить общий маркер
+        break маркер занят или Redis недоступен
+            redis --> cache: маркер не установлен
+            api --> web: 503 Cache is unavailable
+        end
+    end
+    svc -> pg: UPDATE role, COMMIT
+    alt роли нет
+        opt менялся состав прав роли
+            cache -> redis: снять установленный маркер,\nревизию не менять
+        end
+        api --> web: 404 Role not found
+    else имя занято
+        pg --> svc: unique violation, ROLLBACK
+        opt менялся состав прав роли
+            cache -> redis: снять установленный маркер,\nревизию не менять
+        end
+        api --> web: 409 Role already exists
+    else роль обновлена
+        opt менялся состав прав роли
+            cache -> redis: сменить ревизию\nи снять общий маркер
+        end
+        api --> web: 200 роль обновлена
+    end
+end
+
+== Удаление роли ==
+
+web -> api: DELETE /api/v1/auth/roles/{role_id}\nAuthorization: Bearer access
+api -> svc: проверить токен доступа и право roles:manage
+
+alt токен доступа недействителен или отозван
+    api --> web: 401
+else права недостаточно
+    api --> web: 403 Forbidden
+else право есть
+    ref over svc, redis
+      Общий маркер и смена ревизии описаны в sequence-roles-as-is.puml
+    end ref
+    svc -> cache: roles_mutation()
+    cache -> redis: установить общий маркер
+    break маркер занят или Redis недоступен
+        redis --> cache: маркер не установлен
+        api --> web: 503 Cache is unavailable
+    end
+    svc -> pg: DELETE role, COMMIT
+    alt роли нет
+        cache -> redis: снять общий маркер,\nревизию не менять
+        api --> web: 404 Role not found
+    else роль удалена
+        note right of svc
+          Назначения этой роли удаляются
+          вместе с ролью.
+        end note
+        cache -> redis: сменить ревизию\nи снять общий маркер
+        api --> web: 204
+    end
+end
+
+== Назначение роли пользователю ==
+
+web -> api: POST /api/v1/auth/users/{user_id}/roles\n{ role_id }\nAuthorization: Bearer access
+api -> svc: проверить токен доступа и право user_roles:manage
+
+alt токен доступа недействителен или отозван
+    api --> web: 401
+else права недостаточно
+    api --> web: 403 Forbidden
+else право есть
+    ref over svc, redis
+      Маркер пользователя и удаление его снимка
+      описаны в sequence-roles-as-is.puml
+    end ref
+    svc -> cache: user_mutation(user_id)
+    cache -> redis: установить маркер пользователя
+    break маркер занят или Redis недоступен
+        redis --> cache: маркер не установлен
+        api --> web: 503 Cache is unavailable
+    end
+    svc -> pg: SELECT user, role
+    alt пользователя нет
+        cache -> redis: удалить снимок и снять маркер
+        api --> web: 404 User not found
+    else роли нет
+        cache -> redis: удалить снимок и снять маркер
+        api --> web: 404 Role not found
+    else роль уже назначена
+        cache -> redis: удалить снимок и снять маркер
+        api --> web: 409 Role already assigned
+    else можно назначить
+        svc -> pg: INSERT user_roles, COMMIT
+        cache -> redis: удалить снимок и снять маркер
+        api --> web: 204
+    end
+end
+
+== Отзыв роли у пользователя ==
+
+web -> api: DELETE /api/v1/auth/users/{user_id}/roles/{role_id}\nAuthorization: Bearer access
+api -> svc: проверить токен доступа и право user_roles:manage
+
+alt токен доступа недействителен или отозван
+    api --> web: 401
+else права недостаточно
+    api --> web: 403 Forbidden
+else право есть
+    ref over svc, redis
+      Маркер пользователя и удаление его снимка
+      описаны в sequence-roles-as-is.puml
+    end ref
+    svc -> cache: user_mutation(user_id)
+    cache -> redis: установить маркер пользователя
+    break маркер занят или Redis недоступен
+        redis --> cache: маркер не установлен
+        api --> web: 503 Cache is unavailable
+    end
+    svc -> pg: DELETE user_roles, COMMIT
+    alt назначения нет
+        cache -> redis: удалить снимок и снять маркер
+        api --> web: 404 Assignment not found
+    else роль отозвана
+        cache -> redis: удалить снимок и снять маркер
+        api --> web: 204
+    end
+end
+
+@enduml

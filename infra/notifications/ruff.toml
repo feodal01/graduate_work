@@ -1,0 +1,1 @@
+extend = "../../services/notifications/pyproject.toml"

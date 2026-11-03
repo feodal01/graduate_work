@@ -1,0 +1,72 @@
+@startuml 10-c4-l2-containers
+!include <C4/C4_Container>
+
+skinparam dpi 120
+skinparam defaultFontName Arial
+skinparam nodesep 70
+skinparam ranksep 80
+LAYOUT_WITH_LEGEND()
+
+title C4 Level 2 — Диаграмма контейнеров (контур Биллинга онлайн-кинотеатра)
+
+Person(user, "Пользователь", "Покупает подписку «Премиум», смотрит её статус, историю платежей и новинки")
+Person(admin_user, "Администратор поддержки", "Ищет пользователя, разбирает сбои и оформляет возвраты в админке")
+
+System_Ext(yookassa, "ЮKassa API", "Внешний платёжный провайдер: страница ввода карты, проведение платежей и возвратов (HTTPS)")
+System_Ext(smtp, "Почтовый сервер (Mailpit / SMTP)", "Доставка email-писем пользователю")
+
+System_Boundary(cinema, "Онлайн-кинотеатр (Docker Compose)") {
+
+    Container(nginx, "Шлюз Nginx", "Nginx", "Единая точка входа: маршрутизация внешних запросов и ограничение частоты (rate limit)")
+    Container(movies_api, "Movies API", "Python, FastAPI", "Каталог фильмов; при запросе новинки проверяет право доступа в Auth")
+    Container(admin_app, "Django-админка", "Python, Django", "Интерфейс поддержки: раздел биллинга (подписки, платежи, возвраты, сбои) без своей БД биллинга")
+
+    Boundary(billing_boundary, "Сервис Billing (новый)") {
+        Container(billing_api, "Billing API", "Python, FastAPI, Jinja2", "Экраны пользователя (Э1–Э4), создание покупок и возвратов, приём вебхуков, внутреннее API для админки")
+        Container(billing_worker, "Billing Worker", "Python", "Фоновая сверка незавершённых операций с ЮKassa (каждые 30 с) и доставка задач из outbox (каждые 2 с)")
+        ContainerDb(billing_db, "Billing DB", "PostgreSQL 16", "Тарифы, платежи, подписки, возвраты, журналы переходов и действий, очередь outbox_tasks")
+    }
+
+    Boundary(auth_boundary, "Сервис Auth (дорабатывается)") {
+        Container(auth_api, "Auth API", "Python, FastAPI", "Аутентификация, проверка прав, приём состояния доступа со сроком expires_at и версией, поиск по логину")
+        ContainerDb(auth_db, "Auth DB", "PostgreSQL", "Пользователи, роли со сроком expires_at, версия доступа пользователя")
+        ContainerDb(auth_redis, "Auth Redis", "Redis", "Кэш снимков прав пользователя (TTL ограничен сроком подписки expires_at)")
+    }
+
+    Boundary(ntf_boundary, "Сервис Notifications (дорабатывается)") {
+        Container(ntf_api, "Campaign API & Worker", "Python, FastAPI", "Приём транзакционных писем биллинга, планирование к дате окончания и отмена по campaign_id")
+        ContainerDb(ntf_db, "Notifications DB & Queue", "PostgreSQL, RabbitMQ", "Хранение доставок, очередь отправки и таблица отменённых кампаний")
+    }
+}
+
+' Внешние связи пользователей
+Rel_D(user, nginx, "Открывает /billing/* и смотрит фильмы", "HTTP / Cookie JWT")
+Rel_D(user, yookassa, "Вводит карту и возвращается по return_url", "HTTPS редирект")
+Rel_D(admin_user, nginx, "Работает в /admin/billing/*", "HTTP")
+
+' Маршрутизация шлюза
+Rel_D(nginx, movies_api, "Проксирует /movies/*", "HTTP")
+Rel_D(nginx, billing_api, "Проксирует /billing/* и вебхуки", "HTTP")
+Rel_D(nginx, admin_app, "Проксирует /admin/*", "HTTP")
+
+' Связи Админки и Movies API
+Rel_D(movies_api, auth_api, "Проверяет право на новинку (films.early_access:read)", "HTTP")
+Rel_D(admin_app, billing_api, "Читает списки и карточку, оформляет возврат, запускает сверку", "HTTP / X-Service-Api-Key")
+Rel_D(admin_app, auth_api, "Ищет UUID по логину и получает часовые пояса", "HTTP / X-Service-Api-Key")
+
+' Связи внутри и вокруг Billing
+Rel_R(billing_worker, billing_api, "Использует общие доменные сервисы сверки и доставки outbox")
+Rel_D(billing_api, billing_db, "Записывает платежи, подписки, возвраты и задачи outbox", "SQL")
+Rel_D(billing_worker, billing_db, "Выбирает незавершённые операции и задачи outbox", "SQL (SKIP LOCKED)")
+
+Rel_L(billing_api, yookassa, "Создаёт платежи и возвраты (POST с Idempotence-Key), сверяет статус (GET)", "HTTPS")
+Rel_D(billing_api, auth_api, "Проверяет токен; передаёт состояние доступа (версия V, срок до T)", "HTTP / X-Service-Api-Key")
+Rel_D(billing_api, ntf_api, "Отправляет, планирует на дату T и отменяет письма", "HTTP / X-API-Key")
+
+' Внутренние хранилища Auth и Notifications
+Rel_D(auth_api, auth_db, "Хранит роли (expires_at) и версию доступа", "SQL")
+Rel_D(auth_api, auth_redis, "Читает и сбрасывает снимок прав", "Redis")
+Rel_D(ntf_api, ntf_db, "Сохраняет доставки и отменённые кампании", "SQL / AMQP")
+Rel_D(ntf_api, smtp, "Отправляет транзакционные письма", "SMTP")
+
+@enduml

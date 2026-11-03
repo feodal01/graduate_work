@@ -1,0 +1,55 @@
+@startuml auth-health-sequence-as-is
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam dpi 150
+skinparam maxMessageSize 90
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #64748B
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    BoxBorderColor #94A3B8
+    BoxBackgroundColor #F8FAFC
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+}
+
+title Auth — healthcheck (AS-IS)
+
+autonumber
+
+actor "Система мониторинга" as monitor
+participant "Gateway\nNginx" as gateway
+
+box "Сервис Auth" #F0FDF4
+    participant "Auth API" as auth
+    database "auth-db\nPostgreSQL" as pg
+    database "Auth Redis" as redis
+end box
+
+note over auth, redis
+  Healthcheck использует X-Request-Id и трассировку.
+  Внутренний Token Bucket к этому маршруту не применяется.
+end note
+
+monitor -> gateway: GET /auth/health
+gateway -> auth: GET /api/v1/health/
+auth -> pg: ping
+pg --> auth: состояние PostgreSQL
+auth -> redis: ping
+redis --> auth: состояние Redis
+
+alt PostgreSQL и Redis доступны
+    auth --> gateway: 200 {status: ok,\ndatabase: ok, cache: ok}
+    gateway --> monitor: 200 тот же ответ
+else PostgreSQL или Redis недоступны
+    auth --> gateway: 503 {status: unavailable,\ndatabase: ok или unavailable,\ncache: ok или unavailable}
+    gateway --> monitor: 503 тот же ответ
+end
+
+@enduml

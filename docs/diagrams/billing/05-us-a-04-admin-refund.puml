@@ -1,0 +1,92 @@
+@startuml 05-us-a-04-admin-refund
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam dpi 110
+skinparam maxMessageSize 250
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign center
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #94A3B8
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+    DividerBackgroundColor #E2E8F0
+    DividerBorderColor #64748B
+}
+
+title Оформление возврата администратором и отзыв доступа (US-A-04, US-U-06)
+
+autonumber
+
+actor "Администратор" as admin_user
+participant "Django-админка" as adm
+participant "Billing" as bil
+participant "ЮKassa" as yk
+participant "Auth" as auth
+participant "Notifications" as ntf
+
+== 1. Основной сценарий (Happy Path) ==
+
+admin_user -> adm: В карточке платежа нажимает «Вернуть»
+adm --> admin_user: Открывает страницу подтверждения с предупреждением\nо последствиях и обязательным полем «Причина»
+
+admin_user -> adm: Вводит причину и нажимает «Подтвердить возврат»
+adm -> bil: Запрашивает полный возврат (передаёт ID админа и причину)
+
+bil -> bil: Сохраняет возврат «В обработке» (с ключом идемпотентности)\nи запись в журнал действий администраторов
+bil -> yk: Создаёт возврат на полную сумму (299 ₽)
+yk --> bil: Номер созданного возврата
+
+bil -> yk: Сразу сверяет статус возврата через GET
+yk --> bil: Статус: «Выполнен» (succeeded)
+
+bil -> bil: Переводит возврат в «Выполнен» и ставит задачи в outbox\n(платёж остаётся «Оплачен», подписка вычисляется как «Возвращена»)
+bil -> auth: Закрывает доступ к новинкам (версия V+1, со сбросом кэша Redis)
+bil -> ntf: Отменяет запланированное письмо об окончании подписки\nи отправляет пользователю письмо о возврате
+bil --> adm: Возврат выполнен
+adm --> admin_user: Показывает в карточке платежа статус «Возврат выполнен»
+
+== 2. Краевые случаи и сбои ==
+
+group Не указана причина возврата
+    admin_user -> adm: Отправляет форму с пустой причиной
+    adm --> admin_user: Ошибка формы «Укажите причину возврата» (вызов в Billing не идёт)
+end
+
+group Двойное нажатие кнопки «Подтвердить возврат»
+    admin_user -> adm: Повторная отправка формы
+    adm -> bil: Повторный запрос возврата
+    bil --> adm: Возвращает уже существующий возврат (второй возврат не создаётся)
+end
+
+group Возврат запрещён правилами (подписка уже завершена или возвращена)
+    adm -> bil: Запрос возврата для неактивной подписки
+    bil --> adm: 409 Отказ: возврат возможен только для текущей активной подписки
+    adm --> admin_user: Показывает причину отказа
+end
+
+group ЮKassa отклонила возврат (canceled)
+    bil -> yk: Сверяет статус возврата через GET
+    yk --> bil: Статус: «Отменён» + причина отказа провайдера
+    bil -> bil: Переводит попытку в «Отклонён» (доступ и письма НЕ меняются)
+    bil --> adm: Показывает причину отказа (админ может оформить новую попытку вручную)
+end
+
+group Сбой связи: ЮKassa не ответила при создании возврата
+    bil -[#DC2626]>x yk: Тайм-аут или ошибка 5xx
+    bil --> adm: Возврат сохранён в статусе «В обработке»
+    bil -> yk: Фоновая сверка повторяет запрос по тому же ключу и доводит возврат до итога
+end
+
+group Сбой связи: сервис Billing временно недоступен при отправке формы
+    adm -[#DC2626]>x bil: Ошибка связи или 503
+    adm --> admin_user: Сообщение «Сервис биллинга временно недоступен» (повторная отправка безопасна)
+end
+
+@enduml

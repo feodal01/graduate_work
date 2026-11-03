@@ -1,0 +1,218 @@
+name: ugc-etl-functional-tests
+
+services:
+  kafka:
+    image: bitnamilegacy/kafka:3.4
+    container_name: ugc-etl-ft-kafka
+    ports:
+      - "${KAFKA_PORT:-19094}:9094"
+    environment:
+      KAFKA_ENABLE_KRAFT: "yes"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+      KAFKA_KRAFT_CLUSTER_ID: abcdefghijklmnopqrstuv
+      KAFKA_CFG_NODE_ID: "0"
+      KAFKA_CFG_PROCESS_ROLES: broker,controller
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://127.0.0.1:19094
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --list"]
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 40s
+
+  kafka-init:
+    image: bitnamilegacy/kafka:3.4
+    restart: "no"
+    environment:
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - bash
+      - -c
+      - |
+        kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic ugc.events --partitions 1 --replication-factor 1
+        kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic ugc.events.dlq --partitions 1 --replication-factor 1
+        exec sleep infinity
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-topics.sh --bootstrap-server kafka:9092 --list | grep -q ugc.events.dlq",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 5s
+
+  zookeeper:
+    image: zookeeper:3.8
+    container_name: ugc-etl-ft-zookeeper
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/commands/ruok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  clickhouse-node1:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: ugc-etl-ft-clickhouse-node1
+    hostname: clickhouse-node1
+    environment:
+      CLICKHOUSE_USER: ugc
+      CLICKHOUSE_PASSWORD: functional-clickhouse-password
+    ports:
+      - "127.0.0.1:${CLICKHOUSE_HOST_PORT:-18123}:8123"
+    volumes:
+      - ../../../../infra/clickhouse/config.d/cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ../../../../infra/clickhouse/node1.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
+
+  clickhouse-node2:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: ugc-etl-ft-clickhouse-node2
+    hostname: clickhouse-node2
+    environment:
+      CLICKHOUSE_USER: ugc
+      CLICKHOUSE_PASSWORD: functional-clickhouse-password
+    volumes:
+      - ../../../../infra/clickhouse/config.d/cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ../../../../infra/clickhouse/node2.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
+
+  clickhouse-node3:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: ugc-etl-ft-clickhouse-node3
+    hostname: clickhouse-node3
+    environment:
+      CLICKHOUSE_USER: ugc
+      CLICKHOUSE_PASSWORD: functional-clickhouse-password
+    volumes:
+      - ../../../../infra/clickhouse/config.d/cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ../../../../infra/clickhouse/node3.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
+
+  clickhouse-node4:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: ugc-etl-ft-clickhouse-node4
+    hostname: clickhouse-node4
+    environment:
+      CLICKHOUSE_USER: ugc
+      CLICKHOUSE_PASSWORD: functional-clickhouse-password
+    volumes:
+      - ../../../../infra/clickhouse/config.d/cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ../../../../infra/clickhouse/node4.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
+
+  etl:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: ugc-etl:test
+    container_name: ugc-etl-ft-etl
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      CLICKHOUSE_HOST: clickhouse-node1
+      CLICKHOUSE_USER: ugc
+      CLICKHOUSE_PASSWORD: functional-clickhouse-password
+      ETL_FLUSH_INTERVAL_SECONDS: "1"
+      CLICKHOUSE_BACKOFF__MAX_TRIES: "3"
+      CLICKHOUSE_BACKOFF__INITIAL_DELAY: "0.2"
+      CLICKHOUSE_BACKOFF__MAX_DELAY: "2"
+    ports:
+      - "${ETL_HOST_PORT:-18000}:8000"
+    volumes:
+      - ../../../../infra/clickhouse/init.sql:/app/init.sql:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_healthy
+      clickhouse-node1:
+        condition: service_healthy
+      clickhouse-node2:
+        condition: service_healthy
+      clickhouse-node3:
+        condition: service_healthy
+      clickhouse-node4:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/', timeout=2)"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 40s
+
+  tests:
+    # Не запускать через `up --abort-on-container-exit`: тесты сами stop/start ClickHouse и Kafka.
+    image: ugc-etl:test
+    pull_policy: never
+    user: root
+    working_dir: /app
+    volumes:
+      - ../..:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      ETL_URL: http://etl:8000
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      CLICKHOUSE_HOST: clickhouse-node1
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_USER: ugc
+      CLICKHOUSE_PASSWORD: functional-clickhouse-password
+      KAFKA_CONTAINER: ugc-etl-ft-kafka
+      CLICKHOUSE_CONTAINER: ugc-etl-ft-clickhouse-node1
+      ETL_CONTAINER: ugc-etl-ft-etl
+    depends_on:
+      kafka:
+        condition: service_healthy
+      clickhouse-node1:
+        condition: service_healthy
+      etl:
+        condition: service_started
+    entrypoint: >
+      sh -c "python -m ensurepip
+      && python -m pip install --no-cache-dir -r tests/functional/requirements.txt
+      && python -m tests.functional.utils.wait_for kafka clickhouse etl
+      && python -m pytest -c tests/functional/pytest.ini
+      tests/functional/src -v -p no:cacheprovider"

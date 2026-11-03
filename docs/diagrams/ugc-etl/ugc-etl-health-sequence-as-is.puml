@@ -1,0 +1,68 @@
+@startuml ugc-etl-health-sequence-as-is
+scale 0.8
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam dpi 150
+skinparam maxMessageSize 90
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #64748B
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    BoxBorderColor #94A3B8
+    BoxBackgroundColor #F8FAFC
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+}
+
+title UGC ETL — healthcheck (AS-IS)
+
+autonumber
+
+actor "Система мониторинга" as monitor
+participant "Gateway\nNginx" as gateway
+
+box "Сервис ETL" #EFF6FF
+    participant "UGC ETL" as etl
+end box
+
+participant "Kafka\nтопик ugc.events" as kafka
+participant "ClickHouse" as ch
+
+monitor -> gateway: GET /ugc-etl/health
+gateway -> etl: GET /api/v1/health/\nX-Request-Id
+etl -> kafka: запросить метаданные топика ugc.events
+etl -> ch: SELECT 1
+etl -> etl: сравнить rss_bytes\nс rss_limit_bytes
+
+alt брокер, хранилище и RSS в норме
+    kafka --> etl: список партиций
+    ch --> etl: 1
+    etl --> gateway: 200 {status: ok, kafka: ok,\nclickhouse: ok, rss_bytes,\nrss_limit_bytes, batch_size}
+    gateway --> monitor: 200 тот же ответ
+else брокер недоступен или топик отсутствует
+    kafka --> etl: ошибка метаданных
+    etl --> gateway: 503 {status: unavailable,\nkafka: unavailable, clickhouse: ok,\nrss_bytes, rss_limit_bytes, batch_size}
+    gateway --> monitor: 503 тот же ответ
+else ClickHouse недоступен
+    ch --> etl: ошибка запроса
+    etl --> gateway: 503 {status: unavailable,\nkafka: ok, clickhouse: unavailable,\nrss_bytes, rss_limit_bytes, batch_size}
+    gateway --> monitor: 503 тот же ответ
+else rss_bytes выше лимита
+    etl --> gateway: 503 {status: unavailable,\nkafka: ok, clickhouse: ok,\nrss_bytes, rss_limit_bytes, batch_size}
+    gateway --> monitor: 503 тот же ответ
+    note over etl
+      Любой 503 делает контейнер
+      unhealthy. Compose сам
+      процесс не перезапускает.
+      После падения процесса чтение
+      идёт с закоммиченного офсета.
+    end note
+end
+
+@enduml

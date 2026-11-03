@@ -1,0 +1,56 @@
+@startuml ugc-etl-clickhouse-unavailable-sequence-as-is
+scale 0.8
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam dpi 150
+skinparam maxMessageSize 90
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #64748B
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    BoxBorderColor #94A3B8
+    BoxBackgroundColor #F8FAFC
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+}
+
+title UGC ETL — ClickHouse недоступен (AS-IS)
+
+autonumber
+
+participant "Kafka\nтопик ugc.events" as kafka
+
+box "Сервис ETL" #EFF6FF
+    participant "UGC ETL" as etl
+end box
+
+participant "ClickHouse" as ch
+
+etl -> kafka: poll
+kafka --> etl: records
+etl -> ch: INSERT ugc.events
+
+alt хранилище недоступно
+    ch --> etl: ошибка соединения или timeout
+    loop backoff с экспонентой
+        etl -> ch: INSERT тот же батч ugc.events
+        ch --> etl: ошибка
+    end
+    note over etl, kafka
+      Commit не вызывается.
+      В памяти остаётся один батч,
+      без второй очереди.
+    end note
+else хранилище снова отвечает
+    ch --> etl: ok
+    etl -> kafka: Commit offsets
+    etl -> etl: очистить батч
+end
+
+@enduml

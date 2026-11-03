@@ -1,0 +1,60 @@
+@startuml ugc-events-documentation-sequence-as-is
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam dpi 150
+skinparam maxMessageSize 90
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #64748B
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    BoxBorderColor #94A3B8
+    BoxBackgroundColor #F8FAFC
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+}
+
+title UGC Events API — документация API (AS-IS)
+
+autonumber
+
+actor "Ревьюер" as reviewer
+actor "Внутренний клиент" as internal
+participant "Gateway\nNginx" as gateway
+
+box "Сервис пользовательских действий" #ECFDF5
+    participant "UGC Events API" as ugc
+end box
+
+note over reviewer, ugc
+  Сервис принимает GET и HEAD для трёх маршрутов.
+  Gateway публикует /ugc/docs и /ugc/openapi.json.
+  /docs/oauth2-redirect доступен только внутри контейнерной сети.
+end note
+
+reviewer -> gateway: GET /ugc/docs
+gateway -> ugc: GET /ugc/docs\nX-Request-Id
+ugc --> gateway: 200 Swagger UI HTML
+gateway --> reviewer: 200 Swagger UI HTML
+
+reviewer -> gateway: GET /ugc/openapi.json
+gateway -> ugc: GET /ugc/openapi.json\nX-Request-Id
+ugc -> ugc: получить OpenAPI-схему
+alt схема уже находится в кэше FastAPI
+    ugc -> ugc: использовать готовую схему
+else первый запрос схемы
+    ugc -> ugc: сформировать и сохранить схему\nпо текущим маршрутам и моделям
+end
+ugc -> ugc: добавить charset=utf-8\nв Content-Type JSON
+ugc --> gateway: 200 OpenAPI JSON
+gateway --> reviewer: 200 OpenAPI JSON
+
+internal -> ugc: GET /docs/oauth2-redirect
+ugc --> internal: 200 Swagger UI OAuth2 redirect HTML
+
+@enduml

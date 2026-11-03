@@ -1,0 +1,60 @@
+@startuml movies-api-documentation-sequence-as-is
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam dpi 150
+skinparam maxMessageSize 90
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #64748B
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    BoxBorderColor #94A3B8
+    BoxBackgroundColor #F8FAFC
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+}
+
+title Movies API — документация API (AS-IS)
+
+autonumber
+
+actor "Ревьюер" as reviewer
+actor "Внутренний клиент" as internal
+participant "Gateway\nNginx" as gateway
+
+box "Сервис фильмов" #EFF6FF
+    participant "Movies API" as movies
+end box
+
+note over reviewer, movies
+  Сервис принимает GET и HEAD для трёх маршрутов.
+  Gateway публикует /movies/docs и /movies/openapi.json.
+  /docs/oauth2-redirect доступен только внутри контейнерной сети.
+end note
+
+reviewer -> gateway: GET /movies/docs
+gateway -> movies: GET /movies/docs\nX-Request-Id
+movies --> gateway: 200 Swagger UI HTML
+gateway --> reviewer: 200 Swagger UI HTML
+
+reviewer -> gateway: GET /movies/openapi.json
+gateway -> movies: GET /movies/openapi.json\nX-Request-Id
+movies -> movies: получить OpenAPI-схему
+alt схема уже находится в кэше FastAPI
+    movies -> movies: использовать готовую схему
+else первый запрос схемы
+    movies -> movies: сформировать и сохранить схему\nпо текущим маршрутам и моделям
+end
+movies -> movies: добавить charset=utf-8\nв Content-Type JSON
+movies --> gateway: 200 OpenAPI JSON
+gateway --> reviewer: 200 OpenAPI JSON
+
+internal -> movies: GET /docs/oauth2-redirect
+movies --> internal: 200 Swagger UI OAuth2 redirect HTML
+
+@enduml

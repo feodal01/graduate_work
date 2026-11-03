@@ -1,0 +1,60 @@
+{
+  "UUID": "1b39356e134b4999bb6c1069f9a2454b",
+  "bulk_sent": 300,
+  "welcome_sent": 12,
+  "external_transactional_sent": 1,
+  "workers_per_class": 1,
+  "concurrency": 2,
+  "rates_and_capacities": {
+    "total": 20,
+    "transactional": 10,
+    "service": 5,
+    "bulk": 5
+  },
+  "registration_intervals_seconds": [
+    1.0005274169998302,
+    1.002303875000507,
+    1.0006640829997195,
+    0.9999284589994204,
+    1.0058912910008075,
+    0.9957171250007377,
+    1.000534583999979,
+    1.0000267499999609,
+    1.0044392499985406,
+    0.9996822080011043,
+    1.0019092499987892
+  ],
+  "bulk_pending_during_registration": [
+    296,
+    290,
+    285,
+    280,
+    275,
+    270,
+    265,
+    260,
+    255,
+    250,
+    245,
+    240,
+    235
+  ],
+  "bulk_sent_before_urgent": 4,
+  "bulk_sent_after_urgent": 67,
+  "conservative_upper_bounds_seconds": {
+    "welcome-0-1b39356e134b4999bb6c1069f9a2454b@example.org": 2.0965580840002076,
+    "welcome-1-1b39356e134b4999bb6c1069f9a2454b@example.org": 1.0960306670003774,
+    "welcome-2-1b39356e134b4999bb6c1069f9a2454b@example.org": 1.0958021249989542,
+    "welcome-3-1b39356e134b4999bb6c1069f9a2454b@example.org": 1.095124167000904,
+    "welcome-4-1b39356e134b4999bb6c1069f9a2454b@example.org": 2.0972505410009035,
+    "welcome-5-1b39356e134b4999bb6c1069f9a2454b@example.org": 2.0912386250001873,
+    "welcome-6-1b39356e134b4999bb6c1069f9a2454b@example.org": 2.0904079590000038,
+    "welcome-7-1b39356e134b4999bb6c1069f9a2454b@example.org": 2.100374790999922,
+    "welcome-8-1b39356e134b4999bb6c1069f9a2454b@example.org": 2.097931124999377,
+    "welcome-9-1b39356e134b4999bb6c1069f9a2454b@example.org": 2.1005537080000067,
+    "welcome-10-1b39356e134b4999bb6c1069f9a2454b@example.org": 2.062230916999397,
+    "welcome-11-1b39356e134b4999bb6c1069f9a2454b@example.org": 1.3045763330010232,
+    "b03ab041-d6c6-45ba-8cb0-a71c9ddbc012-1b39356e134b4999bb6c1069f9a2454b@example.org": 0.3032792079993669
+  },
+  "max_upper_bound_seconds": 2.1005537080000067
+}

@@ -1,0 +1,139 @@
+@startuml admin-role-management-sequence-as-is
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam dpi 75
+skinparam maxMessageSize 90
+skinparam responseMessageBelowArrow true
+skinparam sequence {
+    ArrowColor #334155
+    ActorBorderColor #334155
+    LifeLineBorderColor #64748B
+    LifeLineBackgroundColor #F8FAFC
+    ParticipantBorderColor #334155
+    ParticipantBackgroundColor #E2E8F0
+    BoxBorderColor #94A3B8
+    BoxBackgroundColor #F8FAFC
+    GroupBorderColor #64748B
+    GroupBackgroundColor #F8FAFC
+}
+
+title Django Admin — управление ролями через Auth (AS-IS)
+
+autonumber
+
+actor "Администратор" as operator
+participant "Gateway\nNginx" as gateway
+
+box "Сервис Admin" #FFF7ED
+    participant "Django Admin" as admin
+end box
+
+participant "Auth API" as auth
+
+note over operator, auth
+  Перед каждым запросом Admin проверяет сессию и административное право.
+  Эта проверка описана в admin-request-after-login-sequence-as-is.puml.
+  Успешный GET /roles также передаёт список ролей странице Admin.
+  GET допускает безопасный повтор временного отказа.
+  Изменяющий запрос повторяется только после ошибки установки соединения.
+end note
+
+== Просмотреть роли ==
+
+operator -> gateway: GET /admin/auth/roles/
+gateway -> admin: передать запрос
+admin -> auth: GET /api/v1/auth/roles\nAuthorization: Bearer access
+auth --> admin: 200 список ролей
+admin --> gateway: 200 страница ролей
+gateway --> operator: 200 страница ролей
+
+== Создать роль ==
+
+operator -> gateway: GET или POST /admin/auth/roles/add/
+gateway -> admin: передать запрос
+opt POST формы
+    admin -> auth: POST /api/v1/auth/roles\n{name, permissions} + Bearer access\nповтор только при ошибке установки соединения
+    auth --> admin: 201 роль; 409 имя занято;\n422 неверные данные
+end
+admin --> gateway: 200 форма с результатом или 302 к списку
+gateway --> operator: 200 или 302
+
+== Изменить роль ==
+
+operator -> gateway: GET или POST /admin/auth/roles/{role_id}/change/
+gateway -> admin: передать запрос
+opt POST формы
+    admin -> auth: PATCH /api/v1/auth/roles/{role_id}\n{name?, permissions?} + Bearer access\nповтор только при ошибке установки соединения
+    auth --> admin: 200 роль; 404 роль не найдена;\n409 имя занято; 422 неверные данные
+end
+admin --> gateway: 200 форма с результатом или 302 к списку
+gateway --> operator: 200 или 302
+
+== Удалить роль ==
+
+operator -> gateway: GET или POST /admin/auth/roles/{role_id}/delete/
+gateway -> admin: передать запрос
+opt POST подтверждения
+    admin -> auth: DELETE /api/v1/auth/roles/{role_id}\nAuthorization: Bearer access\nповтор только при ошибке установки соединения
+    auth --> admin: 204; 404 роль не найдена
+end
+admin --> gateway: 200 подтверждение или 302 к списку
+gateway --> operator: 200 или 302
+
+== Назначить роль ==
+
+operator -> gateway: GET или POST /admin/auth/user-roles/add/
+gateway -> admin: передать запрос
+opt POST формы
+    admin -> auth: POST /api/v1/auth/users/{user_id}/roles\n{role_id} + Bearer access\nповтор только при ошибке установки соединения
+    auth --> admin: 204; 404 пользователь или роль не найдены;\n409 роль уже назначена
+end
+admin --> gateway: 200 форма с результатом или 302 к списку
+gateway --> operator: 200 или 302
+
+== Отозвать роль ==
+
+operator -> gateway: GET или POST /admin/auth/user-roles/delete/
+gateway -> admin: передать запрос
+opt POST формы
+    admin -> auth: DELETE /api/v1/auth/users/{user_id}/roles/{role_id}\nAuthorization: Bearer access\nповтор только при ошибке установки соединения
+    auth --> admin: 204; 404 пользователь, роль\nили назначение не найдены
+end
+admin --> gateway: 200 форма с результатом или 302 к списку
+gateway --> operator: 200 или 302
+
+== Ошибка целевого вызова Auth ==
+
+operator -> gateway: один из GET или POST маршрутов выше
+gateway -> admin: передать запрос
+admin -> auth: соответствующий метод /api/v1/auth/*
+
+alt Auth вернул 401 при целевом вызове
+    admin -> admin: завершить локальную сессию
+    admin --> gateway: 302 /admin/login/
+    gateway --> operator: 302 /admin/login/
+else Auth вернул 403 при целевом вызове
+    note right of admin
+      Admin не записывает роли локально.
+    end note
+    admin --> gateway: 403 действие запрещено
+    gateway --> operator: 403 действие запрещено
+else Auth вернул 429 при целевом вызове
+    note right of admin
+      Admin не выполняет локальную административную запись.
+      Admin сохраняет Retry-After из ответа Auth.
+    end note
+    admin --> gateway: 429 страница ограничения\nRetry-After
+    gateway --> operator: 429 Too many requests\nRetry-After
+else Auth недоступен или вернул 5xx
+    note right of admin
+      Admin не выполняет локальную административную запись.
+      Изменяющий запрос не повторяется после ошибки ответа.
+    end note
+    admin --> gateway: 503 Auth temporarily unavailable
+    gateway --> operator: 503 Auth temporarily unavailable
+end
+
+@enduml

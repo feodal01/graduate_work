@@ -1,0 +1,14 @@
+target-version = "py310"
+line-length = 100
+include = [
+    "**/example/config.py",
+    "**/example/settings.py",
+    "**/example/test_config.py",
+    "app/movies/migrations/0003_catalog_relation_changes.py",
+]
+
+[lint]
+select = ["E", "F", "I", "UP"]
+
+[format]
+quote-style = "single"
