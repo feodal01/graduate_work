@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+
+{% block title %}Ошибка — Биллинг{% endblock %}
+
+{% block content %}
+<h1>{{ title or 'Произошла ошибка' }}</h1>
+<div class="alert-error" role="alert">{{ message }}</div>
+<p><a href="/billing/" class="btn">Вернуться в «Мою подписку»</a></p>
+{% endblock %}

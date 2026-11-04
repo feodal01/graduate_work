@@ -1,0 +1,154 @@
+import asyncio
+import logging
+import signal
+from collections.abc import Awaitable, Callable
+from logging.config import dictConfig
+
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+
+from core.config import settings
+from core.logger import LOGGING, add_logstash_handler
+from core.observability import init_sentry
+from core.tracing import create_tracer_provider
+from db.sql.postgres import PostgresDatabase
+
+logger = logging.getLogger(__name__)
+
+
+async def _sleep_or_stop(stop_event: asyncio.Event, delay_seconds: float) -> bool:
+    """Wait for delay_seconds or return True immediately if stop_event is set."""
+    try:
+        async with asyncio.timeout(delay_seconds):
+            await stop_event.wait()
+        return True
+    except TimeoutError:
+        return stop_event.is_set()
+
+
+async def run_periodic_loop(
+    name: str,
+    step: Callable[[], Awaitable[None]],
+    interval_seconds: float,
+    stop_event: asyncio.Event,
+) -> None:
+    """Run step immediately on startup and then every interval_seconds until stopped."""
+    while not stop_event.is_set():
+        try:
+            await step()
+        except Exception:
+            logger.exception('Unexpected error in billing-worker %s loop', name)
+        if await _sleep_or_stop(stop_event, interval_seconds):
+            break
+
+
+class BillingWorkerRunner:
+    """Background runner for reconciliation and outbox with graceful shutdown."""
+
+    def __init__(
+        self,
+        database: PostgresDatabase,
+        *,
+        reconcile_interval_seconds: float,
+        outbox_interval_seconds: float,
+        reconcile_step: Callable[[], Awaitable[None]] | None = None,
+        outbox_step: Callable[[], Awaitable[None]] | None = None,
+        tracer_provider: TracerProvider | None = None,
+    ) -> None:
+        self._database = database
+        self._reconcile_interval_seconds = reconcile_interval_seconds
+        self._outbox_interval_seconds = outbox_interval_seconds
+        self._reconcile_step = reconcile_step or self._noop_step
+        self._outbox_step = outbox_step or self._noop_step
+        self._tracer_provider = tracer_provider
+        self.stop_event = asyncio.Event()
+
+    @staticmethod
+    async def _noop_step() -> None:
+        return None
+
+    def request_stop(self) -> None:
+        logger.info('Stopping billing-worker gracefully')
+        self.stop_event.set()
+
+    async def run(self) -> None:
+        logger.info(
+            'Starting billing-worker (reconcile_interval=%ss, outbox_interval=%ss)',
+            self._reconcile_interval_seconds,
+            self._outbox_interval_seconds,
+        )
+        try:
+            async with asyncio.TaskGroup() as task_group:
+                task_group.create_task(
+                    run_periodic_loop(
+                        'reconcile',
+                        self._reconcile_step,
+                        self._reconcile_interval_seconds,
+                        self.stop_event,
+                    )
+                )
+                task_group.create_task(
+                    run_periodic_loop(
+                        'outbox',
+                        self._outbox_step,
+                        self._outbox_interval_seconds,
+                        self.stop_event,
+                    )
+                )
+        finally:
+            try:
+                await self._database.close()
+            finally:
+                if self._tracer_provider is not None:
+                    self._tracer_provider.shutdown()
+            logger.info('billing-worker stopped')
+
+
+def install_signal_handlers(
+    loop: asyncio.AbstractEventLoop,
+    runner: BillingWorkerRunner,
+) -> None:
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, runner.request_stop)
+        except NotImplementedError:  # pragma: no cover
+            signal.signal(sig, lambda *_: runner.request_stop())
+
+
+async def main() -> None:
+    if settings.logstash.host:
+        add_logstash_handler(
+            settings.logstash.host,
+            settings.logstash.port,
+            settings.tracing.service_name,
+        )
+    dictConfig(LOGGING)
+    init_sentry(
+        dsn=settings.sentry.dsn,
+        environment=settings.sentry.environment,
+        traces_sample_rate=settings.sentry.traces_sample_rate,
+        service=settings.tracing.service_name,
+    )
+    tracer_provider: TracerProvider | None = None
+    if settings.tracing.enabled:
+        tracer_provider = create_tracer_provider(settings.tracing)
+        trace.set_tracer_provider(tracer_provider)
+    database = PostgresDatabase(
+        settings.postgres.dsn,
+        connect_timeout_seconds=settings.postgres.connect_timeout_seconds,
+        pool_timeout_seconds=settings.postgres.pool_timeout_seconds,
+        command_timeout_seconds=settings.postgres.command_timeout_seconds,
+        statement_timeout_ms=settings.postgres.statement_timeout_ms,
+    )
+    runner = BillingWorkerRunner(
+        database,
+        reconcile_interval_seconds=settings.worker.billing_reconcile_interval_seconds,
+        outbox_interval_seconds=settings.worker.billing_outbox_interval_seconds,
+        tracer_provider=tracer_provider,
+    )
+    install_signal_handlers(asyncio.get_running_loop(), runner)
+    await runner.run()
+
+
+if __name__ == '__main__':  # pragma: no cover
+    asyncio.run(main())

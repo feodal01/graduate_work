@@ -30,6 +30,13 @@ jobs:
       python-versions: '["3.12", "3.13", "3.14"]'
       integration-stack: true
 
+  billing:
+    uses: ./.github/workflows/python-service.yml
+    with:
+      service: billing
+      python-versions: '["3.12", "3.13", "3.14"]'
+      integration-stack: true
+
   notifications:
     uses: ./.github/workflows/python-service.yml
     with:
@@ -116,6 +123,7 @@ jobs:
     needs:
       - auth
       - auth-integration
+      - billing
       - notifications
       - notifications-e2e
       - movies-api

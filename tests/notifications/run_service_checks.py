@@ -14,7 +14,10 @@ from stack_endpoints import stack_endpoints
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("service", choices=["auth", "ugc-api", "movies-etl", "notifications"])
+    parser.add_argument(
+        "service",
+        choices=["auth", "billing", "ugc-api", "movies-etl", "notifications"],
+    )
     parser.add_argument("pytest_args", nargs="*")
     args = parser.parse_args()
     e = stack_endpoints()

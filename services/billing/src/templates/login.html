@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+
+{% block title %}Вход в Биллинг{% endblock %}
+
+{% block content %}
+<h1>Вход в личный кабинет подписки</h1>
+
+{% if error_message %}
+<div class="alert-error" role="alert">{{ error_message }}</div>
+{% endif %}
+
+<form method="post" action="/billing/login">
+    <div class="field">
+        <label for="login">Логин</label>
+        <input id="login" name="login" type="text" value="{{ login_value or '' }}" required autocomplete="username">
+    </div>
+    <div class="field">
+        <label for="password">Пароль</label>
+        <input id="password" name="password" type="password" required autocomplete="current-password">
+    </div>
+    <button type="submit" class="btn">Войти</button>
+</form>
+{% endblock %}

@@ -1,0 +1,80 @@
+[project]
+name = "billing"
+version = "0.1.0"
+description = "Subscription billing service for an online cinema"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.19.1",
+    "asyncpg>=0.31.0",
+    "fastapi>=0.141.1",
+    "greenlet>=3.5.5",
+    "httpx>=0.28.1",
+    "jinja2>=3.1.6",
+    "opentelemetry-api>=1.44.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.44.0",
+    "opentelemetry-instrumentation-fastapi>=0.65b0",
+    "opentelemetry-sdk>=1.44.0",
+    "pydantic-settings>=2.15.0",
+    "pyjwt>=2.10.1",
+    "python-logstash>=0.4.8",
+    "python-multipart>=0.0.20",
+    "sentry-sdk[fastapi]>=2",
+    "sqlalchemy>=2.0.51",
+    "uvicorn[standard]>=0.52.1",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.0",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.1.0",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.16.3",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = ["-m", "not integration"]
+markers = [
+    "integration: needs live PostgreSQL (run with -m integration)",
+]
+
+[tool.mypy]
+mypy_path = "src"
+files = ["src"]
+explicit_package_bases = true
+plugins = ["pydantic.mypy"]
+warn_return_any = true
+warn_unused_configs = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+check_untyped_defs = true
+pretty = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = [
+    "asyncpg",
+    "logstash",
+]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["D", "E", "F", "I", "W"]
+ignore = ["D100", "D101", "D104", "D105", "D107", "D203", "D213"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/**/*.py" = ["D"]
+"tests/conftest.py" = ["E402"]
+
+[tool.ruff.format]
+quote-style = "single"
