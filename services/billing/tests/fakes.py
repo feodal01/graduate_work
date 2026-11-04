@@ -4,6 +4,11 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from api.errors import BillingDomainError
+from clients.auth import AuthServiceUnavailableError
+from clients.payment_provider import (
+    CreateProviderPaymentRequest,
+    ProviderPaymentSnapshot,
+)
 from db.sql.errors import DatabaseUnavailableError
 from domain.subscription import ReconcileSource, deterministic_id, format_msk_datetime
 from repositories.purchase import LocalPaymentResultData
@@ -78,6 +83,19 @@ class InMemoryPurchaseRepository:
     async def get_payment(self, payment_id: UUID) -> FakePaymentRow | None:
         """Возвращает платёж по внутреннему UUID."""
         return self.payments.get(payment_id)
+
+    async def get_payment_for_user(
+        self,
+        payment_id: UUID,
+        user_id: UUID,
+    ) -> FakePaymentRow | None:
+        """Возвращает платёж пользователя по UUID или None для чужого/неизвестного."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        payment = self.payments.get(payment_id)
+        if payment is None or payment.user_id != user_id:
+            return None
+        return payment
 
     async def get_local_payment_result_for_user(
         self,
@@ -373,3 +391,111 @@ class InMemoryPurchaseRepository:
             },
         )
         return row, True
+
+
+class FakeProviderGateway:
+    """Единый in-memory стаб платёжного провайдера для модульных TDD-тестов."""
+
+    provider_code = 'yookassa'
+
+    def __init__(self, *, id_prefix: str = 'yk-pay') -> None:
+        self._id_prefix = id_prefix
+        self.create_calls: list[CreateProviderPaymentRequest] = []
+        self.get_calls: list[str] = []
+        self.create_error: Exception | None = None
+        self.get_error: Exception | None = None
+        self.get_status: str = 'pending'
+        self.next_provider_num: int = 1
+
+    async def create_payment(
+        self,
+        request: CreateProviderPaymentRequest,
+    ) -> ProviderPaymentSnapshot:
+        """Эмулирует создание платежа в ЮKassa."""
+        self.create_calls.append(request)
+        if self.create_error is not None:
+            raise self.create_error
+        provider_id = f'{self._id_prefix}-{self.next_provider_num}'
+        self.next_provider_num += 1
+        return ProviderPaymentSnapshot(
+            provider_code='yookassa',
+            provider_payment_id=provider_id,
+            domain_status='pending',
+            amount_kopeks=request.amount_kopeks,
+            currency=request.currency,
+            confirmation_url=(
+                f'https://yoomoney.ru/checkout/payments/v2/contract?orderId={provider_id}'
+            ),
+            failure_reason=None,
+            metadata_payment_id=str(request.payment_id),
+            provider_details={'id': provider_id, 'status': 'pending'},
+        )
+
+    async def get_payment(
+        self,
+        provider_payment_id: str,
+        *,
+        expected_payment_id: UUID | None = None,
+        expected_amount_kopeks: int | None = None,
+        expected_currency: str | None = None,
+    ) -> ProviderPaymentSnapshot:
+        """Эмулирует чтение статуса платежа в ЮKassa."""
+        self.get_calls.append(provider_payment_id)
+        if self.get_error is not None:
+            raise self.get_error
+        return ProviderPaymentSnapshot(
+            provider_code='yookassa',
+            provider_payment_id=provider_payment_id,
+            domain_status=self.get_status,  # type: ignore[arg-type]
+            amount_kopeks=expected_amount_kopeks or 29_900,
+            currency=expected_currency or 'RUB',
+            confirmation_url=(
+                f'https://yoomoney.ru/checkout/payments/v2/contract?orderId={provider_payment_id}'
+            ),
+            failure_reason=(
+                'expired_on_confirmation' if self.get_status == 'failed' else None
+            ),
+            metadata_payment_id=(
+                str(expected_payment_id) if expected_payment_id else None
+            ),
+            provider_details={'id': provider_payment_id, 'status': self.get_status},
+        )
+
+
+class ConfigurableAuthGateway:
+    """Единый стаб AuthGateway с поддержкой настройки часового пояса и отказа 503."""
+
+    def __init__(
+        self,
+        user_id: UUID,
+        *,
+        login: str = 'viewer',
+        tz: str = 'Europe/Moscow',
+        unavailable: bool = False,
+    ) -> None:
+        self.user_id = user_id
+        self.user_login = login
+        self.tz = tz
+        self.unavailable = unavailable
+
+    async def login(
+        self, login: str, password: str, *, request_id: str
+    ) -> tuple[str, str]:
+        """Эмулирует вход."""
+        if self.unavailable:
+            raise AuthServiceUnavailableError('Auth is down')
+        return 'acc', 'ref'
+
+    async def get_current_user(
+        self, access_token: str, *, request_id: str
+    ) -> tuple[UUID, str, str]:
+        """Возвращает пользователя или имитирует отказ Auth."""
+        if self.unavailable:
+            raise AuthServiceUnavailableError('Auth is down')
+        return self.user_id, self.user_login, self.tz
+
+    async def logout(
+        self, access_token: str, refresh_token: str, *, request_id: str
+    ) -> None:
+        """Эмулирует выход."""
+        return None

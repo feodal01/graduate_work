@@ -91,7 +91,7 @@ class BillingIntegrationCheck:
         self._check_payment_result_screen_t12()
         self._check_degradation_and_worker_graceful_shutdown()
         print(
-            'All Billing T-06 / T-07 / T-08 / T-09 / T-10 / T-11 / T-12 '
+            'All Billing T-06 / T-07 / T-08 / T-09 / T-10 / T-11 / T-12 / T-13 '
             'live Docker checks passed.'
         )
 
@@ -837,6 +837,22 @@ class BillingIntegrationCheck:
                     f'Expected pending block on E3 screen: {res_pending}'
                 )
 
+            # T-13: /continue on fake provider_payment_id -> 503 E4 screen
+            res_cont_err = self._http(
+                'GET',
+                f'/billing/payments/{pay_id}/continue',
+                headers={'Cookie': cookie_header},
+                follow_redirects=False,
+            )
+            if (
+                res_cont_err.status != 503
+                or 'Не удалось связаться с платёжной системой'
+                not in res_cont_err.text()
+            ):
+                raise AssertionError(
+                    f'Expected 503 E4 on /continue with fake id: {res_cont_err}'
+                )
+
             # Block 2: succeeded, outbox pending -> "Оплачено, доступ активируется"
             self._psql(
                 f"UPDATE payments SET status = 'succeeded' WHERE id = '{pay_id}';"
@@ -884,6 +900,20 @@ class BillingIntegrationCheck:
             ):
                 raise AssertionError(
                     f'Expected succeeded_ready block on E3 screen: {res_ready}'
+                )
+
+            # T-13: /continue on local succeeded -> 303 redirect to result page
+            res_cont_ok = self._http(
+                'GET',
+                f'/billing/payments/{pay_id}/continue',
+                headers={'Cookie': cookie_header},
+                follow_redirects=False,
+            )
+            if res_cont_ok.status != 303 or not (
+                res_cont_ok.header('Location') or ''
+            ).endswith(f'/billing/payments/{pay_id}'):
+                raise AssertionError(
+                    f'Expected 303 to result page on /continue: {res_cont_ok}'
                 )
 
             # Block 3: failed -> "Оплата не прошла" + human reason + retry form

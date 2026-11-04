@@ -89,9 +89,15 @@ def _register_handler[ErrorT: Exception](
 
 
 async def domain_error_handler(
-    _request: Request,
+    request: Request,
     exc: BillingDomainError,
-) -> JSONResponse:
+) -> Response:
+    if request.url.path.startswith('/billing/'):
+        return render_error_page(
+            request,
+            status_code=exc.status_code,
+            message=exc.detail,
+        )
     return error_response(exc.status_code, exc.error_code, exc.detail)
 
 

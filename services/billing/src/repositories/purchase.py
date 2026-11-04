@@ -66,6 +66,12 @@ class PurchaseRepository(Protocol):
         payment_id: UUID,
     ) -> PaymentRecordProtocol | None: ...
 
+    async def get_payment_for_user(
+        self,
+        payment_id: UUID,
+        user_id: UUID,
+    ) -> PaymentRecordProtocol | None: ...
+
     async def get_local_payment_result_for_user(
         self,
         payment_id: UUID,
@@ -224,6 +230,23 @@ class SQLAlchemyPurchaseRepository:
         try:
             async with self._session_factory() as session:
                 return await session.get(Payment, payment_id)
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def get_payment_for_user(
+        self,
+        payment_id: UUID,
+        user_id: UUID,
+    ) -> Payment | None:
+        """Возвращает платёж пользователя по UUID или None (BIL-NFR-SEC-03)."""
+        try:
+            async with self._session_factory() as session:
+                return await session.scalar(
+                    select(Payment).where(
+                        Payment.id == payment_id,
+                        Payment.user_id == user_id,
+                    )
+                )
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 

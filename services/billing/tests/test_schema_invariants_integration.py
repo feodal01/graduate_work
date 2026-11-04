@@ -707,3 +707,9 @@ async def test_t11_atomic_reconciliation_succeeded_failed_and_concurrent_race(
     # Чужой пользователь получает None (защита BIL-NFR-SEC-03)
     local_foreign = await repo.get_local_payment_result_for_user(payment.id, uuid4())
     assert local_foreign is None
+
+    # 7. T-13: проверяем get_payment_for_user для своего и чужого пользователя
+    own_pay = await repo.get_payment_for_user(payment.id, user_id)
+    assert own_pay is not None and own_pay.id == payment.id
+    foreign_pay = await repo.get_payment_for_user(payment.id, uuid4())
+    assert foreign_pay is None

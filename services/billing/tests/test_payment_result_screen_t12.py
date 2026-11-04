@@ -6,7 +6,6 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from clients.auth import AuthServiceUnavailableError
 from clients.payment_provider import (
     CreateProviderPaymentRequest,
     ProviderPaymentSnapshot,
@@ -19,6 +18,7 @@ from dependencies import (
 from main import create_app
 from services.purchase import PurchaseService
 from tests.fakes import (
+    ConfigurableAuthGateway,
     FakeOutboxTaskRow,
     FakePaymentRow,
     FakeSubscriptionRow,
@@ -53,39 +53,6 @@ class ForbiddenProviderGateway:
         """Выбрасывает ошибку: экран результата не имеет права вызывать ЮKassa."""
         self.calls += 1
         raise AssertionError('YooKassa get_payment must not be called on GET result')
-
-
-class ConfigurableAuthGateway:
-    def __init__(
-        self,
-        *,
-        user_id: UUID,
-        tz: str = 'Asia/Yekaterinburg',
-        unavailable: bool = False,
-    ) -> None:
-        self.user_id = user_id
-        self.tz = tz
-        self.unavailable = unavailable
-
-    async def login(
-        self, login: str, password: str, *, request_id: str
-    ) -> tuple[str, str]:
-        """Эмулирует вход."""
-        return 'acc', 'ref'
-
-    async def get_current_user(
-        self, access_token: str, *, request_id: str
-    ) -> tuple[UUID, str, str]:
-        """Возвращает пользователя или имитирует отказ Auth."""
-        if self.unavailable:
-            raise AuthServiceUnavailableError('Auth is down')
-        return self.user_id, 'viewer', self.tz
-
-    async def logout(
-        self, access_token: str, refresh_token: str, *, request_id: str
-    ) -> None:
-        """Эмулирует выход."""
-        return None
 
 
 @pytest.fixture

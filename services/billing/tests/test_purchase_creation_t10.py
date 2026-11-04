@@ -13,93 +13,11 @@ from clients.payment_provider import (
 )
 from dependencies import AuthenticatedUser, get_auth_gateway, get_payment_provider
 from main import create_app
-from tests.fakes import InMemoryPurchaseRepository
-
-
-class FakeProviderGateway:
-    provider_code = 'yookassa'
-
-    def __init__(self) -> None:
-        self.create_calls: list[CreateProviderPaymentRequest] = []
-        self.get_calls: list[str] = []
-        self.create_error: Exception | None = None
-        self.get_status: str = 'pending'
-        self.next_provider_num: int = 1
-
-    async def create_payment(
-        self,
-        request: CreateProviderPaymentRequest,
-    ) -> ProviderPaymentSnapshot:
-        """Эмулирует создание платежа в ЮKassa."""
-        self.create_calls.append(request)
-        if self.create_error is not None:
-            raise self.create_error
-        provider_id = f'yk-pay-{self.next_provider_num}'
-        self.next_provider_num += 1
-        return ProviderPaymentSnapshot(
-            provider_code='yookassa',
-            provider_payment_id=provider_id,
-            domain_status='pending',
-            amount_kopeks=request.amount_kopeks,
-            currency=request.currency,
-            confirmation_url=(
-                f'https://yoomoney.ru/checkout/payments/v2/contract?orderId={provider_id}'
-            ),
-            failure_reason=None,
-            metadata_payment_id=str(request.payment_id),
-            provider_details={'id': provider_id, 'status': 'pending'},
-        )
-
-    async def get_payment(
-        self,
-        provider_payment_id: str,
-        *,
-        expected_payment_id: UUID | None = None,
-        expected_amount_kopeks: int | None = None,
-        expected_currency: str | None = None,
-    ) -> ProviderPaymentSnapshot:
-        """Эмулирует чтение статуса платежа в ЮKassa."""
-        self.get_calls.append(provider_payment_id)
-        return ProviderPaymentSnapshot(
-            provider_code='yookassa',
-            provider_payment_id=provider_payment_id,
-            domain_status=self.get_status,  # type: ignore[arg-type]
-            amount_kopeks=expected_amount_kopeks or 29_900,
-            currency=expected_currency or 'RUB',
-            confirmation_url=(
-                f'https://yoomoney.ru/checkout/payments/v2/contract?orderId={provider_payment_id}'
-            ),
-            failure_reason=(
-                'expired_on_confirmation' if self.get_status == 'failed' else None
-            ),
-            metadata_payment_id=(
-                str(expected_payment_id) if expected_payment_id else None
-            ),
-            provider_details={'id': provider_payment_id, 'status': self.get_status},
-        )
-
-
-class StubAuthGateway:
-    def __init__(self, user_id: UUID) -> None:
-        self.user_id = user_id
-
-    async def login(
-        self, login: str, password: str, *, request_id: str
-    ) -> tuple[str, str]:
-        """Эмулирует вход."""
-        return 'acc', 'ref'
-
-    async def get_current_user(
-        self, access_token: str, *, request_id: str
-    ) -> tuple[UUID, str, str]:
-        """Возвращает пользователя для тестового токена."""
-        return self.user_id, 'viewer', 'Europe/Moscow'
-
-    async def logout(
-        self, access_token: str, refresh_token: str, *, request_id: str
-    ) -> None:
-        """Эмулирует выход."""
-        return None
+from tests.fakes import (
+    ConfigurableAuthGateway,
+    FakeProviderGateway,
+    InMemoryPurchaseRepository,
+)
 
 
 @pytest.fixture
@@ -133,7 +51,9 @@ async def purchase_test_env() -> AsyncGenerator[
     )
 
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_auth_gateway] = lambda: StubAuthGateway(user_id)
+    app.dependency_overrides[get_auth_gateway] = lambda: ConfigurableAuthGateway(
+        user_id
+    )
     app.dependency_overrides[get_payment_provider] = lambda: provider
     app.dependency_overrides[get_purchase_service] = lambda: service
 
