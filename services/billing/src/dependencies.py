@@ -18,6 +18,7 @@ from db.sql.postgres import PostgresDatabase
 from repositories.purchase import SQLAlchemyPurchaseRepository
 from security.service_credentials import ServiceCredentials
 from services.purchase import PurchaseService
+from services.reconciler import PaymentReconciler
 
 ACCESS_TOKEN_COOKIE = 'billing_access_token'
 REFRESH_TOKEN_COOKIE = 'billing_refresh_token'
@@ -47,9 +48,23 @@ async def get_payment_provider(request: Request) -> PaymentProviderGateway:
     return cast(PaymentProviderGateway, request.app.state.payment_provider)
 
 
+async def get_payment_reconciler(
+    request: Request,
+    payment_provider: PaymentProviderGateway = Depends(get_payment_provider),
+) -> PaymentReconciler:
+    database = cast(PostgresDatabase, request.app.state.database)
+    repo = SQLAlchemyPurchaseRepository(database.sessionmaker)
+    return PaymentReconciler(
+        repository=repo,
+        payment_provider=payment_provider,
+        public_base_url=str(settings.worker.billing_public_base_url),
+    )
+
+
 async def get_purchase_service(
     request: Request,
     payment_provider: PaymentProviderGateway = Depends(get_payment_provider),
+    reconciler: PaymentReconciler = Depends(get_payment_reconciler),
 ) -> PurchaseService:
     database = cast(PostgresDatabase, request.app.state.database)
     repo = SQLAlchemyPurchaseRepository(database.sessionmaker)
@@ -57,6 +72,7 @@ async def get_purchase_service(
         repository=repo,
         payment_provider=payment_provider,
         public_base_url=str(settings.worker.billing_public_base_url),
+        reconciler=reconciler,
     )
 
 

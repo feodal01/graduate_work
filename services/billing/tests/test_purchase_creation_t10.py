@@ -1,6 +1,4 @@
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import httpx
@@ -15,128 +13,7 @@ from clients.payment_provider import (
 )
 from dependencies import AuthenticatedUser, get_auth_gateway, get_payment_provider
 from main import create_app
-
-
-@dataclass
-class FakePaymentRow:
-    id: UUID
-    user_id: UUID
-    tariff_id: UUID
-    provider_code: str
-    amount_kopeks: int
-    currency: str
-    status: str
-    idempotency_key: UUID
-    provider_payment_id: str | None = None
-    confirmation_url: str | None = None
-    failure_reason: str | None = None
-    last_checked_at: datetime | None = None
-    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-
-
-class FakePurchaseRepository:
-    """In-memory репозиторий покупок для модульных TDD-тестов T-10."""
-
-    def __init__(self) -> None:
-        self.has_active_subscription: bool = False
-        self.has_processing_refund: bool = False
-        self.payments: dict[UUID, FakePaymentRow] = {}
-        self.events: list[tuple[str, UUID, str | None, str, str]] = []
-
-    async def check_purchase_allowed(self, user_id: UUID) -> tuple[bool, str | None]:
-        """Проверяет отсутствие активной подписки и возврата в обработке."""
-        if self.has_active_subscription:
-            return False, 'subscription_already_active'
-        if self.has_processing_refund:
-            return False, 'refund_in_processing'
-        return True, None
-
-    async def get_or_create_pending_payment(
-        self,
-        user_id: UUID,
-    ) -> tuple[FakePaymentRow, bool]:
-        """Возвращает существующий или создаёт новый pending-платёж."""
-        from api.errors import BillingDomainError
-
-        allowed, block_code = await self.check_purchase_allowed(user_id)
-        if not allowed:
-            if block_code == 'subscription_already_active':
-                raise BillingDomainError(
-                    'Подписка уже активна',
-                    error_code='subscription_already_active',
-                    status_code=409,
-                )
-            raise BillingDomainError(
-                'Нельзя оформить новую подписку, пока возврат находится в обработке',
-                error_code='refund_in_processing',
-                status_code=409,
-            )
-        for payment in self.payments.values():
-            if payment.user_id == user_id and payment.status == 'pending':
-                return payment, False
-        pid = uuid4()
-        row = FakePaymentRow(
-            id=pid,
-            user_id=user_id,
-            tariff_id=UUID('00000000-0000-0000-0000-000000000001'),
-            provider_code='yookassa',
-            amount_kopeks=29_900,
-            currency='RUB',
-            status='pending',
-            idempotency_key=pid,
-        )
-        self.payments[pid] = row
-        self.events.append(('payment', pid, None, 'pending', 'continue'))
-        return row, True
-
-    async def save_provider_payment_created(
-        self,
-        payment_id: UUID,
-        *,
-        provider_payment_id: str,
-        confirmation_url: str | None,
-        provider_details: dict[str, object],
-    ) -> FakePaymentRow:
-        """Сохраняет номер платежа провайдера и confirmation_url."""
-        row = self.payments[payment_id]
-        if row.status == 'pending':
-            row.provider_payment_id = provider_payment_id
-            if confirmation_url is not None:
-                row.confirmation_url = confirmation_url
-        return row
-
-    async def record_payment_checked(
-        self,
-        payment_id: UUID,
-        *,
-        confirmation_url: str | None = None,
-        provider_details: dict[str, object] | None = None,
-    ) -> FakePaymentRow:
-        """Фиксирует время последней сверки GET (last_checked_at)."""
-        row = self.payments[payment_id]
-        if row.status == 'pending':
-            if confirmation_url:
-                row.confirmation_url = confirmation_url
-            row.last_checked_at = datetime.now(UTC)
-        return row
-
-    async def mark_payment_failed(
-        self,
-        payment_id: UUID,
-        *,
-        failure_reason: str,
-        source: str,
-        provider_details: dict[str, object] | None = None,
-    ) -> FakePaymentRow:
-        """Переводит платёж в статус failed."""
-        row = self.payments[payment_id]
-        if row.status == 'pending':
-            old_status = row.status
-            row.status = 'failed'
-            row.failure_reason = failure_reason
-            self.events.append(('payment', payment_id, old_status, 'failed', source))
-        return row
+from tests.fakes import InMemoryPurchaseRepository
 
 
 class FakeProviderGateway:
@@ -230,7 +107,7 @@ async def purchase_test_env() -> AsyncGenerator[
     tuple[
         httpx.AsyncClient,
         FastAPI,
-        FakePurchaseRepository,
+        InMemoryPurchaseRepository,
         FakeProviderGateway,
         AuthenticatedUser,
     ],
@@ -247,7 +124,7 @@ async def purchase_test_env() -> AsyncGenerator[
         tz='Europe/Moscow',
         access_token='valid-token',
     )
-    repo = FakePurchaseRepository()
+    repo = InMemoryPurchaseRepository()
     provider = FakeProviderGateway()
     service = PurchaseService(
         repository=repo,
@@ -278,7 +155,7 @@ async def test_create_purchase_creates_pending_payment_calls_yookassa_and_redire
     purchase_test_env: tuple[
         httpx.AsyncClient,
         FastAPI,
-        FakePurchaseRepository,
+        InMemoryPurchaseRepository,
         FakeProviderGateway,
         AuthenticatedUser,
     ],
@@ -306,7 +183,7 @@ async def test_repeat_purchase_checks_yookassa_and_reuses_live_pending_payment(
     purchase_test_env: tuple[
         httpx.AsyncClient,
         FastAPI,
-        FakePurchaseRepository,
+        InMemoryPurchaseRepository,
         FakeProviderGateway,
         AuthenticatedUser,
     ],
@@ -334,7 +211,7 @@ async def test_repeat_purchase_when_pending_was_canceled_creates_new_payment(
     purchase_test_env: tuple[
         httpx.AsyncClient,
         FastAPI,
-        FakePurchaseRepository,
+        InMemoryPurchaseRepository,
         FakeProviderGateway,
         AuthenticatedUser,
     ],
@@ -355,6 +232,7 @@ async def test_repeat_purchase_when_pending_was_canceled_creates_new_payment(
         == 'https://yoomoney.ru/checkout/payments/v2/contract?orderId=yk-pay-2'
     )
     assert repo.payments[first_id].status == 'failed'
+    assert f'payment_failed:{first_id}:notify_failed' in repo.outbox_tasks
     assert len(repo.payments) == 2
     assert len(provider.create_calls) == 2
 
@@ -364,7 +242,7 @@ async def test_repeat_purchase_recovers_payment_without_provider_id_by_same_key(
     purchase_test_env: tuple[
         httpx.AsyncClient,
         FastAPI,
-        FakePurchaseRepository,
+        InMemoryPurchaseRepository,
         FakeProviderGateway,
         AuthenticatedUser,
     ],
@@ -398,7 +276,7 @@ async def test_purchase_rejected_with_409_when_active_subscription_or_processing
     purchase_test_env: tuple[
         httpx.AsyncClient,
         FastAPI,
-        FakePurchaseRepository,
+        InMemoryPurchaseRepository,
         FakeProviderGateway,
         AuthenticatedUser,
     ],
@@ -428,7 +306,7 @@ async def test_purchase_marks_payment_failed_when_yookassa_returns_400_401_403(
     purchase_test_env: tuple[
         httpx.AsyncClient,
         FastAPI,
-        FakePurchaseRepository,
+        InMemoryPurchaseRepository,
         FakeProviderGateway,
         AuthenticatedUser,
     ],
@@ -442,6 +320,7 @@ async def test_purchase_marks_payment_failed_when_yookassa_returns_400_401_403(
     saved = next(iter(repo.payments.values()))
     assert saved.status == 'failed'
     assert saved.failure_reason is not None
+    assert f'payment_failed:{saved.id}:notify_failed' in repo.outbox_tasks
 
 
 @pytest.mark.asyncio
@@ -449,7 +328,7 @@ async def test_repeat_purchase_throttles_yookassa_get_calls_to_once_per_5_second
     purchase_test_env: tuple[
         httpx.AsyncClient,
         FastAPI,
-        FakePurchaseRepository,
+        InMemoryPurchaseRepository,
         FakeProviderGateway,
         AuthenticatedUser,
     ],
@@ -479,21 +358,24 @@ async def test_repeat_purchase_redirects_to_result_when_yookassa_returns_succeed
     purchase_test_env: tuple[
         httpx.AsyncClient,
         FastAPI,
-        FakePurchaseRepository,
+        InMemoryPurchaseRepository,
         FakeProviderGateway,
         AuthenticatedUser,
     ],
 ) -> None:
-    """US-U-01: при succeeded в ЮKassa редиректит на экран результата платежа."""
-    client, _, _, provider, _ = purchase_test_env
+    """US-U-01: при succeeded в ЮKassa создаётся подписка и редирект на результат."""
+    client, _, repo, provider, user = purchase_test_env
 
     first = await client.post('/api/v1/billing/payments')
-    payment_id = first.json()['payment_id']
+    payment_id = UUID(first.json()['payment_id'])
 
     provider.get_status = 'succeeded'
     second = await client.post('/billing/subscribe')
     assert second.status_code == 303
     assert second.headers['location'] == f'/billing/payments/{payment_id}'
+    assert payment_id in repo.subscriptions
+    assert repo.access_versions[user.user_id] == 1
+    assert len(repo.outbox_tasks) == 3
 
 
 @pytest.mark.asyncio
@@ -501,7 +383,7 @@ async def test_idempotent_post_replay_verifies_via_get_when_non_pending(
     purchase_test_env: tuple[
         httpx.AsyncClient,
         FastAPI,
-        FakePurchaseRepository,
+        InMemoryPurchaseRepository,
         FakeProviderGateway,
         AuthenticatedUser,
     ],

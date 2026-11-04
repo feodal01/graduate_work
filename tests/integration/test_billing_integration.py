@@ -77,7 +77,7 @@ class BillingIntegrationCheck:
         self.no_redirect_opener = urllib.request.build_opener(NoRedirectHandler())
 
     def run(self) -> None:
-        """Run live Docker Compose checks for T-06, T-07, T-08, T-09, and T-10."""
+        """Run live Docker Compose checks for T-06..T-11."""
         self._wait_for_billing_and_auth_health()
         self._check_one_time_migration_and_seeds()
         self._check_gateway_routing_and_internal_isolation()
@@ -87,8 +87,12 @@ class BillingIntegrationCheck:
         self._check_login_logout_and_auth_degradation_t08()
         self._check_yookassa_adapter_in_container_t09()
         self._check_purchase_creation_t10()
+        self._check_reconciler_atomic_outcome_t11()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06 / T-07 / T-08 / T-09 / T-10 live Docker checks passed.')
+        print(
+            'All Billing T-06 / T-07 / T-08 / T-09 / T-10 / T-11 '
+            'live Docker checks passed.'
+        )
 
     def _http(
         self,
@@ -625,6 +629,143 @@ class BillingIntegrationCheck:
             raise AssertionError(
                 f'Unexpected status on POST /api/v1/billing/payments: {pay_1}'
             )
+
+    def _check_reconciler_atomic_outcome_t11(self) -> None:
+        """T-11 (BIL-FR-04, BIL-FR-08, BIL-FR-13, inv. 6, 7, 11): live Reconciler."""
+        code = (
+            'import asyncio\n'
+            'from uuid import uuid4\n'
+            'from sqlalchemy import delete, select\n'
+            'from clients.payment_provider import (\n'
+            '    ProviderIntegrityMismatchError,\n'
+            '    ProviderPaymentSnapshot,\n'
+            ')\n'
+            'from core.config import settings\n'
+            'from db.sql.postgres import PostgresDatabase\n'
+            'from domain.subscription import (\n'
+            '    SubscriptionState,\n'
+            '    compute_subscription_state,\n'
+            ')\n'
+            'from models import (\n'
+            '    OperationEvent,\n'
+            '    OutboxTask,\n'
+            '    Payment,\n'
+            '    Subscription,\n'
+            '    UserAccessVersion,\n'
+            ')\n'
+            'from repositories.purchase import SQLAlchemyPurchaseRepository\n'
+            'from services.reconciler import PaymentReconciler\n'
+            'class LiveStubProvider:\n'
+            '    provider_code = "yookassa"\n'
+            '    def __init__(self, snap, err=None):\n'
+            '        self.snap = snap\n'
+            '        self.err = err\n'
+            '    async def create_payment(self, request):\n'
+            '        raise AssertionError("Not expected")\n'
+            '    async def get_payment(self, pid, **kwargs):\n'
+            '        if self.err:\n'
+            '            raise self.err\n'
+            '        return self.snap\n'
+            'async def check_t11():\n'
+            '    db = PostgresDatabase(settings.postgres.dsn)\n'
+            '    repo = SQLAlchemyPurchaseRepository(db.sessionmaker)\n'
+            '    uid = uuid4()\n'
+            '    pay, _ = await repo.get_or_create_pending_payment(uid)\n'
+            '    await repo.save_provider_payment_created(\n'
+            '        pay.id,\n'
+            '        provider_payment_id=f"yk-t11-{pay.id.hex[:8]}",\n'
+            '        confirmation_url="https://yoomoney.ru/checkout/t11",\n'
+            '        provider_details={"id": "yk-t11"},\n'
+            '    )\n'
+            '    # 1. Unhappy path: integrity mismatch keeps status pending\n'
+            '    bad_rec = PaymentReconciler(\n'
+            '        repository=repo,\n'
+            '        payment_provider=LiveStubProvider(\n'
+            '            None, ProviderIntegrityMismatchError("bad amount")\n'
+            '        ),\n'
+            '    )\n'
+            '    try:\n'
+            '        await bad_rec.reconcile_payment(\n'
+            '            pay.id, source="reconcile", respect_throttle=False\n'
+            '        )\n'
+            '        raise AssertionError("Expected mismatch error")\n'
+            '    except ProviderIntegrityMismatchError:\n'
+            '        pass\n'
+            '    still_pending = await repo.get_payment(pay.id)\n'
+            '    assert still_pending and still_pending.status == "pending"\n'
+            '    # 2. Happy path + race: succeeded creates 1 sub, v=1, 3 tasks\n'
+            '    snap = ProviderPaymentSnapshot(\n'
+            '        provider_code="yookassa",\n'
+            '        provider_payment_id=f"yk-t11-{pay.id.hex[:8]}",\n'
+            '        domain_status="succeeded",\n'
+            '        amount_kopeks=29900,\n'
+            '        currency="RUB",\n'
+            '        confirmation_url=None,\n'
+            '        failure_reason=None,\n'
+            '        metadata_payment_id=str(pay.id),\n'
+            '        provider_details={"status": "succeeded"},\n'
+            '    )\n'
+            '    good_rec = PaymentReconciler(\n'
+            '        repository=repo,\n'
+            '        payment_provider=LiveStubProvider(snap),\n'
+            '    )\n'
+            '    r1, r2 = await asyncio.gather(\n'
+            '        good_rec.reconcile_payment(\n'
+            '            pay.id, source="webhook", respect_throttle=False\n'
+            '        ),\n'
+            '        good_rec.reconcile_payment(\n'
+            '            pay.id, source="reconcile", respect_throttle=False\n'
+            '        ),\n'
+            '    )\n'
+            '    assert {r1.transitioned, r2.transitioned} == {True, False}\n'
+            '    async with db.sessionmaker() as s:\n'
+            '        sub = await s.scalar(\n'
+            '            select(Subscription).where(\n'
+            '                Subscription.payment_id == pay.id\n'
+            '            )\n'
+            '        )\n'
+            '        assert sub is not None\n'
+            '        state = compute_subscription_state(\n'
+            '            ends_at=sub.ends_at, has_succeeded_refund=False\n'
+            '        )\n'
+            '        assert state == SubscriptionState.ACTIVE\n'
+            '        ver = await s.get(UserAccessVersion, uid)\n'
+            '        assert ver is not None and ver.last_version == 1\n'
+            '        tasks = list(\n'
+            '            (await s.scalars(\n'
+            '                select(OutboxTask).where(\n'
+            '                    OutboxTask.payment_id == pay.id\n'
+            '                )\n'
+            '            )).all()\n'
+            '        )\n'
+            '        assert len(tasks) == 3\n'
+            '        await s.execute(\n'
+            '            delete(OutboxTask).where(OutboxTask.payment_id == pay.id)\n'
+            '        )\n'
+            '        await s.execute(\n'
+            '            delete(Subscription).where(\n'
+            '                Subscription.payment_id == pay.id\n'
+            '            )\n'
+            '        )\n'
+            '        await s.execute(\n'
+            '            delete(UserAccessVersion).where(\n'
+            '                UserAccessVersion.user_id == uid\n'
+            '            )\n'
+            '        )\n'
+            '        await s.execute(\n'
+            '            delete(OperationEvent).where(\n'
+            '                OperationEvent.operation_id == pay.id\n'
+            '            )\n'
+            '        )\n'
+            '        await s.execute(delete(Payment).where(Payment.id == pay.id))\n'
+            '        await s.commit()\n'
+            '    await db.close()\n'
+            '    print("t11-reconciler-ok")\n'
+            'asyncio.run(check_t11())\n'
+        )
+        out = self._compose('exec', '-T', 'billing-api', 'python', '-c', code).strip()
+        if 't11-reconciler-ok' not in out:
+            raise AssertionError(f'T-11 Reconciler live check failed: {out}')
 
     def _check_degradation_and_worker_graceful_shutdown(self) -> None:
         """BIL-API-15, GW-NFR-R-01, BIL-NFR-R-09: DB outage yields 503; worker stops."""

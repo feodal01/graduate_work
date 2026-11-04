@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from api.errors import BillingDomainError
@@ -10,8 +9,13 @@ from clients.payment_provider import (
     ProviderPermanentError,
 )
 from repositories.purchase import PaymentRecordProtocol, PurchaseRepository
+from services.reconciler import CHECK_THROTTLE_WINDOW, PaymentReconciler
 
-CHECK_THROTTLE_WINDOW = timedelta(seconds=5)
+__all__ = [
+    'CHECK_THROTTLE_WINDOW',
+    'PurchaseOutcome',
+    'PurchaseService',
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,7 +27,7 @@ class PurchaseOutcome:
 
 
 class PurchaseService:
-    """Доменный сервис создания и продолжения покупки подписки (T-10)."""
+    """Доменный сервис создания и продолжения покупки подписки (T-10, T-11)."""
 
     def __init__(
         self,
@@ -31,21 +35,26 @@ class PurchaseService:
         repository: PurchaseRepository,
         payment_provider: PaymentProviderGateway,
         public_base_url: str,
+        reconciler: PaymentReconciler | None = None,
     ) -> None:
         self._repo = repository
         self._provider = payment_provider
         self._public_base_url = public_base_url.rstrip('/')
+        self._reconciler = reconciler or PaymentReconciler(
+            repository=repository,
+            payment_provider=payment_provider,
+            public_base_url=self._public_base_url,
+        )
 
     async def start_or_continue_purchase(self, user_id: UUID) -> PurchaseOutcome:
         payment, is_new = await self._repo.get_or_create_pending_payment(user_id)
 
         # Если платёж уже существовал в pending и у него есть provider_payment_id:
-        # проверяем статус в ЮKassa (GET, не чаще 1 раза в 5 с по BIL-NFR-R-06).
+        # проверяем статус в ЮKassa через единый Reconciler (GET, не чаще 1 раза в 5 с).
         if not is_new and payment.provider_payment_id:
             return await self._verify_existing_pending_and_resolve(
                 user_id,
                 payment,
-                payment.provider_payment_id,
                 respect_throttle=True,
             )
 
@@ -55,30 +64,14 @@ class PurchaseService:
         self,
         user_id: UUID,
         payment: PaymentRecordProtocol,
-        provider_payment_id: str,
         *,
         respect_throttle: bool,
     ) -> PurchaseOutcome:
-        now_utc = datetime.now(UTC)
-        if (
-            respect_throttle
-            and payment.last_checked_at is not None
-            and (now_utc - payment.last_checked_at) < CHECK_THROTTLE_WINDOW
-            and payment.confirmation_url
-        ):
-            return PurchaseOutcome(
-                payment_id=payment.id,
-                status='pending',
-                redirect_url=payment.confirmation_url,
-                confirmation_url=payment.confirmation_url,
-            )
-
         try:
-            snapshot = await self._provider.get_payment(
-                provider_payment_id,
-                expected_payment_id=payment.id,
-                expected_amount_kopeks=payment.amount_kopeks,
-                expected_currency=payment.currency.strip(),
+            outcome = await self._reconciler.reconcile_payment_record(
+                payment,
+                source='continue',
+                respect_throttle=respect_throttle,
             )
         except PaymentProviderError as exc:
             raise BillingDomainError(
@@ -87,19 +80,14 @@ class PurchaseService:
                 status_code=503,
             ) from exc
 
-        if snapshot.domain_status == 'pending':
-            url = snapshot.confirmation_url or payment.confirmation_url
+        if outcome.status == 'pending':
+            url = outcome.confirmation_url or payment.confirmation_url
             if not url:
                 raise BillingDomainError(
                     'Не удалось связаться с платёжной системой, попробуйте ещё раз',
                     error_code='payment_provider_unavailable',
                     status_code=503,
                 )
-            await self._repo.record_payment_checked(
-                payment.id,
-                confirmation_url=url,
-                provider_details=snapshot.provider_details,
-            )
             return PurchaseOutcome(
                 payment_id=payment.id,
                 status='pending',
@@ -107,13 +95,7 @@ class PurchaseService:
                 confirmation_url=url,
             )
 
-        if snapshot.domain_status == 'failed':
-            await self._repo.mark_payment_failed(
-                payment.id,
-                failure_reason=snapshot.failure_reason or 'canceled_by_provider',
-                source='continue',
-                provider_details=snapshot.provider_details,
-            )
+        if outcome.status == 'failed':
             new_payment, is_new = await self._repo.get_or_create_pending_payment(
                 user_id
             )
@@ -121,16 +103,11 @@ class PurchaseService:
                 return await self._verify_existing_pending_and_resolve(
                     user_id,
                     new_payment,
-                    new_payment.provider_payment_id,
                     respect_throttle=True,
                 )
             return await self._create_in_provider(user_id, new_payment)
 
-        # succeeded -> редирект на экран результата оплаты
-        await self._repo.record_payment_checked(
-            payment.id,
-            provider_details=snapshot.provider_details,
-        )
+        # succeeded -> редирект на экран результата (подписка создана в Reconciler)
         result_url = f'/billing/payments/{payment.id}'
         return PurchaseOutcome(
             payment_id=payment.id,
@@ -157,10 +134,11 @@ class PurchaseService:
                 )
             )
         except ProviderPermanentError as exc:
-            await self._repo.mark_payment_failed(
+            await self._repo.finalize_payment_failed(
                 payment.id,
                 failure_reason=exc.message,
                 source='continue',
+                public_base_url=self._public_base_url,
             )
             raise BillingDomainError(
                 'Не удалось связаться с платёжной системой, попробуйте ещё раз',
@@ -174,7 +152,6 @@ class PurchaseService:
                 status_code=503,
             ) from exc
 
-        # Сохраняем полученный provider_payment_id (и confirmation_url для pending) в БД
         payment = await self._repo.save_provider_payment_created(
             payment.id,
             provider_payment_id=snapshot.provider_payment_id,
@@ -183,12 +160,11 @@ class PurchaseService:
         )
 
         # Инвариант 6 и BIL-NFR-SEC-04: если повтор POST вернул не-pending,
-        # никогда не меняем статус по ответу POST, а проверяем через GET.
+        # никогда не меняем статус по ответу POST, а проверяем через GET в Reconciler.
         if snapshot.domain_status != 'pending':
             return await self._verify_existing_pending_and_resolve(
                 user_id,
                 payment,
-                snapshot.provider_payment_id,
                 respect_throttle=False,
             )
 

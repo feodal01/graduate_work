@@ -453,14 +453,14 @@ async def test_sqlalchemy_purchase_repository_concurrent_and_blocking_rules(
     )
     assert checked.last_checked_at is not None
 
-    # 4. Два параллельных mark_payment_failed пишут ровно одно событие
+    # 4. Два параллельных finalize_payment_failed пишут ровно одно событие
     await asyncio.gather(
-        repo.mark_payment_failed(
+        repo.finalize_payment_failed(
             pay_a.id,
             failure_reason='canceled_by_provider',
             source='continue',
         ),
-        repo.mark_payment_failed(
+        repo.finalize_payment_failed(
             pay_a.id,
             failure_reason='canceled_by_provider',
             source='continue',
@@ -534,3 +534,149 @@ async def test_sqlalchemy_purchase_repository_concurrent_and_blocking_rules(
         await repo.get_or_create_pending_payment(user_id)
     assert exc_info.value.status_code == 409
     assert exc_info.value.error_code == 'subscription_already_active'
+
+
+async def test_t11_atomic_reconciliation_succeeded_failed_and_concurrent_race(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """T-11 (BIL-FR-04, BIL-FR-08, BIL-FR-13, инв. 6, 7, 11): фиксация в БД."""
+    from domain.subscription import SubscriptionState, compute_subscription_state
+    from repositories.purchase import SQLAlchemyPurchaseRepository
+
+    session_factory = migrated_billing_db
+    repo = SQLAlchemyPurchaseRepository(session_factory)
+    user_id = uuid4()
+
+    # 1. Создаём pending-платёж и сохраняем provider_payment_id
+    payment, is_new = await repo.get_or_create_pending_payment(user_id)
+    assert is_new is True
+    await repo.save_provider_payment_created(
+        payment.id,
+        provider_payment_id='yk-race-succeeded-1',
+        confirmation_url='https://yoomoney.ru/checkout/race-1',
+        provider_details={'id': 'yk-race-succeeded-1', 'status': 'pending'},
+    )
+
+    # 2. Запускаем 4 параллельных процесса фиксации оплаты
+    results = await asyncio.gather(
+        repo.finalize_payment_succeeded(
+            payment.id,
+            source='webhook',
+            provider_details={'id': 'yk-race-succeeded-1', 'status': 'succeeded'},
+            public_base_url='http://localhost',
+        ),
+        repo.finalize_payment_succeeded(
+            payment.id,
+            source='reconcile',
+            provider_details={'id': 'yk-race-succeeded-1', 'status': 'succeeded'},
+            public_base_url='http://localhost',
+        ),
+        repo.finalize_payment_succeeded(
+            payment.id,
+            source='continue',
+            provider_details={'id': 'yk-race-succeeded-1', 'status': 'succeeded'},
+            public_base_url='http://localhost',
+        ),
+        repo.finalize_payment_succeeded(
+            payment.id,
+            source='admin',
+            provider_details={'id': 'yk-race-succeeded-1', 'status': 'succeeded'},
+            public_base_url='http://localhost',
+        ),
+    )
+
+    transition_flags = [transitioned for _, transitioned in results]
+    assert transition_flags.count(True) == 1
+    assert transition_flags.count(False) == 3
+
+    # 3. Проверяем таблицы в PostgreSQL: 1 подписка, версия 1, 3 задачи outbox
+    async with session_factory() as session:
+        subs = list(
+            (
+                await session.scalars(
+                    select(Subscription).where(Subscription.payment_id == payment.id)
+                )
+            ).all()
+        )
+        assert len(subs) == 1
+        sub = subs[0]
+        assert sub.ends_at - sub.starts_at == timedelta(days=30)
+        assert (
+            compute_subscription_state(
+                ends_at=sub.ends_at,
+                has_succeeded_refund=False,
+            )
+            == SubscriptionState.ACTIVE
+        )
+
+        ver = await session.get(UserAccessVersion, user_id)
+        assert ver is not None
+        assert ver.last_version == 1
+
+        tasks = list(
+            (
+                await session.scalars(
+                    select(OutboxTask).where(OutboxTask.payment_id == payment.id)
+                )
+            ).all()
+        )
+        assert len(tasks) == 3
+        task_types = {t.task_type for t in tasks}
+        assert task_types == {
+            'sync_access',
+            'payment_succeeded_email',
+            'subscription_expiration_email',
+        }
+        auth_task = next(t for t in tasks if t.task_type == 'sync_access')
+        assert auth_task.access_version == 1
+        assert auth_task.payload['version'] == 1
+        assert auth_task.payload['expires_at'] == sub.ends_at.isoformat()
+
+        succeeded_events = list(
+            (
+                await session.scalars(
+                    select(OperationEvent).where(
+                        OperationEvent.operation_id == payment.id,
+                        OperationEvent.to_status == 'succeeded',
+                    )
+                )
+            ).all()
+        )
+        assert len(succeeded_events) == 1
+
+    # 4. Попытка перевести уже оплаченный платёж в failed игнорируется (инвариант 7 и 8)
+    after_fail, failed_transitioned = await repo.finalize_payment_failed(
+        payment.id,
+        failure_reason='late_cancel',
+        source='reconcile',
+    )
+    assert failed_transitioned is False
+    assert after_fail.status == 'succeeded'
+
+    # 5. Проверяем атомарную фиксацию неуспешной оплаты (failed + письмо отказа)
+    user_2 = uuid4()
+    pay_2, _ = await repo.get_or_create_pending_payment(user_2)
+    res_fail_1, res_fail_2 = await asyncio.gather(
+        repo.finalize_payment_failed(
+            pay_2.id,
+            failure_reason='insufficient_funds',
+            source='webhook',
+        ),
+        repo.finalize_payment_failed(
+            pay_2.id,
+            failure_reason='insufficient_funds',
+            source='reconcile',
+        ),
+    )
+    assert {res_fail_1[1], res_fail_2[1]} == {True, False}
+    async with session_factory() as session:
+        fail_tasks = list(
+            (
+                await session.scalars(
+                    select(OutboxTask).where(OutboxTask.payment_id == pay_2.id)
+                )
+            ).all()
+        )
+        assert len(fail_tasks) == 1
+        assert fail_tasks[0].task_type == 'payment_failed_email'
+        assert fail_tasks[0].payload['failure_reason'] == 'insufficient_funds'
