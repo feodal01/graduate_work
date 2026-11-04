@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+
+{% block head_extra %}
+{% if view.auto_refresh_seconds %}
+<meta http-equiv="refresh" content="{{ view.auto_refresh_seconds }}">
+{% endif %}
+{% endblock %}
+
+{% block title %}Результат оплаты — Биллинг{% endblock %}
+
+{% block content %}
+<h1>Результат оплаты</h1>
+<p><strong>Тариф:</strong> Подписка «{{ view.tariff_title }}» ({{ view.amount_display }})</p>
+
+{% if view.block == 'succeeded_ready' %}
+<div class="alert-success" role="status">
+    <strong>Оплата прошла, доступ открыт до {{ view.subscription_ends_display }}</strong>
+</div>
+{% elif view.block == 'succeeded_activating' %}
+<div class="alert-info" role="status">
+    <strong>Оплачено, доступ активируется</strong>
+    <p style="margin: 8px 0 0 0;">Страница обновится автоматически через {{ view.auto_refresh_seconds }} с.</p>
+</div>
+{% elif view.block == 'failed' %}
+<div class="alert-error" role="alert">
+    <strong>Оплата не прошла</strong>
+    {% if view.failure_reason_display %}
+    <p style="margin: 8px 0 0 0;">Причина: {{ view.failure_reason_display }}</p>
+    {% endif %}
+</div>
+<form method="post" action="/billing/subscribe" style="margin-bottom: 16px;">
+    <button type="submit" class="btn">Повторить оплату</button>
+</form>
+{% else %}
+<div class="alert-info" role="status">
+    <strong>Проверяем оплату…</strong>
+    <p style="margin: 8px 0 0 0;">Ожидаем подтверждения от платёжной системы. Страница обновляется автоматически раз в {{ view.auto_refresh_seconds }} с.</p>
+</div>
+<p>
+    <a href="/billing/payments/{{ view.payment_id }}/continue" class="btn">Продолжить оплату</a>
+</p>
+{% endif %}
+
+<p style="margin-top: 20px;">
+    <a href="/billing/">Вернуться в «Мою подписку»</a>
+</p>
+{% endblock %}

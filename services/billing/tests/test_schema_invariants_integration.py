@@ -680,3 +680,30 @@ async def test_t11_atomic_reconciliation_succeeded_failed_and_concurrent_race(
         assert len(fail_tasks) == 1
         assert fail_tasks[0].task_type == 'payment_failed_email'
         assert fail_tasks[0].payload['failure_reason'] == 'insufficient_funds'
+
+    # 6. T-12: проверяем get_local_payment_result_for_user
+    local_own = await repo.get_local_payment_result_for_user(payment.id, user_id)
+    assert local_own is not None
+    assert local_own.status == 'succeeded'
+    assert local_own.subscription_ends_at is not None
+    assert local_own.auth_access_delivered is False
+
+    # Помечаем задачу sync_access выполненной -> auth_access_delivered == True
+    async with session_factory() as session:
+        task_row = await session.scalar(
+            select(OutboxTask).where(
+                OutboxTask.payment_id == payment.id,
+                OutboxTask.task_type == 'sync_access',
+            )
+        )
+        assert task_row is not None
+        task_row.status = 'completed'
+        await session.commit()
+
+    local_delivered = await repo.get_local_payment_result_for_user(payment.id, user_id)
+    assert local_delivered is not None
+    assert local_delivered.auth_access_delivered is True
+
+    # Чужой пользователь получает None (защита BIL-NFR-SEC-03)
+    local_foreign = await repo.get_local_payment_result_for_user(payment.id, uuid4())
+    assert local_foreign is None

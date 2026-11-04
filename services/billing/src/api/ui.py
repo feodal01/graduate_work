@@ -1,4 +1,5 @@
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Form, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -141,4 +142,41 @@ async def subscribe(
     return RedirectResponse(
         url=outcome.redirect_url,
         status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.get('/payments/{payment_id}', response_class=HTMLResponse)
+async def get_payment_result_page(
+    request: Request,
+    payment_id: str,
+    user: Annotated[AuthenticatedUser, Depends(require_ui_user)],
+    purchase_service: Annotated[PurchaseService, Depends(get_purchase_service)],
+) -> HTMLResponse:
+    """Экран «Результат оплаты» Э3: чтение локальной БД (BIL-FR-04, BIL-API-04)."""
+    try:
+        parsed_payment_id = UUID(payment_id)
+    except ValueError:
+        return render_error_page(
+            request,
+            status_code=status.HTTP_404_NOT_FOUND,
+            message='Платёж не найден',
+        )
+
+    try:
+        view = await purchase_service.get_payment_result_view(
+            payment_id=parsed_payment_id,
+            user_id=user.user_id,
+            user_tz=user.tz,
+        )
+    except BillingDomainError as exc:
+        return render_error_page(
+            request,
+            status_code=exc.status_code,
+            message=exc.detail,
+        )
+
+    return templates.TemplateResponse(
+        request=request,
+        name='payment_result.html',
+        context={'view': view, 'user': user},
     )

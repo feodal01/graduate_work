@@ -4,7 +4,9 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from api.errors import BillingDomainError
+from db.sql.errors import DatabaseUnavailableError
 from domain.subscription import ReconcileSource, deterministic_id, format_msk_datetime
+from repositories.purchase import LocalPaymentResultData
 
 
 @dataclass
@@ -56,6 +58,7 @@ class InMemoryPurchaseRepository:
     def __init__(self) -> None:
         self.has_active_subscription: bool = False
         self.has_processing_refund: bool = False
+        self.db_unavailable: bool = False
         self.payments: dict[UUID, FakePaymentRow] = {}
         self.subscriptions: dict[UUID, FakeSubscriptionRow] = {}
         self.access_versions: dict[UUID, int] = {}
@@ -75,6 +78,33 @@ class InMemoryPurchaseRepository:
     async def get_payment(self, payment_id: UUID) -> FakePaymentRow | None:
         """Возвращает платёж по внутреннему UUID."""
         return self.payments.get(payment_id)
+
+    async def get_local_payment_result_for_user(
+        self,
+        payment_id: UUID,
+        user_id: UUID,
+    ) -> LocalPaymentResultData | None:
+        """Читает локальный статус платежа, подписки и задачи Auth для Э3."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        payment = self.payments.get(payment_id)
+        if payment is None or payment.user_id != user_id:
+            return None
+        sub = self.subscriptions.get(payment_id)
+        sub_ends_at = sub.ends_at if sub is not None else None
+        auth_task = self.outbox_tasks.get(f'payment_succeeded:{payment_id}:auth_access')
+        auth_delivered = auth_task is not None and auth_task.status == 'completed'
+        return LocalPaymentResultData(
+            payment_id=payment.id,
+            user_id=payment.user_id,
+            tariff_title='Премиум',
+            amount_kopeks=payment.amount_kopeks,
+            currency=payment.currency,
+            status=payment.status,
+            failure_reason=payment.failure_reason,
+            subscription_ends_at=sub_ends_at,
+            auth_access_delivered=auth_delivered,
+        )
 
     async def get_payment_by_provider_id(
         self,

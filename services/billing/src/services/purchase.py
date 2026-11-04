@@ -8,11 +8,18 @@ from clients.payment_provider import (
     PaymentProviderGateway,
     ProviderPermanentError,
 )
+from domain.subscription import (
+    PaymentResultBlock,
+    format_amount_rubles,
+    format_user_datetime,
+    humanize_failure_reason,
+)
 from repositories.purchase import PaymentRecordProtocol, PurchaseRepository
 from services.reconciler import CHECK_THROTTLE_WINDOW, PaymentReconciler
 
 __all__ = [
     'CHECK_THROTTLE_WINDOW',
+    'PaymentResultView',
     'PurchaseOutcome',
     'PurchaseService',
 ]
@@ -24,6 +31,17 @@ class PurchaseOutcome:
     status: str
     redirect_url: str
     confirmation_url: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentResultView:
+    payment_id: UUID
+    tariff_title: str
+    amount_display: str
+    block: PaymentResultBlock
+    subscription_ends_display: str | None
+    failure_reason_display: str | None
+    auto_refresh_seconds: int | None
 
 
 class PurchaseService:
@@ -59,6 +77,68 @@ class PurchaseService:
             )
 
         return await self._create_in_provider(user_id, payment)
+
+    async def get_payment_result_view(
+        self,
+        *,
+        payment_id: UUID,
+        user_id: UUID,
+        user_tz: str,
+    ) -> PaymentResultView:
+        """Читает только локальный статус из БД для Э3 без ЮKassa (BIL-FR-04)."""
+        local = await self._repo.get_local_payment_result_for_user(payment_id, user_id)
+        if local is None:
+            raise BillingDomainError(
+                'Платёж не найден',
+                error_code='payment_not_found',
+                status_code=404,
+            )
+
+        amount_display = format_amount_rubles(local.amount_kopeks)
+        if local.status == 'succeeded':
+            if local.auth_access_delivered and local.subscription_ends_at is not None:
+                return PaymentResultView(
+                    payment_id=local.payment_id,
+                    tariff_title=local.tariff_title,
+                    amount_display=amount_display,
+                    block='succeeded_ready',
+                    subscription_ends_display=format_user_datetime(
+                        local.subscription_ends_at,
+                        user_tz,
+                    ),
+                    failure_reason_display=None,
+                    auto_refresh_seconds=None,
+                )
+            return PaymentResultView(
+                payment_id=local.payment_id,
+                tariff_title=local.tariff_title,
+                amount_display=amount_display,
+                block='succeeded_activating',
+                subscription_ends_display=None,
+                failure_reason_display=None,
+                auto_refresh_seconds=5,
+            )
+
+        if local.status == 'failed':
+            return PaymentResultView(
+                payment_id=local.payment_id,
+                tariff_title=local.tariff_title,
+                amount_display=amount_display,
+                block='failed',
+                subscription_ends_display=None,
+                failure_reason_display=humanize_failure_reason(local.failure_reason),
+                auto_refresh_seconds=None,
+            )
+
+        return PaymentResultView(
+            payment_id=local.payment_id,
+            tariff_title=local.tariff_title,
+            amount_display=amount_display,
+            block='pending',
+            subscription_ends_display=None,
+            failure_reason_display=None,
+            auto_refresh_seconds=5,
+        )
 
     async def _verify_existing_pending_and_resolve(
         self,

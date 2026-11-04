@@ -1,8 +1,9 @@
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
-from sqlalchemy import exists, select, text
+from sqlalchemy import and_, exists, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -41,6 +42,19 @@ class PaymentRecordProtocol(Protocol):
     updated_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class LocalPaymentResultData:
+    payment_id: UUID
+    user_id: UUID
+    tariff_title: str
+    amount_kopeks: int
+    currency: str
+    status: str
+    failure_reason: str | None
+    subscription_ends_at: datetime | None
+    auth_access_delivered: bool
+
+
 class PurchaseRepository(Protocol):
     async def check_purchase_allowed(
         self,
@@ -51,6 +65,12 @@ class PurchaseRepository(Protocol):
         self,
         payment_id: UUID,
     ) -> PaymentRecordProtocol | None: ...
+
+    async def get_local_payment_result_for_user(
+        self,
+        payment_id: UUID,
+        user_id: UUID,
+    ) -> LocalPaymentResultData | None: ...
 
     async def get_payment_by_provider_id(
         self,
@@ -204,6 +224,74 @@ class SQLAlchemyPurchaseRepository:
         try:
             async with self._session_factory() as session:
                 return await session.get(Payment, payment_id)
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def get_local_payment_result_for_user(
+        self,
+        payment_id: UUID,
+        user_id: UUID,
+    ) -> LocalPaymentResultData | None:
+        """Читает локальный статус платежа и подписки одним запросом (BIL-FR-04)."""
+        try:
+            async with self._session_factory() as session:
+                stmt = (
+                    select(
+                        Payment.id,
+                        Payment.user_id,
+                        Payment.amount_kopeks,
+                        Payment.currency,
+                        Payment.status,
+                        Payment.failure_reason,
+                        Tariff.title,
+                        Subscription.ends_at,
+                        OutboxTask.status,
+                    )
+                    .join(Tariff, Tariff.id == Payment.tariff_id)
+                    .outerjoin(
+                        Subscription,
+                        Subscription.payment_id == Payment.id,
+                    )
+                    .outerjoin(
+                        OutboxTask,
+                        and_(
+                            OutboxTask.payment_id == Payment.id,
+                            OutboxTask.target_service == 'auth',
+                            OutboxTask.task_type == 'sync_access',
+                        ),
+                    )
+                    .where(
+                        Payment.id == payment_id,
+                        Payment.user_id == user_id,
+                    )
+                )
+                row = (await session.execute(stmt)).one_or_none()
+                if row is None:
+                    return None
+
+                (
+                    row_payment_id,
+                    row_user_id,
+                    amount_kopeks,
+                    currency,
+                    status,
+                    failure_reason,
+                    tariff_title,
+                    sub_ends_at,
+                    auth_task_status,
+                ) = row
+
+                return LocalPaymentResultData(
+                    payment_id=row_payment_id,
+                    user_id=row_user_id,
+                    tariff_title=tariff_title,
+                    amount_kopeks=amount_kopeks,
+                    currency=currency.strip(),
+                    status=status,
+                    failure_reason=failure_reason,
+                    subscription_ends_at=sub_ends_at,
+                    auth_access_delivered=auth_task_status == 'completed',
+                )
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 

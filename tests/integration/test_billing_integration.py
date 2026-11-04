@@ -88,9 +88,10 @@ class BillingIntegrationCheck:
         self._check_yookassa_adapter_in_container_t09()
         self._check_purchase_creation_t10()
         self._check_reconciler_atomic_outcome_t11()
+        self._check_payment_result_screen_t12()
         self._check_degradation_and_worker_graceful_shutdown()
         print(
-            'All Billing T-06 / T-07 / T-08 / T-09 / T-10 / T-11 '
+            'All Billing T-06 / T-07 / T-08 / T-09 / T-10 / T-11 / T-12 '
             'live Docker checks passed.'
         )
 
@@ -766,6 +767,159 @@ class BillingIntegrationCheck:
         out = self._compose('exec', '-T', 'billing-api', 'python', '-c', code).strip()
         if 't11-reconciler-ok' not in out:
             raise AssertionError(f'T-11 Reconciler live check failed: {out}')
+
+    def _check_payment_result_screen_t12(self) -> None:
+        """T-12 (BIL-FR-04, BIL-API-04, BIL-NFR-U-01): live E3 result screen."""
+        login_res = self._http(
+            'POST',
+            '/billing/login',
+            data=urllib.parse.urlencode(
+                {'login': 'admin', 'password': 'Cinema-Admin-2026!'}
+            ).encode(),
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            follow_redirects=False,
+        )
+        assert login_res.status == 303, login_res
+        cookie_header = '; '.join([c.split(';', 1)[0] for c in login_res.set_cookies])
+
+        # Get admin user_id via billing-api container using AuthGateway
+        access_cookie = next(
+            c.split(';', 1)[0].split('=', 1)[1]
+            for c in login_res.set_cookies
+            if 'billing_access_token=' in c
+        )
+        uid_code = (
+            'import asyncio, httpx\n'
+            'from clients.auth import HttpAuthGateway\n'
+            'from core.config import settings\n'
+            'async def get_uid():\n'
+            '    async with httpx.AsyncClient() as c:\n'
+            '        url = str(settings.auth_client.service_url)\n'
+            '        gw = HttpAuthGateway(http_client=c, base_url=url)\n'
+            f'        token = "{access_cookie}"\n'
+            '        uid, _, _ = await gw.get_current_user(token, request_id="t12")\n'
+            '        print(uid)\n'
+            'asyncio.run(get_uid())\n'
+        )
+        admin_uid = self._compose(
+            'exec', '-T', 'billing-api', 'python', '-c', uid_code
+        ).strip()
+
+        pay_id = str(uuid4())
+        sub_id = str(uuid4())
+        task_id = str(uuid4())
+        idem_id = str(uuid4())
+
+        # 1. Insert pending payment with fake provider_payment_id (not in YooKassa)
+        self._psql(
+            'INSERT INTO payments '
+            '(id, user_id, tariff_id, provider_code, amount_kopeks, '
+            'currency, status, idempotency_key, provider_payment_id, confirmation_url) '
+            'VALUES '
+            f"('{pay_id}', '{admin_uid}', "
+            "'00000000-0000-0000-0000-000000000001', 'yookassa', "
+            f"29900, 'RUB', 'pending', '{idem_id}', 'yk-fake-never-called', "
+            "'https://yoomoney.ru/checkout/fake');"
+        )
+        try:
+            # Block 4: pending -> "Проверяем оплату…" + meta refresh
+            res_pending = self._http(
+                'GET',
+                f'/billing/payments/{pay_id}',
+                headers={'Cookie': cookie_header},
+            )
+            if (
+                res_pending.status != 200
+                or 'Проверяем оплату…' not in res_pending.text()
+                or 'http-equiv="refresh"' not in res_pending.text()
+            ):
+                raise AssertionError(
+                    f'Expected pending block on E3 screen: {res_pending}'
+                )
+
+            # Block 2: succeeded, outbox pending -> "Оплачено, доступ активируется"
+            self._psql(
+                f"UPDATE payments SET status = 'succeeded' WHERE id = '{pay_id}';"
+            )
+            self._psql(
+                'INSERT INTO subscriptions '
+                '(id, user_id, tariff_id, payment_id, starts_at, ends_at) VALUES '
+                f"('{sub_id}', '{admin_uid}', "
+                f"'00000000-0000-0000-0000-000000000001', '{pay_id}', "
+                "'2026-11-04T12:00:00Z', '2026-12-04T12:00:00Z');"
+            )
+            self._psql(
+                'INSERT INTO outbox_tasks '
+                '(id, dedup_key, target_service, task_type, payment_id, '
+                'user_id, access_version, payload, status) VALUES '
+                f"('{task_id}', 'payment_succeeded:{pay_id}:auth_access', "
+                f"'auth', 'sync_access', '{pay_id}', '{admin_uid}', 1, "
+                "'{}'::jsonb, 'pending');"
+            )
+            res_act = self._http(
+                'GET',
+                f'/billing/payments/{pay_id}',
+                headers={'Cookie': cookie_header},
+            )
+            if (
+                res_act.status != 200
+                or 'Оплачено, доступ активируется' not in res_act.text()
+            ):
+                raise AssertionError(
+                    f'Expected activating block on E3 screen: {res_act}'
+                )
+
+            # Block 1: outbox completed -> "Оплата прошла, доступ открыт до …"
+            self._psql(
+                f"UPDATE outbox_tasks SET status = 'completed' WHERE id = '{task_id}';"
+            )
+            res_ready = self._http(
+                'GET',
+                f'/billing/payments/{pay_id}',
+                headers={'Cookie': cookie_header},
+            )
+            if (
+                res_ready.status != 200
+                or 'Оплата прошла, доступ открыт до' not in res_ready.text()
+            ):
+                raise AssertionError(
+                    f'Expected succeeded_ready block on E3 screen: {res_ready}'
+                )
+
+            # Block 3: failed -> "Оплата не прошла" + human reason + retry form
+            self._psql(f"DELETE FROM outbox_tasks WHERE payment_id = '{pay_id}';")
+            self._psql(f"DELETE FROM subscriptions WHERE payment_id = '{pay_id}';")
+            self._psql(
+                "UPDATE payments SET status = 'failed', "
+                "failure_reason = 'insufficient_funds' "
+                f"WHERE id = '{pay_id}';"
+            )
+            res_failed = self._http(
+                'GET',
+                f'/billing/payments/{pay_id}',
+                headers={'Cookie': cookie_header},
+            )
+            if (
+                res_failed.status != 200
+                or 'Оплата не прошла' not in res_failed.text()
+                or 'Недостаточно средств на карте' not in res_failed.text()
+            ):
+                raise AssertionError(
+                    f'Expected failed block on E3 screen: {res_failed}'
+                )
+
+            # Unhappy: unknown UUID -> 404 E4 screen
+            res_404 = self._http(
+                'GET',
+                f'/billing/payments/{uuid4()}',
+                headers={'Cookie': cookie_header},
+            )
+            if res_404.status != 404 or 'Платёж не найден' not in res_404.text():
+                raise AssertionError(f'Expected 404 E4 screen: {res_404}')
+        finally:
+            self._psql(f"DELETE FROM outbox_tasks WHERE payment_id = '{pay_id}';")
+            self._psql(f"DELETE FROM subscriptions WHERE payment_id = '{pay_id}';")
+            self._psql(f"DELETE FROM payments WHERE id = '{pay_id}';")
 
     def _check_degradation_and_worker_graceful_shutdown(self) -> None:
         """BIL-API-15, GW-NFR-R-01, BIL-NFR-R-09: DB outage yields 503; worker stops."""
