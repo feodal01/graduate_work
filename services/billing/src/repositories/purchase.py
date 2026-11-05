@@ -1,9 +1,12 @@
+import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, exists, select, text
+import sentry_sdk
+from sqlalchemy import and_, exists, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -23,6 +26,8 @@ from models import (
     Tariff,
     UserAccessVersion,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class PaymentRecordProtocol(Protocol):
@@ -53,6 +58,28 @@ class LocalPaymentResultData:
     failure_reason: str | None
     subscription_ends_at: datetime | None
     auth_access_delivered: bool
+
+
+class OutboxTaskRecordProtocol(Protocol):
+    id: UUID
+    dedup_key: str
+    target_service: str
+    task_type: str
+    payment_id: UUID
+    user_id: UUID
+    access_version: int | None
+    payload: dict[str, Any]
+    status: str
+    attempts: int
+    last_error: str | None
+    next_retry_at: datetime
+
+
+DeliveryOutcome = Literal['completed', 'transient_error', 'permanent_error']
+OutboxDeliverFn = Callable[
+    [OutboxTaskRecordProtocol],
+    Awaitable[tuple[DeliveryOutcome, str | None]],
+]
 
 
 class PurchaseRepository(Protocol):
@@ -124,6 +151,15 @@ class PurchaseRepository(Protocol):
         provider_details: dict[str, Any] | None = None,
         public_base_url: str = 'http://localhost',
     ) -> tuple[PaymentRecordProtocol, bool]: ...
+
+    async def process_due_auth_outbox_tasks(
+        self,
+        deliver_fn: OutboxDeliverFn,
+        *,
+        payment_id: UUID | None = None,
+        limit: int = 20,
+        max_attempts: int = 20,
+    ) -> int: ...
 
 
 class SQLAlchemyPurchaseRepository:
@@ -685,5 +721,97 @@ class SQLAlchemyPurchaseRepository:
                 )
                 await session.commit()
                 return payment, True
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def process_due_auth_outbox_tasks(
+        self,
+        deliver_fn: OutboxDeliverFn,
+        *,
+        payment_id: UUID | None = None,
+        limit: int = 20,
+        max_attempts: int = 20,
+    ) -> int:
+        """Выбирает и обрабатывает задачи Auth под SKIP LOCKED (BIL-FR-11)."""
+        processed = 0
+        try:
+            for _ in range(limit):
+                async with self._session_factory() as session:
+                    now_utc = datetime.now(UTC)
+                    stmt = (
+                        select(OutboxTask)
+                        .where(
+                            OutboxTask.target_service == 'auth',
+                            OutboxTask.status == 'pending',
+                            OutboxTask.next_retry_at <= now_utc,
+                        )
+                        .order_by(OutboxTask.created_at)
+                        .limit(1)
+                        .with_for_update(skip_locked=True)
+                    )
+                    if payment_id is not None:
+                        stmt = stmt.where(OutboxTask.payment_id == payment_id)
+
+                    task = await session.scalar(stmt)
+                    if task is None:
+                        break
+
+                    # US-S-02 шаг 3: если уже доставлена более новая версия,
+                    # закрываем устаревшую задачу без вызова Auth.
+                    if task.access_version is not None:
+                        max_delivered = await session.scalar(
+                            select(func.max(OutboxTask.access_version)).where(
+                                OutboxTask.user_id == task.user_id,
+                                OutboxTask.target_service == 'auth',
+                                OutboxTask.status == 'completed',
+                            )
+                        )
+                        if (
+                            max_delivered is not None
+                            and int(max_delivered) >= task.access_version
+                        ):
+                            task.status = 'completed'
+                            task.updated_at = now_utc
+                            await session.commit()
+                            processed += 1
+                            continue
+
+                    outcome, error_msg = await deliver_fn(task)
+                    now_after = datetime.now(UTC)
+                    if outcome == 'completed':
+                        task.status = 'completed'
+                        task.last_error = None
+                        task.updated_at = now_after
+                    elif outcome == 'permanent_error':
+                        task.attempts += 1
+                        task.status = 'requires_intervention'
+                        task.last_error = error_msg
+                        task.updated_at = now_after
+                        alert_msg = (
+                            f'Outbox task {task.id} requires intervention '
+                            f'(permanent error): {error_msg}'
+                        )
+                        logger.error(alert_msg)
+                        sentry_sdk.capture_message(alert_msg, level='error')
+                    else:
+                        task.attempts += 1
+                        task.last_error = error_msg
+                        task.updated_at = now_after
+                        if task.attempts >= max_attempts:
+                            task.status = 'requires_intervention'
+                            alert_msg = (
+                                f'Outbox task {task.id} exhausted {max_attempts} '
+                                f'attempts and requires intervention: {error_msg}'
+                            )
+                            logger.error(alert_msg)
+                            sentry_sdk.capture_message(alert_msg, level='error')
+                        else:
+                            backoff_sec = min(300, 2 ** min(task.attempts, 8))
+                            task.next_retry_at = now_after + timedelta(
+                                seconds=backoff_sec
+                            )
+                    await session.commit()
+                    processed += 1
+            return processed
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc

@@ -71,6 +71,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.auth_gateway = HttpAuthGateway(
         http_client=auth_http_client,
         base_url=str(settings.auth_client.service_url),
+        service_api_key=service_settings.api_key.get_secret_value(),
     )
     app.state.payment_provider = YooKassaProviderAdapter(
         http_client=yookassa_http_client,

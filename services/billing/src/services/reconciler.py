@@ -61,8 +61,12 @@ class ReconcileRepositoryProtocol(Protocol):
     ) -> tuple[PaymentRecordProtocol, bool]: ...
 
 
+class OutboxDispatcherProtocol(Protocol):
+    async def try_deliver_payment_tasks(self, payment_id: UUID) -> int: ...
+
+
 class PaymentReconciler:
-    """Единый доменный сервис сверки платежей через GET (T-11, инв. 6, 7, 11)."""
+    """Единый доменный сервис сверки платежей через GET (T-11, T-16, инв. 6, 7, 11)."""
 
     def __init__(
         self,
@@ -70,10 +74,12 @@ class PaymentReconciler:
         repository: ReconcileRepositoryProtocol,
         payment_provider: PaymentProviderGateway,
         public_base_url: str = 'http://localhost',
+        outbox_dispatcher: OutboxDispatcherProtocol | None = None,
     ) -> None:
         self._repo = repository
         self._provider = payment_provider
         self._public_base_url = public_base_url.rstrip('/')
+        self._outbox_dispatcher = outbox_dispatcher
 
     async def reconcile_payment(
         self,
@@ -189,6 +195,8 @@ class PaymentReconciler:
                 provider_details=snapshot.provider_details,
                 public_base_url=self._public_base_url,
             )
+            if transitioned and self._outbox_dispatcher is not None:
+                await self._outbox_dispatcher.try_deliver_payment_tasks(payment.id)
             return ReconcileOutcome(
                 payment_id=updated.id,
                 user_id=updated.user_id,

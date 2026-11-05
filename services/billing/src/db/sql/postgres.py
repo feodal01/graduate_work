@@ -20,11 +20,15 @@ class PostgresDatabase(AbstractDatabase):
         pool_timeout_seconds: float = 10.0,
         command_timeout_seconds: float = 15.0,
         statement_timeout_ms: int = 15_000,
+        pool_size: int = 20,
+        max_overflow: int = 30,
     ) -> None:
         self.engine = create_async_engine(
             dsn,
             echo=False,
             future=True,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
             pool_timeout=pool_timeout_seconds,
             connect_args={
                 'timeout': connect_timeout_seconds,

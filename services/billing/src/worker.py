@@ -4,14 +4,18 @@ import signal
 from collections.abc import Awaitable, Callable
 from logging.config import dictConfig
 
+import httpx
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 
-from core.config import settings
+from clients.auth import HttpAuthGateway
+from core.config import ServiceSettings, settings
 from core.logger import LOGGING, add_logstash_handler
 from core.observability import init_sentry
 from core.tracing import create_tracer_provider
 from db.sql.postgres import PostgresDatabase
+from repositories.purchase import SQLAlchemyPurchaseRepository
+from services.outbox_dispatcher import OutboxDispatcher
 
 logger = logging.getLogger(__name__)
 
@@ -140,14 +144,37 @@ async def main() -> None:
         command_timeout_seconds=settings.postgres.command_timeout_seconds,
         statement_timeout_ms=settings.postgres.statement_timeout_ms,
     )
+    service_settings = ServiceSettings()  # pyright: ignore[reportCallIssue]
+    auth_http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(settings.auth_client.timeout_seconds)
+    )
+    auth_gateway = HttpAuthGateway(
+        http_client=auth_http_client,
+        base_url=str(settings.auth_client.service_url),
+        service_api_key=service_settings.api_key.get_secret_value(),
+    )
+    repo = SQLAlchemyPurchaseRepository(database.sessionmaker)
+    outbox_dispatcher = OutboxDispatcher(
+        repository=repo,
+        auth_gateway=auth_gateway,
+        max_attempts=settings.worker.billing_outbox_max_attempts,
+    )
+
+    async def outbox_step() -> None:
+        await outbox_dispatcher.process_due_tasks()
+
     runner = BillingWorkerRunner(
         database,
         reconcile_interval_seconds=settings.worker.billing_reconcile_interval_seconds,
         outbox_interval_seconds=settings.worker.billing_outbox_interval_seconds,
+        outbox_step=outbox_step,
         tracer_provider=tracer_provider,
     )
     install_signal_handlers(asyncio.get_running_loop(), runner)
-    await runner.run()
+    try:
+        await runner.run()
+    finally:
+        await auth_http_client.aclose()
 
 
 if __name__ == '__main__':  # pragma: no cover

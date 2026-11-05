@@ -17,6 +17,7 @@ from db.health import HealthCheck
 from db.sql.postgres import PostgresDatabase
 from repositories.purchase import SQLAlchemyPurchaseRepository
 from security.service_credentials import ServiceCredentials
+from services.outbox_dispatcher import OutboxDispatcher
 from services.purchase import PurchaseService
 from services.reconciler import PaymentReconciler
 
@@ -48,9 +49,23 @@ async def get_payment_provider(request: Request) -> PaymentProviderGateway:
     return cast(PaymentProviderGateway, request.app.state.payment_provider)
 
 
+async def get_outbox_dispatcher(
+    request: Request,
+    auth_gateway: AuthGateway = Depends(get_auth_gateway),
+) -> OutboxDispatcher:
+    database = cast(PostgresDatabase, request.app.state.database)
+    repo = SQLAlchemyPurchaseRepository(database.sessionmaker)
+    return OutboxDispatcher(
+        repository=repo,
+        auth_gateway=auth_gateway,
+        max_attempts=settings.worker.billing_outbox_max_attempts,
+    )
+
+
 async def get_payment_reconciler(
     request: Request,
     payment_provider: PaymentProviderGateway = Depends(get_payment_provider),
+    outbox_dispatcher: OutboxDispatcher = Depends(get_outbox_dispatcher),
 ) -> PaymentReconciler:
     database = cast(PostgresDatabase, request.app.state.database)
     repo = SQLAlchemyPurchaseRepository(database.sessionmaker)
@@ -58,6 +73,7 @@ async def get_payment_reconciler(
         repository=repo,
         payment_provider=payment_provider,
         public_base_url=str(settings.worker.billing_public_base_url),
+        outbox_dispatcher=outbox_dispatcher,
     )
 
 

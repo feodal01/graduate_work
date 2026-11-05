@@ -79,6 +79,19 @@ class FakeAuthGateway:
         self.last_request_id = request_id
         self.logout_called_with = (access_token, refresh_token)
 
+    async def put_subscription_access(
+        self,
+        user_id: UUID,
+        *,
+        version: int,
+        expires_at: str | None,
+        request_id: str,
+    ) -> object:
+        """Эмулирует запись состояния доступа."""
+        from clients.auth import SubscriptionAccessSyncResult
+
+        return SubscriptionAccessSyncResult(applied=True, current_version=version)
+
 
 @pytest.fixture
 async def login_client() -> AsyncGenerator[

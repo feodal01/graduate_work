@@ -4,14 +4,22 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from api.errors import BillingDomainError
-from clients.auth import AuthServiceUnavailableError
+from clients.auth import (
+    AuthPermanentDeliveryError,
+    AuthServiceUnavailableError,
+    SubscriptionAccessSyncResult,
+)
 from clients.payment_provider import (
     CreateProviderPaymentRequest,
     ProviderPaymentSnapshot,
 )
 from db.sql.errors import DatabaseUnavailableError
 from domain.subscription import ReconcileSource, deterministic_id, format_msk_datetime
-from repositories.purchase import LocalPaymentResultData
+from repositories.purchase import (
+    DeliveryOutcome,
+    LocalPaymentResultData,
+    OutboxDeliverFn,
+)
 
 
 @dataclass
@@ -55,6 +63,9 @@ class FakeOutboxTaskRow:
     access_version: int | None
     payload: dict[str, Any]
     status: str = 'pending'
+    attempts: int = 0
+    last_error: str | None = None
+    next_retry_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class InMemoryPurchaseRepository:
@@ -392,6 +403,84 @@ class InMemoryPurchaseRepository:
         )
         return row, True
 
+    async def process_due_auth_outbox_tasks(
+        self,
+        deliver_fn: OutboxDeliverFn,
+        *,
+        payment_id: UUID | None = None,
+        limit: int = 20,
+        max_attempts: int = 20,
+    ) -> int:
+        """Обрабатывает готовые задачи Auth в in-memory репозитории."""
+        import logging
+
+        import sentry_sdk
+
+        logger = logging.getLogger(__name__)
+
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        processed = 0
+        now_utc = datetime.now(UTC)
+        candidates = [
+            task
+            for task in self.outbox_tasks.values()
+            if task.target_service == 'auth'
+            and task.status == 'pending'
+            and task.next_retry_at <= now_utc
+            and (payment_id is None or task.payment_id == payment_id)
+        ]
+        for task in candidates[:limit]:
+            if task.access_version is not None:
+                delivered_versions = [
+                    int(t.access_version)
+                    for t in self.outbox_tasks.values()
+                    if t.user_id == task.user_id
+                    and t.target_service == 'auth'
+                    and t.status == 'completed'
+                    and t.access_version is not None
+                ]
+                if (
+                    delivered_versions
+                    and max(delivered_versions) >= task.access_version
+                ):
+                    task.status = 'completed'
+                    processed += 1
+                    continue
+
+            outcome: DeliveryOutcome
+            outcome, error_msg = await deliver_fn(task)
+            now_after = datetime.now(UTC)
+            if outcome == 'completed':
+                task.status = 'completed'
+                task.last_error = None
+            elif outcome == 'permanent_error':
+                task.attempts += 1
+                task.status = 'requires_intervention'
+                task.last_error = error_msg
+                alert_msg = (
+                    f'Outbox task {task.id} requires intervention '
+                    f'(permanent error): {error_msg}'
+                )
+                logger.error(alert_msg)
+                sentry_sdk.capture_message(alert_msg, level='error')
+            else:
+                task.attempts += 1
+                task.last_error = error_msg
+                if task.attempts >= max_attempts:
+                    task.status = 'requires_intervention'
+                    alert_msg = (
+                        f'Outbox task {task.id} exhausted {max_attempts} '
+                        f'attempts and requires intervention: {error_msg}'
+                    )
+                    logger.error(alert_msg)
+                    sentry_sdk.capture_message(alert_msg, level='error')
+                else:
+                    backoff_sec = min(300, 2 ** min(task.attempts, 8))
+                    task.next_retry_at = now_after + timedelta(seconds=backoff_sec)
+            processed += 1
+        return processed
+
 
 class FakeProviderGateway:
     """Единый in-memory стаб платёжного провайдера для модульных TDD-тестов."""
@@ -477,6 +566,9 @@ class ConfigurableAuthGateway:
         self.user_login = login
         self.tz = tz
         self.unavailable = unavailable
+        self.permanent_error: AuthPermanentDeliveryError | None = None
+        self.synced_access_calls: list[tuple[UUID, int, str | None]] = []
+        self.seen_request_ids: list[str] = []
 
     async def login(
         self, login: str, password: str, *, request_id: str
@@ -499,3 +591,23 @@ class ConfigurableAuthGateway:
     ) -> None:
         """Эмулирует выход."""
         return None
+
+    async def put_subscription_access(
+        self,
+        user_id: UUID,
+        *,
+        version: int,
+        expires_at: str | None,
+        request_id: str,
+    ) -> SubscriptionAccessSyncResult:
+        """Эмулирует запись состояния доступа в Auth."""
+        self.seen_request_ids.append(request_id)
+        if self.unavailable:
+            raise AuthServiceUnavailableError('Auth is down')
+        if self.permanent_error is not None:
+            raise self.permanent_error
+        self.synced_access_calls.append((user_id, version, expires_at))
+        return SubscriptionAccessSyncResult(
+            applied=True,
+            current_version=version,
+        )

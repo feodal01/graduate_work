@@ -713,3 +713,29 @@ async def test_t11_atomic_reconciliation_succeeded_failed_and_concurrent_race(
     assert own_pay is not None and own_pay.id == payment.id
     foreign_pay = await repo.get_payment_for_user(payment.id, uuid4())
     assert foreign_pay is None
+
+    # 8. T-16: проверяем FOR UPDATE SKIP LOCKED в process_due_auth_outbox_tasks
+    user_3 = uuid4()
+    pay_3, _ = await repo.get_or_create_pending_payment(user_3)
+    await repo.finalize_payment_succeeded(pay_3.id, source='webhook')
+
+    delivered_calls: list[int] = []
+
+    from repositories.purchase import DeliveryOutcome, OutboxTaskRecordProtocol
+
+    async def deliver_ok(
+        task: OutboxTaskRecordProtocol,
+    ) -> tuple[DeliveryOutcome, str | None]:
+        delivered_calls.append(int(task.access_version or 0))
+        return 'completed', None
+
+    # Два параллельных воркера обрабатывают одну задачу без дублей благодаря SKIP LOCKED
+    c1, c2 = await asyncio.gather(
+        repo.process_due_auth_outbox_tasks(deliver_ok, payment_id=pay_3.id),
+        repo.process_due_auth_outbox_tasks(deliver_ok, payment_id=pay_3.id),
+    )
+    assert c1 + c2 == 1
+    assert delivered_calls == [1]
+
+    local_after = await repo.get_local_payment_result_for_user(pay_3.id, user_3)
+    assert local_after is not None and local_after.auth_access_delivered is True

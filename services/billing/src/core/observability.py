@@ -1,5 +1,6 @@
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from time import gmtime, strftime
 from typing import cast
@@ -18,6 +19,21 @@ _request_id: ContextVar[str] = ContextVar('request_id', default=NO_REQUEST_ID)
 
 def get_current_request_id() -> str:
     return _request_id.get()
+
+
+@contextmanager
+def correlation_request_id(fallback_id: str) -> Iterator[str]:
+    """Привязывает fallback_id к логам и Sentry вне HTTP-запроса (NFR-S-01)."""
+    current = _request_id.get()
+    if current != NO_REQUEST_ID and current.strip():
+        yield current
+        return
+    token = _request_id.set(fallback_id)
+    sentry_sdk.set_tag('request_id', fallback_id)
+    try:
+        yield fallback_id
+    finally:
+        _request_id.reset(token)
 
 
 class RequestIdLogstashFormatter(LogstashFormatterVersion1):
