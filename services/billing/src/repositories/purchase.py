@@ -1,12 +1,12 @@
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
 import sentry_sdk
-from sqlalchemy import and_, exists, func, select, text
+from sqlalchemy import and_, exists, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -42,6 +42,7 @@ class PaymentRecordProtocol(Protocol):
     provider_payment_id: str | None
     confirmation_url: str | None
     failure_reason: str | None
+    provider_details: dict[str, Any] | None
     last_checked_at: datetime | None
     created_at: datetime
     updated_at: datetime
@@ -110,6 +111,28 @@ class PurchaseRepository(Protocol):
         provider_code: str,
         provider_payment_id: str,
     ) -> PaymentRecordProtocol | None: ...
+
+    async def list_due_pending_payments(
+        self,
+        *,
+        min_age_seconds: float,
+        throttle_seconds: float = 5.0,
+        limit: int = 20,
+    ) -> Sequence[PaymentRecordProtocol]: ...
+
+    async def claim_next_due_pending_payment(
+        self,
+        *,
+        min_age_seconds: float,
+        throttle_seconds: float = 5.0,
+    ) -> PaymentRecordProtocol | None: ...
+
+    async def record_payment_reconcile_error(
+        self,
+        payment_id: UUID,
+        *,
+        error_message: str,
+    ) -> PaymentRecordProtocol: ...
 
     async def get_or_create_pending_payment(
         self,
@@ -368,6 +391,111 @@ class SQLAlchemyPurchaseRepository:
                         Payment.provider_payment_id == provider_payment_id,
                     )
                 )
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def list_due_pending_payments(
+        self,
+        *,
+        min_age_seconds: float,
+        throttle_seconds: float = 5.0,
+        limit: int = 20,
+    ) -> list[Payment]:
+        """Возвращает pending-платежи старше min_age_seconds (BIL-FR-05)."""
+        now_utc = datetime.now(UTC)
+        created_cutoff = now_utc - timedelta(seconds=min_age_seconds)
+        checked_cutoff = now_utc - timedelta(seconds=throttle_seconds)
+        try:
+            async with self._session_factory() as session:
+                stmt = (
+                    select(Payment)
+                    .where(
+                        Payment.status == 'pending',
+                        Payment.created_at <= created_cutoff,
+                        or_(
+                            Payment.last_checked_at.is_(None),
+                            Payment.last_checked_at <= checked_cutoff,
+                        ),
+                    )
+                    .order_by(
+                        Payment.last_checked_at.asc().nulls_first(),
+                        Payment.created_at.asc(),
+                    )
+                    .limit(limit)
+                )
+                return list((await session.scalars(stmt)).all())
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def claim_next_due_pending_payment(
+        self,
+        *,
+        min_age_seconds: float,
+        throttle_seconds: float = 5.0,
+    ) -> Payment | None:
+        """Атомарно захватывает pending-платёж через SKIP LOCKED (BIL-NFR-S-01)."""
+        now_utc = datetime.now(UTC)
+        created_cutoff = now_utc - timedelta(seconds=min_age_seconds)
+        checked_cutoff = now_utc - timedelta(seconds=throttle_seconds)
+        try:
+            async with self._session_factory() as session:
+                stmt = (
+                    select(Payment)
+                    .where(
+                        Payment.status == 'pending',
+                        Payment.created_at <= created_cutoff,
+                        or_(
+                            Payment.last_checked_at.is_(None),
+                            Payment.last_checked_at <= checked_cutoff,
+                        ),
+                    )
+                    .order_by(
+                        Payment.last_checked_at.asc().nulls_first(),
+                        Payment.created_at.asc(),
+                    )
+                    .limit(1)
+                    .with_for_update(skip_locked=True)
+                )
+                payment = await session.scalar(stmt)
+                if payment is None:
+                    return None
+                payment.last_checked_at = now_utc
+                payment.updated_at = now_utc
+                await session.commit()
+                return payment
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def record_payment_reconcile_error(
+        self,
+        payment_id: UUID,
+        *,
+        error_message: str,
+    ) -> Payment:
+        """Фиксирует ошибку фоновой сверки с backoff (US-S-01, BIL-NFR-R-05)."""
+        now_utc = datetime.now(UTC)
+        try:
+            async with self._session_factory() as session:
+                payment = await self._lock_user_and_payment(session, payment_id)
+                if payment.status == 'pending':
+                    details = dict(payment.provider_details or {})
+                    prev_errors = details.get('_reconcile_errors', 0)
+                    err_count = (
+                        int(prev_errors) + 1
+                        if isinstance(prev_errors, (int, str))
+                        else 1
+                    )
+                    backoff_sec = min(300, 5 * (2 ** min(err_count - 1, 6)))
+                    next_eligible_at = now_utc + timedelta(
+                        seconds=max(0, backoff_sec - 5)
+                    )
+                    details['_reconcile_errors'] = err_count
+                    details['_last_reconcile_error'] = error_message[:250]
+                    payment.provider_details = details
+                    payment.last_checked_at = next_eligible_at
+                    payment.updated_at = now_utc
+                    await session.commit()
+                return payment
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 

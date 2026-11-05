@@ -149,6 +149,79 @@ class InMemoryPurchaseRepository:
                 return payment
         return None
 
+    async def list_due_pending_payments(
+        self,
+        *,
+        min_age_seconds: float,
+        throttle_seconds: float = 5.0,
+        limit: int = 20,
+    ) -> list[FakePaymentRow]:
+        """Возвращает pending-платежи старше min_age_seconds с учётом лимита 5 с."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        now_utc = datetime.now(UTC)
+        created_cutoff = now_utc - timedelta(seconds=min_age_seconds)
+        checked_cutoff = now_utc - timedelta(seconds=throttle_seconds)
+        candidates = [
+            p
+            for p in self.payments.values()
+            if p.status == 'pending'
+            and p.created_at <= created_cutoff
+            and (p.last_checked_at is None or p.last_checked_at <= checked_cutoff)
+        ]
+        candidates.sort(
+            key=lambda p: (
+                p.last_checked_at is not None,
+                p.last_checked_at or p.created_at,
+                p.created_at,
+            )
+        )
+        return candidates[:limit]
+
+    async def claim_next_due_pending_payment(
+        self,
+        *,
+        min_age_seconds: float,
+        throttle_seconds: float = 5.0,
+    ) -> FakePaymentRow | None:
+        """Атомарно захватывает один pending-платёж на сверку."""
+        due = await self.list_due_pending_payments(
+            min_age_seconds=min_age_seconds,
+            throttle_seconds=throttle_seconds,
+            limit=1,
+        )
+        if not due:
+            return None
+        payment = due[0]
+        now_utc = datetime.now(UTC)
+        payment.last_checked_at = now_utc
+        payment.updated_at = now_utc
+        return payment
+
+    async def record_payment_reconcile_error(
+        self,
+        payment_id: UUID,
+        *,
+        error_message: str,
+    ) -> FakePaymentRow:
+        """Фиксирует ошибку фоновой сверки с экспоненциальным backoff."""
+        now_utc = datetime.now(UTC)
+        payment = self.payments[payment_id]
+        if payment.status == 'pending':
+            details = dict(payment.provider_details or {})
+            prev_errors = details.get('_reconcile_errors', 0)
+            err_count = (
+                int(prev_errors) + 1 if isinstance(prev_errors, (int, str)) else 1
+            )
+            backoff_sec = min(300, 5 * (2 ** min(err_count - 1, 6)))
+            next_eligible_at = now_utc + timedelta(seconds=max(0, backoff_sec - 5))
+            details['_reconcile_errors'] = err_count
+            details['_last_reconcile_error'] = error_message[:250]
+            payment.provider_details = details
+            payment.last_checked_at = next_eligible_at
+            payment.updated_at = now_utc
+        return payment
+
     async def get_or_create_pending_payment(
         self,
         user_id: UUID,

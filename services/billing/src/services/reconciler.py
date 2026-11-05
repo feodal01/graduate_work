@@ -1,13 +1,24 @@
+import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import UUID
 
-from clients.payment_provider import PaymentProviderGateway
+from clients.payment_provider import (
+    CreateProviderPaymentRequest,
+    PaymentProviderError,
+    PaymentProviderGateway,
+    ProviderPermanentError,
+)
+from core.observability import correlation_request_id
 from domain.subscription import ReconcileSource
 from repositories.purchase import PaymentRecordProtocol
 
+logger = logging.getLogger(__name__)
+
 CHECK_THROTTLE_WINDOW = timedelta(seconds=5)
+IDEMPOTENCY_KEY_TTL = timedelta(hours=24)
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +43,37 @@ class ReconcileRepositoryProtocol(Protocol):
         provider_code: str,
         provider_payment_id: str,
     ) -> PaymentRecordProtocol | None: ...
+
+    async def list_due_pending_payments(
+        self,
+        *,
+        min_age_seconds: float,
+        throttle_seconds: float = 5.0,
+        limit: int = 20,
+    ) -> Sequence[PaymentRecordProtocol]: ...
+
+    async def claim_next_due_pending_payment(
+        self,
+        *,
+        min_age_seconds: float,
+        throttle_seconds: float = 5.0,
+    ) -> PaymentRecordProtocol | None: ...
+
+    async def record_payment_reconcile_error(
+        self,
+        payment_id: UUID,
+        *,
+        error_message: str,
+    ) -> PaymentRecordProtocol: ...
+
+    async def save_provider_payment_created(
+        self,
+        payment_id: UUID,
+        *,
+        provider_payment_id: str,
+        confirmation_url: str | None,
+        provider_details: dict[str, Any],
+    ) -> PaymentRecordProtocol: ...
 
     async def record_payment_checked(
         self,
@@ -66,7 +108,7 @@ class OutboxDispatcherProtocol(Protocol):
 
 
 class PaymentReconciler:
-    """Единый доменный сервис сверки платежей через GET (T-11, T-16, инв. 6, 7, 11)."""
+    """Единый доменный сервис сверки платежей через GET (T-11, T-16, T-17)."""
 
     def __init__(
         self,
@@ -116,6 +158,122 @@ class PaymentReconciler:
             payment,
             source=source,
             respect_throttle=respect_throttle,
+        )
+
+    async def reconcile_due_pending_payments(
+        self,
+        *,
+        min_age_seconds: float,
+        limit: int = 20,
+    ) -> int:
+        """Фоновая сверка платежей старше min_age_seconds (T-17, BIL-FR-05)."""
+        processed = 0
+        throttle_sec = CHECK_THROTTLE_WINDOW.total_seconds()
+        for _ in range(limit):
+            payment = await self._repo.claim_next_due_pending_payment(
+                min_age_seconds=min_age_seconds,
+                throttle_seconds=throttle_sec,
+            )
+            if payment is None:
+                break
+            with correlation_request_id(f'reconcile-{payment.id}'):
+                try:
+                    await self._reconcile_background_payment(payment)
+                    processed += 1
+                except PaymentProviderError as exc:
+                    logger.warning(
+                        'Background reconcile deferred for payment_id=%s: %s',
+                        payment.id,
+                        exc,
+                    )
+                    await self._repo.record_payment_reconcile_error(
+                        payment.id,
+                        error_message=str(exc),
+                    )
+        return processed
+
+    async def _reconcile_background_payment(
+        self,
+        payment: PaymentRecordProtocol,
+    ) -> ReconcileOutcome:
+        if payment.status != 'pending':
+            return ReconcileOutcome(
+                payment_id=payment.id,
+                user_id=payment.user_id,
+                status=payment.status,
+                confirmation_url=payment.confirmation_url,
+                failure_reason=payment.failure_reason,
+                transitioned=False,
+                throttled=False,
+            )
+
+        if not payment.provider_payment_id:
+            now_utc = datetime.now(UTC)
+            created_at = (
+                payment.created_at
+                if payment.created_at.tzinfo is not None
+                else payment.created_at.replace(tzinfo=UTC)
+            )
+            # Инвариант 13: если за 24 часа жизни ключа номер ЮKassa не получен,
+            # переводим платёж в Не оплачен (средства не списаны).
+            if (now_utc - created_at) >= IDEMPOTENCY_KEY_TTL:
+                updated, transitioned = await self._repo.finalize_payment_failed(
+                    payment.id,
+                    failure_reason='idempotency_key_expired',
+                    source='reconcile',
+                    public_base_url=self._public_base_url,
+                )
+                return ReconcileOutcome(
+                    payment_id=updated.id,
+                    user_id=updated.user_id,
+                    status=updated.status,
+                    confirmation_url=updated.confirmation_url,
+                    failure_reason=updated.failure_reason,
+                    transitioned=transitioned,
+                    throttled=False,
+                )
+
+            # До 24 часов: досоздаём платёж по тому же ключу и проверяем через GET
+            return_url = f'{self._public_base_url}/billing/payments/{payment.id}'
+            try:
+                created_snapshot = await self._provider.create_payment(
+                    CreateProviderPaymentRequest(
+                        payment_id=payment.id,
+                        idempotency_key=payment.idempotency_key,
+                        amount_kopeks=payment.amount_kopeks,
+                        currency=payment.currency.strip(),
+                        description='Подписка «Премиум» на 30 дней',
+                        return_url=return_url,
+                    )
+                )
+            except ProviderPermanentError as exc:
+                updated, transitioned = await self._repo.finalize_payment_failed(
+                    payment.id,
+                    failure_reason=exc.message,
+                    source='reconcile',
+                    public_base_url=self._public_base_url,
+                )
+                return ReconcileOutcome(
+                    payment_id=updated.id,
+                    user_id=updated.user_id,
+                    status=updated.status,
+                    confirmation_url=updated.confirmation_url,
+                    failure_reason=updated.failure_reason,
+                    transitioned=transitioned,
+                    throttled=False,
+                )
+
+            payment = await self._repo.save_provider_payment_created(
+                payment.id,
+                provider_payment_id=created_snapshot.provider_payment_id,
+                confirmation_url=created_snapshot.confirmation_url,
+                provider_details=created_snapshot.provider_details,
+            )
+
+        return await self.reconcile_payment_record(
+            payment,
+            source='reconcile',
+            respect_throttle=False,
         )
 
     async def reconcile_payment_record(

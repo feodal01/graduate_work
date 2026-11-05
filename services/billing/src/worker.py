@@ -9,6 +9,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 
 from clients.auth import HttpAuthGateway
+from clients.payment_provider import YooKassaProviderAdapter
 from core.config import ServiceSettings, settings
 from core.logger import LOGGING, add_logstash_handler
 from core.observability import init_sentry
@@ -16,6 +17,7 @@ from core.tracing import create_tracer_provider
 from db.sql.postgres import PostgresDatabase
 from repositories.purchase import SQLAlchemyPurchaseRepository
 from services.outbox_dispatcher import OutboxDispatcher
+from services.reconciler import PaymentReconciler
 
 logger = logging.getLogger(__name__)
 
@@ -148,10 +150,19 @@ async def main() -> None:
     auth_http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(settings.auth_client.timeout_seconds)
     )
+    yookassa_http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(settings.yookassa.timeout_seconds)
+    )
     auth_gateway = HttpAuthGateway(
         http_client=auth_http_client,
         base_url=str(settings.auth_client.service_url),
         service_api_key=service_settings.api_key.get_secret_value(),
+    )
+    payment_provider = YooKassaProviderAdapter(
+        http_client=yookassa_http_client,
+        shop_id=settings.yookassa.shop_id,
+        secret_key=settings.yookassa.secret_key.get_secret_value(),
+        base_url=str(settings.yookassa.api_base_url),
     )
     repo = SQLAlchemyPurchaseRepository(database.sessionmaker)
     outbox_dispatcher = OutboxDispatcher(
@@ -159,6 +170,17 @@ async def main() -> None:
         auth_gateway=auth_gateway,
         max_attempts=settings.worker.billing_outbox_max_attempts,
     )
+    reconciler = PaymentReconciler(
+        repository=repo,
+        payment_provider=payment_provider,
+        public_base_url=str(settings.worker.billing_public_base_url),
+        outbox_dispatcher=outbox_dispatcher,
+    )
+
+    async def reconcile_step() -> None:
+        await reconciler.reconcile_due_pending_payments(
+            min_age_seconds=settings.worker.reconcile_min_age_seconds,
+        )
 
     async def outbox_step() -> None:
         await outbox_dispatcher.process_due_tasks()
@@ -167,6 +189,7 @@ async def main() -> None:
         database,
         reconcile_interval_seconds=settings.worker.billing_reconcile_interval_seconds,
         outbox_interval_seconds=settings.worker.billing_outbox_interval_seconds,
+        reconcile_step=reconcile_step,
         outbox_step=outbox_step,
         tracer_provider=tracer_provider,
     )
@@ -174,7 +197,10 @@ async def main() -> None:
     try:
         await runner.run()
     finally:
-        await auth_http_client.aclose()
+        try:
+            await yookassa_http_client.aclose()
+        finally:
+            await auth_http_client.aclose()
 
 
 if __name__ == '__main__':  # pragma: no cover

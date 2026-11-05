@@ -739,3 +739,81 @@ async def test_t11_atomic_reconciliation_succeeded_failed_and_concurrent_race(
 
     local_after = await repo.get_local_payment_result_for_user(pay_3.id, user_3)
     assert local_after is not None and local_after.auth_access_delivered is True
+
+    # 9. T-17: проверяем list_due_pending_payments с отступом min_age_seconds
+    now_t17 = datetime.now(UTC)
+    young_pay_id = uuid4()
+    mature_pay_id = uuid4()
+    throttled_pay_id = uuid4()
+    async with session_factory() as session:
+        session.add_all(
+            [
+                Payment(
+                    id=young_pay_id,
+                    user_id=uuid4(),
+                    tariff_id=DEFAULT_TARIFF_ID,
+                    provider_code=DEFAULT_PROVIDER_CODE,
+                    amount_kopeks=DEFAULT_TARIFF_PRICE_KOPEKS,
+                    status='pending',
+                    idempotency_key=young_pay_id,
+                    created_at=now_t17 - timedelta(seconds=1),
+                ),
+                Payment(
+                    id=mature_pay_id,
+                    user_id=uuid4(),
+                    tariff_id=DEFAULT_TARIFF_ID,
+                    provider_code=DEFAULT_PROVIDER_CODE,
+                    amount_kopeks=DEFAULT_TARIFF_PRICE_KOPEKS,
+                    status='pending',
+                    idempotency_key=mature_pay_id,
+                    created_at=now_t17 - timedelta(seconds=15),
+                ),
+                Payment(
+                    id=throttled_pay_id,
+                    user_id=uuid4(),
+                    tariff_id=DEFAULT_TARIFF_ID,
+                    provider_code=DEFAULT_PROVIDER_CODE,
+                    amount_kopeks=DEFAULT_TARIFF_PRICE_KOPEKS,
+                    status='pending',
+                    idempotency_key=throttled_pay_id,
+                    created_at=now_t17 - timedelta(seconds=20),
+                    last_checked_at=now_t17 - timedelta(seconds=1),
+                ),
+            ]
+        )
+        await session.commit()
+
+    due_rows = await repo.list_due_pending_payments(
+        min_age_seconds=5.0,
+        throttle_seconds=5.0,
+        limit=10,
+    )
+    due_ids = {r.id for r in due_rows}
+    assert mature_pay_id in due_ids
+    assert young_pay_id not in due_ids
+    assert throttled_pay_id not in due_ids
+
+    # Два параллельных воркера через claim_next_due_pending_payment (SKIP LOCKED)
+    # захватывают mature_pay_id ровно один раз без дублей (BIL-NFR-S-01)
+    claimed_1, claimed_2 = await asyncio.gather(
+        repo.claim_next_due_pending_payment(min_age_seconds=5.0, throttle_seconds=5.0),
+        repo.claim_next_due_pending_payment(min_age_seconds=5.0, throttle_seconds=5.0),
+    )
+    claimed_ids = [c.id for c in (claimed_1, claimed_2) if c is not None]
+    assert claimed_ids == [mature_pay_id]
+
+    # Проверяем record_payment_reconcile_error с экспоненциальным backoff
+    err_1 = await repo.record_payment_reconcile_error(
+        mature_pay_id,
+        error_message='YooKassa timeout #1',
+    )
+    assert err_1.provider_details is not None
+    assert err_1.provider_details['_reconcile_errors'] == 1
+    err_2 = await repo.record_payment_reconcile_error(
+        mature_pay_id,
+        error_message='YooKassa timeout #2',
+    )
+    assert err_2.provider_details is not None
+    assert err_2.provider_details['_reconcile_errors'] == 2
+    assert err_2.last_checked_at is not None
+    assert err_2.last_checked_at > datetime.now(UTC)
