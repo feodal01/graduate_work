@@ -852,3 +852,158 @@ async def test_t12_t13_t16_and_t17_repository_queries_and_skip_locked(
     assert err_2.provider_details['_reconcile_errors'] == 2
     assert err_2.last_checked_at is not None
     assert err_2.last_checked_at > datetime.now(UTC)
+
+
+async def test_t19_outbox_worker_skip_locked_backoff_intervention_and_stale_versions(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """T-19 (BIL-FR-11, BIL-FR-14, BIL-NFR-R-04, BIL-NFR-S-01): воркер outbox в БД."""
+    from repositories.purchase import (
+        DeliveryOutcome,
+        OutboxTaskRecordProtocol,
+        SQLAlchemyPurchaseRepository,
+    )
+
+    session_factory = migrated_billing_db
+    repo = SQLAlchemyPurchaseRepository(session_factory)
+    user_id = uuid4()
+    pay_1, _ = await repo.get_or_create_pending_payment(user_id)
+    await repo.finalize_payment_succeeded(pay_1.id, source='webhook')
+
+    # 1. Проверяем SKIP LOCKED сразу по двум target_service ('auth', 'notifications')
+    delivered_keys: list[str] = []
+
+    async def deliver_all_ok(
+        task: OutboxTaskRecordProtocol,
+    ) -> tuple[DeliveryOutcome, str | None]:
+        await asyncio.sleep(0.01)
+        delivered_keys.append(f'{task.target_service}:{task.task_type}')
+        return 'completed', None
+
+    w1, w2 = await asyncio.gather(
+        repo.process_due_outbox_tasks(
+            deliver_all_ok,
+            target_services=('auth', 'notifications'),
+            payment_id=pay_1.id,
+        ),
+        repo.process_due_outbox_tasks(
+            deliver_all_ok,
+            target_services=('auth', 'notifications'),
+            payment_id=pay_1.id,
+        ),
+    )
+    # 1 задача auth + 2 задачи notifications = 3 задачи, каждая обработана ровно 1 раз
+    assert w1 + w2 == 3
+    assert sorted(delivered_keys) == [
+        'auth:sync_access',
+        'notifications:payment_succeeded_email',
+        'notifications:subscription_expiration_email',
+    ]
+
+    # 2. Проверяем пропуск устаревшей версии доступа (US-S-02 шаг 3)
+    stale_task_id = uuid4()
+    newer_task_id = uuid4()
+    async with session_factory() as session:
+        session.add_all(
+            [
+                OutboxTask(
+                    id=newer_task_id,
+                    dedup_key=f't19_newer:{pay_1.id}',
+                    target_service='auth',
+                    task_type='sync_access',
+                    payment_id=pay_1.id,
+                    user_id=user_id,
+                    access_version=5,
+                    payload={'version': 5, 'expires_at': None},
+                    status='completed',
+                ),
+                OutboxTask(
+                    id=stale_task_id,
+                    dedup_key=f't19_stale:{pay_1.id}',
+                    target_service='auth',
+                    task_type='sync_access',
+                    payment_id=pay_1.id,
+                    user_id=user_id,
+                    access_version=2,
+                    payload={'version': 2, 'expires_at': None},
+                    status='pending',
+                    attempts=1,
+                    last_error='Previous 503',
+                    next_retry_at=datetime.now(UTC) - timedelta(seconds=1),
+                ),
+            ]
+        )
+        await session.commit()
+
+    called_for_stale = 0
+
+    async def should_not_be_called(
+        _task: OutboxTaskRecordProtocol,
+    ) -> tuple[DeliveryOutcome, str | None]:
+        nonlocal called_for_stale
+        called_for_stale += 1
+        return 'completed', None
+
+    processed_stale = await repo.process_due_outbox_tasks(
+        should_not_be_called,
+        task_id=stale_task_id,
+    )
+    assert processed_stale == 1
+    assert called_for_stale == 0
+    async with session_factory() as session:
+        stale_row = await session.get(OutboxTask, stale_task_id)
+        assert stale_row is not None
+        assert stale_row.status == 'completed'
+        assert stale_row.last_error is None
+
+    # 3. Проверяем backoff и переход в requires_intervention после лимита
+    flaky_task_id = uuid4()
+    async with session_factory() as session:
+        session.add(
+            OutboxTask(
+                id=flaky_task_id,
+                dedup_key=f't19_flaky:{pay_1.id}',
+                target_service='notifications',
+                task_type='payment_succeeded_email',
+                payment_id=pay_1.id,
+                user_id=user_id,
+                access_version=None,
+                payload={'subject': 'Test'},
+                status='pending',
+                attempts=0,
+                next_retry_at=datetime.now(UTC) - timedelta(seconds=1),
+            )
+        )
+        await session.commit()
+
+    async def deliver_transient_fail(
+        _task: OutboxTaskRecordProtocol,
+    ) -> tuple[DeliveryOutcome, str | None]:
+        return 'transient_error', 'Notifications 503 Service Unavailable'
+
+    await repo.process_due_outbox_tasks(
+        deliver_transient_fail,
+        task_id=flaky_task_id,
+        max_attempts=2,
+    )
+    async with session_factory() as session:
+        row_after_1 = await session.get(OutboxTask, flaky_task_id)
+        assert row_after_1 is not None
+        assert row_after_1.status == 'pending'
+        assert row_after_1.attempts == 1
+        assert row_after_1.next_retry_at > datetime.now(UTC)
+        # Сдвигаем next_retry_at в прошлое для 2-й (финальной) попытки
+        row_after_1.next_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+    await repo.process_due_outbox_tasks(
+        deliver_transient_fail,
+        task_id=flaky_task_id,
+        max_attempts=2,
+    )
+    async with session_factory() as session:
+        row_after_2 = await session.get(OutboxTask, flaky_task_id)
+        assert row_after_2 is not None
+        assert row_after_2.status == 'requires_intervention'
+        assert row_after_2.attempts == 2
+        assert row_after_2.last_error == 'Notifications 503 Service Unavailable'

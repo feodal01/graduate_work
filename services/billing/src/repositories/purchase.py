@@ -83,6 +83,12 @@ OutboxDeliverFn = Callable[
 ]
 
 
+def compute_outbox_backoff_seconds(attempts: int) -> int:
+    """Вычисляет паузу экспоненциального backoff (2^attempt с потолком 300 с)."""
+    normalized = max(1, attempts)
+    return int(min(300, 2 ** min(normalized, 9)))
+
+
 class PurchaseRepository(Protocol):
     async def check_purchase_allowed(
         self,
@@ -174,6 +180,18 @@ class PurchaseRepository(Protocol):
         provider_details: dict[str, Any] | None = None,
         public_base_url: str = 'http://localhost',
     ) -> tuple[PaymentRecordProtocol, bool]: ...
+
+    async def process_due_outbox_tasks(
+        self,
+        deliver_fn: OutboxDeliverFn,
+        *,
+        target_services: Sequence[str] = ('auth', 'notifications'),
+        payment_id: UUID | None = None,
+        task_id: UUID | None = None,
+        limit: int = 20,
+        max_attempts: int = 20,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> int: ...
 
     async def process_due_auth_outbox_tasks(
         self,
@@ -853,16 +871,20 @@ class SQLAlchemyPurchaseRepository:
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 
-    async def process_due_auth_outbox_tasks(
+    async def process_due_outbox_tasks(
         self,
         deliver_fn: OutboxDeliverFn,
         *,
+        target_services: Sequence[str] = ('auth', 'notifications'),
         payment_id: UUID | None = None,
+        task_id: UUID | None = None,
         limit: int = 20,
         max_attempts: int = 20,
         should_stop: Callable[[], bool] | None = None,
     ) -> int:
-        """Выбирает и обрабатывает задачи Auth под SKIP LOCKED (BIL-FR-11)."""
+        """Выбирает и обрабатывает задачи outbox под SKIP LOCKED (T-19, BIL-FR-11)."""
+        if not target_services:
+            return 0
         processed = 0
         try:
             for _ in range(limit):
@@ -873,16 +895,21 @@ class SQLAlchemyPurchaseRepository:
                     stmt = (
                         select(OutboxTask)
                         .where(
-                            OutboxTask.target_service == 'auth',
+                            OutboxTask.target_service.in_(tuple(target_services)),
                             OutboxTask.status == 'pending',
                             OutboxTask.next_retry_at <= now_utc,
                         )
-                        .order_by(OutboxTask.created_at)
+                        .order_by(
+                            OutboxTask.next_retry_at.asc(),
+                            OutboxTask.created_at.asc(),
+                        )
                         .limit(1)
                         .with_for_update(skip_locked=True)
                     )
                     if payment_id is not None:
                         stmt = stmt.where(OutboxTask.payment_id == payment_id)
+                    if task_id is not None:
+                        stmt = stmt.where(OutboxTask.id == task_id)
 
                     task = await session.scalar(stmt)
                     if task is None:
@@ -890,7 +917,10 @@ class SQLAlchemyPurchaseRepository:
 
                     # US-S-02 шаг 3: если уже доставлена более новая версия,
                     # закрываем устаревшую задачу без вызова Auth.
-                    if task.access_version is not None:
+                    if (
+                        task.target_service == 'auth'
+                        and task.access_version is not None
+                    ):
                         max_delivered = await session.scalar(
                             select(func.max(OutboxTask.access_version)).where(
                                 OutboxTask.user_id == task.user_id,
@@ -903,12 +933,22 @@ class SQLAlchemyPurchaseRepository:
                             and int(max_delivered) >= task.access_version
                         ):
                             task.status = 'completed'
+                            task.last_error = None
                             task.updated_at = now_utc
                             await session.commit()
                             processed += 1
                             continue
 
-                    outcome, error_msg = await deliver_fn(task)
+                    try:
+                        outcome, error_msg = await deliver_fn(task)
+                    except Exception as exc:
+                        logger.exception(
+                            'Unexpected error delivering outbox task %s',
+                            task.id,
+                        )
+                        outcome = 'transient_error'
+                        error_msg = f'Unexpected delivery error: {exc}'
+
                     now_after = datetime.now(UTC)
                     if outcome == 'completed':
                         task.status = 'completed'
@@ -938,7 +978,7 @@ class SQLAlchemyPurchaseRepository:
                             logger.error(alert_msg)
                             sentry_sdk.capture_message(alert_msg, level='error')
                         else:
-                            backoff_sec = min(300, 2 ** min(task.attempts, 8))
+                            backoff_sec = compute_outbox_backoff_seconds(task.attempts)
                             task.next_retry_at = now_after + timedelta(
                                 seconds=backoff_sec
                             )
@@ -947,3 +987,22 @@ class SQLAlchemyPurchaseRepository:
             return processed
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
+
+    async def process_due_auth_outbox_tasks(
+        self,
+        deliver_fn: OutboxDeliverFn,
+        *,
+        payment_id: UUID | None = None,
+        limit: int = 20,
+        max_attempts: int = 20,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> int:
+        """Выбирает и обрабатывает задачи Auth под SKIP LOCKED (BIL-FR-11)."""
+        return await self.process_due_outbox_tasks(
+            deliver_fn,
+            target_services=('auth',),
+            payment_id=payment_id,
+            limit=limit,
+            max_attempts=max_attempts,
+            should_stop=should_stop,
+        )

@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -20,6 +20,7 @@ from repositories.purchase import (
     DeliveryOutcome,
     LocalPaymentResultData,
     OutboxDeliverFn,
+    compute_outbox_backoff_seconds,
 )
 
 
@@ -479,16 +480,18 @@ class InMemoryPurchaseRepository:
         )
         return row, True
 
-    async def process_due_auth_outbox_tasks(
+    async def process_due_outbox_tasks(
         self,
         deliver_fn: OutboxDeliverFn,
         *,
+        target_services: Sequence[str] = ('auth', 'notifications'),
         payment_id: UUID | None = None,
+        task_id: UUID | None = None,
         limit: int = 20,
         max_attempts: int = 20,
         should_stop: Callable[[], bool] | None = None,
     ) -> int:
-        """Обрабатывает готовые задачи Auth в in-memory репозитории."""
+        """Обрабатывает готовые задачи outbox в in-memory репозитории (T-19)."""
         import logging
 
         import sentry_sdk
@@ -497,20 +500,26 @@ class InMemoryPurchaseRepository:
 
         if self.db_unavailable:
             raise DatabaseUnavailableError('billing-db is down')
+        if not target_services:
+            return 0
         processed = 0
         now_utc = datetime.now(UTC)
-        candidates = [
-            task
-            for task in self.outbox_tasks.values()
-            if task.target_service == 'auth'
-            and task.status == 'pending'
-            and task.next_retry_at <= now_utc
-            and (payment_id is None or task.payment_id == payment_id)
-        ]
+        candidates = sorted(
+            [
+                task
+                for task in self.outbox_tasks.values()
+                if task.target_service in target_services
+                and task.status == 'pending'
+                and task.next_retry_at <= now_utc
+                and (payment_id is None or task.payment_id == payment_id)
+                and (task_id is None or task.id == task_id)
+            ],
+            key=lambda t: t.next_retry_at,
+        )
         for task in candidates[:limit]:
             if should_stop is not None and should_stop():
                 break
-            if task.access_version is not None:
+            if task.target_service == 'auth' and task.access_version is not None:
                 delivered_versions = [
                     int(t.access_version)
                     for t in self.outbox_tasks.values()
@@ -524,11 +533,21 @@ class InMemoryPurchaseRepository:
                     and max(delivered_versions) >= task.access_version
                 ):
                     task.status = 'completed'
+                    task.last_error = None
                     processed += 1
                     continue
 
             outcome: DeliveryOutcome
-            outcome, error_msg = await deliver_fn(task)
+            try:
+                outcome, error_msg = await deliver_fn(task)
+            except Exception as exc:
+                logger.exception(
+                    'Unexpected error delivering outbox task %s',
+                    task.id,
+                )
+                outcome = 'transient_error'
+                error_msg = f'Unexpected delivery error: {exc}'
+
             now_after = datetime.now(UTC)
             if outcome == 'completed':
                 task.status = 'completed'
@@ -555,10 +574,29 @@ class InMemoryPurchaseRepository:
                     logger.error(alert_msg)
                     sentry_sdk.capture_message(alert_msg, level='error')
                 else:
-                    backoff_sec = min(300, 2 ** min(task.attempts, 8))
+                    backoff_sec = compute_outbox_backoff_seconds(task.attempts)
                     task.next_retry_at = now_after + timedelta(seconds=backoff_sec)
             processed += 1
         return processed
+
+    async def process_due_auth_outbox_tasks(
+        self,
+        deliver_fn: OutboxDeliverFn,
+        *,
+        payment_id: UUID | None = None,
+        limit: int = 20,
+        max_attempts: int = 20,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> int:
+        """Обрабатывает готовые задачи Auth в in-memory репозитории."""
+        return await self.process_due_outbox_tasks(
+            deliver_fn,
+            target_services=('auth',),
+            payment_id=payment_id,
+            limit=limit,
+            max_attempts=max_attempts,
+            should_stop=should_stop,
+        )
 
 
 class FakeProviderGateway:
