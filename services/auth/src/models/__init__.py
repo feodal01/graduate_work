@@ -5,6 +5,7 @@ from models.entity import (
     Role,
     SocialAccount,
     User,
+    UserSubscriptionAccessState,
     role_permissions,
     user_roles,
 )
@@ -19,6 +20,7 @@ __all__ = [
     'Role',
     'SocialAccount',
     'User',
+    'UserSubscriptionAccessState',
     'role_permissions',
     'user_roles',
 ]

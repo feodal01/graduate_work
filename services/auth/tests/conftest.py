@@ -4,6 +4,9 @@ import os
 # Settings на чистом checkout (без .env). Выставляем до импорта приложения.
 os.environ.setdefault('JWT_SECRET', 'test-jwt-secret-that-is-long-enough-for-hs256')
 os.environ.setdefault('SERVICE_API_KEY', 'test-service-key-that-is-long-enough')
+os.environ['TRACING_ENABLED'] = 'false'
+os.environ['SENTRY_DSN'] = ''
+os.environ['LOGSTASH_HOST'] = ''
 
 import pytest
 

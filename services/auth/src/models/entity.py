@@ -52,7 +52,36 @@ user_roles = Table(
         ForeignKey('roles.id', ondelete='CASCADE'),
         primary_key=True,
     ),
+    Column('expires_at', DateTime(timezone=True), nullable=True),
 )
+
+
+class UserSubscriptionAccessState(Base):
+    __tablename__ = 'user_subscription_access_state'
+    __table_args__ = (
+        CheckConstraint(
+            'access_version >= 1',
+            name='ck_user_subscription_access_state_version',
+        ),
+    )
+
+    user_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey('users.id', ondelete='CASCADE'),
+        primary_key=True,
+        nullable=False,
+    )
+    access_version: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_utc_now,
+        onupdate=_utc_now,
+        server_default=now(),
+        nullable=False,
+    )
 
 
 class User(Base):

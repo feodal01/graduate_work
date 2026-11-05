@@ -1,16 +1,25 @@
 import builtins
 from collections.abc import Collection
+from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID
 
-from sqlalchemy import delete, insert, select
+from sqlalchemy import delete, insert, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from db.backoff_policy import POSTGRES_RETRYABLE, on_postgres_exception
 from db.sql.errors import DatabaseUnavailableError
-from models import Permission, Role, User, role_permissions, user_roles
+from models import (
+    Permission,
+    Role,
+    User,
+    UserSubscriptionAccessState,
+    role_permissions,
+    user_roles,
+)
 from repositories.errors import (
     RoleAlreadyAssignedError,
     RoleAlreadyExistsError,
@@ -44,6 +53,14 @@ class RoleRepository(Protocol):
     async def assign(self, user_id: UUID, role_id: UUID) -> None: ...
 
     async def revoke(self, user_id: UUID, role_id: UUID) -> None: ...
+
+    async def set_subscription_access(
+        self,
+        user_id: UUID,
+        *,
+        version: int,
+        expires_at: datetime | None,
+    ) -> tuple[bool, int]: ...
 
     async def get_permissions_for_user(self, user_id: UUID) -> set[str]: ...
 
@@ -156,6 +173,85 @@ class SQLAlchemyRoleRepository:
                 await self._session.rollback()
                 raise RoleAssignmentNotFoundError
             await self._session.commit()
+        except (SQLAlchemyError, OSError) as exc:
+            await self._session.rollback()
+            raise DatabaseUnavailableError from exc
+
+    async def set_subscription_access(
+        self,
+        user_id: UUID,
+        *,
+        version: int,
+        expires_at: datetime | None,
+    ) -> tuple[bool, int]:
+        """Атомарно обновляет версию доступа и роль (AUTH-FR-01, AUTH-FR-02)."""
+        try:
+            await self._session.execute(
+                text('SELECT pg_advisory_xact_lock(hashtext(:uid))'),
+                {'uid': str(user_id)},
+            )
+            user = await self._session.get(User, user_id)
+            if user is None:
+                await self._session.rollback()
+                raise UserNotFoundError
+
+            subscriber_role = await self._session.scalar(
+                select(Role).where(Role.name == 'subscriber')
+            )
+            if subscriber_role is None:
+                await self._session.rollback()
+                raise RoleNotFoundError
+
+            state = await self._session.get(
+                UserSubscriptionAccessState,
+                user_id,
+                with_for_update=True,
+                populate_existing=True,
+            )
+            if state is not None and version <= state.access_version:
+                current_version = int(state.access_version)
+                await self._session.commit()
+                return False, current_version
+
+            now_utc = datetime.now(UTC)
+            if state is None:
+                self._session.add(
+                    UserSubscriptionAccessState(
+                        user_id=user_id,
+                        access_version=version,
+                        updated_at=now_utc,
+                    )
+                )
+            else:
+                state.access_version = version
+                state.updated_at = now_utc
+
+            if expires_at is not None:
+                upsert_role = (
+                    pg_insert(user_roles)
+                    .values(
+                        user_id=user_id,
+                        role_id=subscriber_role.id,
+                        expires_at=expires_at,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[user_roles.c.user_id, user_roles.c.role_id],
+                        set_={'expires_at': expires_at},
+                    )
+                )
+                await self._session.execute(upsert_role)
+            else:
+                await self._session.execute(
+                    delete(user_roles).where(
+                        user_roles.c.user_id == user_id,
+                        user_roles.c.role_id == subscriber_role.id,
+                    )
+                )
+
+            await self._session.commit()
+            return True, version
+        except (UserNotFoundError, RoleNotFoundError):
+            raise
         except (SQLAlchemyError, OSError) as exc:
             await self._session.rollback()
             raise DatabaseUnavailableError from exc

@@ -35,6 +35,7 @@
 
 import logging
 from collections.abc import Collection
+from datetime import datetime
 from uuid import UUID
 
 from db.cache.authorization import AuthorizationCache, AuthorizationSnapshot
@@ -229,6 +230,21 @@ class AuthorizationService:
         # Отзыв роли также требует удалить только один снимок.
         async with self._authorization_cache.user_mutation(user_id):
             await self._roles.revoke(user_id, role_id)
+
+    async def put_subscription_access(
+        self,
+        user_id: UUID,
+        *,
+        version: int,
+        expires_at: datetime | None,
+    ) -> tuple[bool, int]:
+        """Записывает состояние доступа внутри user_mutation (AUTH-FR-01)."""
+        async with self._authorization_cache.user_mutation(user_id):
+            return await self._roles.set_subscription_access(
+                user_id,
+                version=version,
+                expires_at=expires_at,
+            )
 
     async def _require_permission(
         self,

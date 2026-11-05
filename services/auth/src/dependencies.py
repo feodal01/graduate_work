@@ -236,7 +236,12 @@ async def require_internal_service(
         str | None,
         Header(alias='X-Service-Key'),
     ] = None,
+    service_api_key: Annotated[
+        str | None,
+        Header(alias='X-Service-Api-Key'),
+    ] = None,
 ) -> str:
-    if not credentials.verify(service_key):
+    provided_key = service_api_key if service_api_key is not None else service_key
+    if not credentials.verify(provided_key):
         raise InvalidServiceCredentialsError
     return 'movies-api'

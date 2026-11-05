@@ -124,6 +124,9 @@ class InMemoryRoleRepository:
     def __init__(self) -> None:
         self.items: dict[UUID, Role] = {}
         self.assignments: set[tuple[UUID, UUID]] = set()
+        self.assignment_expirations: dict[tuple[UUID, UUID], datetime | None] = {}
+        self.access_versions: dict[UUID, int] = {}
+        self.fail_db: bool = False
         self.users: set[UUID] = set()
         self.permission_catalog = {
             'roles:manage',
@@ -206,6 +209,38 @@ class InMemoryRoleRepository:
         if assignment not in self.assignments:
             raise RoleAssignmentNotFoundError
         self.assignments.remove(assignment)
+        self.assignment_expirations.pop(assignment, None)
+
+    async def set_subscription_access(
+        self,
+        user_id: UUID,
+        *,
+        version: int,
+        expires_at: datetime | None,
+    ) -> tuple[bool, int]:
+        if self.fail_db:
+            raise DatabaseUnavailableError('Database is down')
+        if user_id not in self.users:
+            raise UserNotFoundError
+        subscriber_role = next(
+            (role for role in self.items.values() if role.name == 'subscriber'),
+            None,
+        )
+        if subscriber_role is None:
+            raise RoleNotFoundError
+        current_version = self.access_versions.get(user_id)
+        if current_version is not None and version <= current_version:
+            return False, current_version
+
+        self.access_versions[user_id] = version
+        assignment = (user_id, subscriber_role.id)
+        if expires_at is not None:
+            self.assignments.add(assignment)
+            self.assignment_expirations[assignment] = expires_at
+        else:
+            self.assignments.discard(assignment)
+            self.assignment_expirations.pop(assignment, None)
+        return True, version
 
     async def get_permissions_for_user(self, user_id: UUID) -> set[str]:
         self.get_permissions_calls += 1

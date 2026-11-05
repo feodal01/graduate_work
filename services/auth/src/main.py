@@ -16,6 +16,7 @@ from api.v1 import (
     health,
     notification_contacts,
     social_authentication,
+    subscription_access,
     token_introspection,
 )
 from clients.yandex_oauth import YandexOAuthClient
@@ -178,6 +179,7 @@ def create_app(
     application.include_router(authorization.router, prefix='/api/v1/auth')
     application.include_router(health.router, prefix='/api/v1/health')
     application.include_router(notification_contacts.router, prefix='/api/v1/internal')
+    application.include_router(subscription_access.router, prefix='/api/v1/internal')
     application.include_router(token_introspection.router, prefix='/api/v1/internal')
     return application
 

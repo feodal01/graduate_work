@@ -89,9 +89,10 @@ class BillingIntegrationCheck:
         self._check_purchase_creation_t10()
         self._check_reconciler_atomic_outcome_t11()
         self._check_payment_result_screen_t12()
+        self._check_auth_subscription_access_t14()
         self._check_degradation_and_worker_graceful_shutdown()
         print(
-            'All Billing T-06 / T-07 / T-08 / T-09 / T-10 / T-11 / T-12 / T-13 '
+            'All Billing T-06 / T-07 / T-08 / T-09 / T-10 / T-11 / T-12 / T-13 / T-14 '
             'live Docker checks passed.'
         )
 
@@ -950,6 +951,133 @@ class BillingIntegrationCheck:
             self._psql(f"DELETE FROM outbox_tasks WHERE payment_id = '{pay_id}';")
             self._psql(f"DELETE FROM subscriptions WHERE payment_id = '{pay_id}';")
             self._psql(f"DELETE FROM payments WHERE id = '{pay_id}';")
+
+    def _check_auth_subscription_access_t14(self) -> None:
+        """T-14 (AUTH-FR-01, AUTH-FR-02, AUTH-API-01): live Auth subscription-access."""
+        # Verify auth-migrate downgrade & upgrade of 20261104_0006
+        self._compose('run', '--rm', 'auth-migrate', 'alembic', 'downgrade', '-1')
+        self._compose('run', '--rm', 'auth-migrate', 'alembic', 'upgrade', 'head')
+
+        # Run live HTTP checks from billing-api to auth:8000
+        code = (
+            'import asyncio, httpx\n'
+            'from uuid import uuid4\n'
+            'from core.config import ServiceSettings, settings\n'
+            'async def check_t14():\n'
+            '    base = str(settings.auth_client.service_url).rstrip("/")\n'
+            '    key = ServiceSettings().api_key.get_secret_value()\n'
+            '    async with httpx.AsyncClient(base_url=base) as c:\n'
+            '        # 1. Create test user via signup\n'
+            '        login = f"SubT14_{uuid4().hex[:8]}"\n'
+            '        signup = await c.post(\n'
+            '            "/api/v1/auth/signup",\n'
+            '            json={\n'
+            '                "login": login,\n'
+            '                "password": "Saffron-Citadel-SubT14-2026!",\n'
+            '                "tz": "Europe/Moscow",\n'
+            '            },\n'
+            '            headers={"X-Request-Id": "t14-signup"},\n'
+            '        )\n'
+            '        assert signup.status_code == 201, signup.text\n'
+            '        uid = signup.json()["id"]\n'
+            '        tok_res = await c.post(\n'
+            '            "/api/v1/auth/login",\n'
+            '            json={\n'
+            '                "login": login,\n'
+            '                "password": "Saffron-Citadel-SubT14-2026!",\n'
+            '            },\n'
+            '            headers={"X-Request-Id": "t14-login"},\n'
+            '        )\n'
+            '        token = tok_res.json()["access_token"]\n'
+            '        svc_headers = {\n'
+            '            "X-Request-Id": "t14-svc",\n'
+            '            "X-Service-Api-Key": key,\n'
+            '        }\n'
+            '        # 2. Unauth / wrong key -> 401\n'
+            '        r_401 = await c.put(\n'
+            '            f"/api/v1/internal/users/{uid}/subscription-access",\n'
+            '            json={"version": 1, "expires_at": None},\n'
+            '            headers={"X-Request-Id": "t14-401"},\n'
+            '        )\n'
+            '        assert r_401.status_code == 401\n'
+            '        # 3. Unknown user -> 404\n'
+            '        r_404 = await c.put(\n'
+            '            f"/api/v1/internal/users/{uuid4()}/subscription-access",\n'
+            '            json={"version": 1, "expires_at": None},\n'
+            '            headers=svc_headers,\n'
+            '        )\n'
+            '        assert r_404.status_code == 404\n'
+            '        # 4. Out-of-order versions 4 ("no access"), then 1..3 -> stays 4\n'
+            '        r_v4 = await c.put(\n'
+            '            f"/api/v1/internal/users/{uid}/subscription-access",\n'
+            '            json={"version": 4, "expires_at": None},\n'
+            '            headers=svc_headers,\n'
+            '        )\n'
+            '        assert r_v4.status_code == 200\n'
+            '        assert r_v4.json() == {"applied": True, "current_version": 4}\n'
+            '        for v in (1, 2, 3, 4):\n'
+            '            r_old = await c.put(\n'
+            '                f"/api/v1/internal/users/{uid}/subscription-access",\n'
+            '                json={\n'
+            '                    "version": v,\n'
+            '                    "expires_at": "2027-01-01T00:00:00Z",\n'
+            '                },\n'
+            '                headers=svc_headers,\n'
+            '            )\n'
+            '            assert r_old.status_code == 200\n'
+            '            assert r_old.json() == {\n'
+            '                "applied": False,\n'
+            '                "current_version": 4,\n'
+            '            }\n'
+            '        # 5. Version 5 grants access -> immediate permissions/check True\n'
+            '        r_v5 = await c.put(\n'
+            '            f"/api/v1/internal/users/{uid}/subscription-access",\n'
+            '            json={\n'
+            '                "version": 5,\n'
+            '                "expires_at": "2027-01-01T00:00:00Z",\n'
+            '            },\n'
+            '            headers=svc_headers,\n'
+            '        )\n'
+            '        assert r_v5.json() == {"applied": True, "current_version": 5}\n'
+            '        chk_1 = await c.post(\n'
+            '            "/api/v1/auth/permissions/check",\n'
+            '            json={\n'
+            '                "resource": "film",\n'
+            '                "action": "read",\n'
+            '                "attributes": {"creation_date": "9999-01-01"},\n'
+            '            },\n'
+            '            headers={\n'
+            '                **svc_headers,\n'
+            '                "Authorization": f"Bearer {token}",\n'
+            '            },\n'
+            '        )\n'
+            '        assert chk_1.json() == {"allowed": True}\n'
+            '        # 6. Version 6 revokes access -> permissions/check False\n'
+            '        r_v6 = await c.put(\n'
+            '            f"/api/v1/internal/users/{uid}/subscription-access",\n'
+            '            json={"version": 6, "expires_at": None},\n'
+            '            headers=svc_headers,\n'
+            '        )\n'
+            '        assert r_v6.json() == {"applied": True, "current_version": 6}\n'
+            '        chk_2 = await c.post(\n'
+            '            "/api/v1/auth/permissions/check",\n'
+            '            json={\n'
+            '                "resource": "film",\n'
+            '                "action": "read",\n'
+            '                "attributes": {"creation_date": "9999-01-01"},\n'
+            '            },\n'
+            '            headers={\n'
+            '                **svc_headers,\n'
+            '                "Authorization": f"Bearer {token}",\n'
+            '            },\n'
+            '        )\n'
+            '        assert chk_2.json() == {"allowed": False}\n'
+            '        print("t14-auth-ok")\n'
+            'asyncio.run(check_t14())\n'
+        )
+        out = self._compose('exec', '-T', 'billing-api', 'python', '-c', code).strip()
+        if 't14-auth-ok' not in out:
+            raise AssertionError(f'T-14 Auth subscription-access check failed: {out}')
 
     def _check_degradation_and_worker_graceful_shutdown(self) -> None:
         """BIL-API-15, GW-NFR-R-01, BIL-NFR-R-09: DB outage yields 503; worker stops."""
