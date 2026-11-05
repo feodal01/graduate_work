@@ -131,14 +131,19 @@ class AuthorizationService:
         user = await self._users.get_by_id(user_id)
         if user is None:
             raise InvalidAccessTokenError
-        permissions: frozenset[str] = (
-            frozenset()
-            if user.is_superuser
-            else frozenset(await self._roles.get_permissions_for_user(user.id))
-        )
+        if user.is_superuser:
+            permissions: frozenset[str] = frozenset()
+            nearest_expires_at: datetime | None = None
+        else:
+            (
+                raw_perms,
+                nearest_expires_at,
+            ) = await self._roles.get_active_permissions_and_nearest_expiry(user.id)
+            permissions = frozenset(raw_perms)
         snapshot = AuthorizationSnapshot(
             is_superuser=user.is_superuser,
             permissions=permissions,
+            nearest_expires_at=nearest_expires_at,
         )
 
         # Если Redis был доступен, пытаемся сохранить новый снимок. Lua-скрипт

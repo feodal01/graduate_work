@@ -30,7 +30,9 @@
 """
 
 import logging
+import math
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -66,6 +68,26 @@ class AuthorizationSnapshot:
 
     is_superuser: bool
     permissions: frozenset[str]
+    nearest_expires_at: datetime | None = None
+
+
+def compute_effective_snapshot_ttl(
+    base_ttl_seconds: int,
+    nearest_expires_at: datetime | None,
+    *,
+    now_utc: datetime | None = None,
+) -> int:
+    """Ограничивает TTL снимка прав ближайшим сроком истечения роли (AUTH-FR-03)."""
+    if nearest_expires_at is None:
+        return base_ttl_seconds
+    current = now_utc if now_utc is not None else datetime.now(UTC)
+    target = (
+        nearest_expires_at
+        if nearest_expires_at.tzinfo is not None
+        else nearest_expires_at.replace(tzinfo=UTC)
+    )
+    remaining_seconds = math.ceil((target - current).total_seconds())
+    return min(base_ttl_seconds, max(1, remaining_seconds))
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +164,7 @@ class _StoredAuthorizationSnapshot(BaseModel):
     roles_revision: str
     is_superuser: bool
     permissions: list[str]
+    nearest_expires_at: str | None = None
 
 
 class RedisAuthorizationSnapshotStore:
@@ -197,10 +220,25 @@ class RedisAuthorizationSnapshotStore:
         if stored_snapshot.roles_revision != current_roles_revision:
             return cache_miss
 
+        nearest_expires_at: datetime | None = None
+        if stored_snapshot.nearest_expires_at is not None:
+            try:
+                parsed = datetime.fromisoformat(stored_snapshot.nearest_expires_at)
+                nearest_expires_at = (
+                    parsed.astimezone(UTC)
+                    if parsed.tzinfo is not None
+                    else parsed.replace(tzinfo=UTC)
+                )
+            except ValueError:
+                return cache_miss
+            if nearest_expires_at <= datetime.now(UTC):
+                return cache_miss
+
         return AuthorizationSnapshotReadResult(
             cached_snapshot=AuthorizationSnapshot(
                 is_superuser=stored_snapshot.is_superuser,
                 permissions=frozenset(stored_snapshot.permissions),
+                nearest_expires_at=nearest_expires_at,
             ),
             roles_revision_at_read=current_roles_revision,
         )
@@ -255,15 +293,35 @@ class RedisAuthorizationSnapshotStore:
         snapshot: AuthorizationSnapshot,
         expected_roles_revision: str,
     ) -> None:
+        now_utc = datetime.now(UTC)
+        normalized_expiry: datetime | None = None
+        if snapshot.nearest_expires_at is not None:
+            normalized_expiry = (
+                snapshot.nearest_expires_at.astimezone(UTC)
+                if snapshot.nearest_expires_at.tzinfo is not None
+                else snapshot.nearest_expires_at.replace(tzinfo=UTC)
+            )
+            if normalized_expiry <= now_utc:
+                return
+
         snapshot_json = _StoredAuthorizationSnapshot(
             roles_revision=expected_roles_revision,
             is_superuser=snapshot.is_superuser,
             permissions=sorted(snapshot.permissions),
+            nearest_expires_at=(
+                normalized_expiry.isoformat() if normalized_expiry is not None else None
+            ),
         ).model_dump_json()
+        effective_ttl = compute_effective_snapshot_ttl(
+            self._ttl_seconds,
+            normalized_expiry,
+            now_utc=now_utc,
+        )
         await self._store_snapshot(
             user_id,
             expected_roles_revision,
             snapshot_json,
+            effective_ttl,
         )
 
     @on_redis_exception()
@@ -272,6 +330,7 @@ class RedisAuthorizationSnapshotStore:
         user_id: UUID,
         expected_roles_revision: str,
         snapshot_json: str,
+        effective_ttl: int,
     ) -> None:
         await self._set_snapshot_script(
             keys=(
@@ -283,7 +342,7 @@ class RedisAuthorizationSnapshotStore:
             args=(
                 expected_roles_revision,
                 snapshot_json,
-                self._ttl_seconds,
+                effective_ttl,
             ),
         )
 

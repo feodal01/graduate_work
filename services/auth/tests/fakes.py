@@ -189,6 +189,11 @@ class InMemoryRoleRepository:
         self.assignments = {
             assignment for assignment in self.assignments if assignment[1] != role_id
         }
+        self.assignment_expirations = {
+            assignment: exp
+            for assignment, exp in self.assignment_expirations.items()
+            if assignment[1] != role_id
+        }
 
     async def assign(self, user_id: UUID, role_id: UUID) -> None:
         if user_id not in self.users:
@@ -243,17 +248,33 @@ class InMemoryRoleRepository:
         return True, version
 
     async def get_permissions_for_user(self, user_id: UUID) -> set[str]:
+        permissions, _ = await self.get_active_permissions_and_nearest_expiry(user_id)
+        return permissions
+
+    async def get_active_permissions_and_nearest_expiry(
+        self,
+        user_id: UUID,
+    ) -> tuple[set[str], datetime | None]:
         self.get_permissions_calls += 1
-        role_ids = {
-            role_id
-            for assigned_user_id, role_id in self.assignments
-            if assigned_user_id == user_id
-        }
-        return {
+        now_utc = datetime.now(UTC)
+        active_role_ids: list[UUID] = []
+        expirations: list[datetime] = []
+        for assigned_user_id, role_id in self.assignments:
+            if assigned_user_id != user_id:
+                continue
+            exp = self.assignment_expirations.get((assigned_user_id, role_id))
+            if exp is not None and exp <= now_utc:
+                continue
+            active_role_ids.append(role_id)
+            if exp is not None:
+                expirations.append(exp)
+        permissions = {
             permission.code
-            for role_id in role_ids
+            for role_id in active_role_ids
             for permission in self.items[role_id].permissions
         }
+        nearest_expires_at = min(expirations) if expirations else None
+        return permissions, nearest_expires_at
 
 
 class InMemoryAuthorizationCache:
@@ -279,7 +300,14 @@ class InMemoryAuthorizationCache:
         item = self.items.get(user_id)
         if item is None or item[0] != self.roles_revision:
             return AuthorizationSnapshotReadResult(None, self.roles_revision)
-        return AuthorizationSnapshotReadResult(item[1], self.roles_revision)
+        snapshot = item[1]
+        if (
+            snapshot.nearest_expires_at is not None
+            and snapshot.nearest_expires_at <= datetime.now(UTC)
+        ):
+            self.items.pop(user_id, None)
+            return AuthorizationSnapshotReadResult(None, self.roles_revision)
+        return AuthorizationSnapshotReadResult(snapshot, self.roles_revision)
 
     async def store_snapshot(
         self,

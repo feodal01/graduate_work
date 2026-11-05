@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID
 
-from sqlalchemy import delete, insert, select, text
+from sqlalchemy import delete, insert, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -63,6 +63,11 @@ class RoleRepository(Protocol):
     ) -> tuple[bool, int]: ...
 
     async def get_permissions_for_user(self, user_id: UUID) -> set[str]: ...
+
+    async def get_active_permissions_and_nearest_expiry(
+        self,
+        user_id: UUID,
+    ) -> tuple[set[str], datetime | None]: ...
 
 
 class SQLAlchemyRoleRepository:
@@ -257,26 +262,51 @@ class SQLAlchemyRoleRepository:
             raise DatabaseUnavailableError from exc
 
     async def get_permissions_for_user(self, user_id: UUID) -> set[str]:
+        permissions, _ = await self.get_active_permissions_and_nearest_expiry(user_id)
+        return permissions
+
+    async def get_active_permissions_and_nearest_expiry(
+        self,
+        user_id: UUID,
+    ) -> tuple[set[str], datetime | None]:
+        """Возвращает активные права и ближайший expires_at (AUTH-FR-03)."""
         try:
-            return await self._get_permissions_for_user(user_id)
+            return await self._get_active_permissions_and_nearest_expiry(user_id)
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError from exc
 
     @on_postgres_exception()
-    async def _get_permissions_for_user(self, user_id: UUID) -> set[str]:
+    async def _get_active_permissions_and_nearest_expiry(
+        self,
+        user_id: UUID,
+    ) -> tuple[set[str], datetime | None]:
+        now_utc = datetime.now(UTC)
         try:
             result = await self._session.execute(
-                select(role_permissions.c.permission_code)
+                select(
+                    role_permissions.c.permission_code,
+                    user_roles.c.expires_at,
+                )
                 .join(
                     user_roles,
                     user_roles.c.role_id == role_permissions.c.role_id,
                 )
-                .where(user_roles.c.user_id == user_id)
+                .where(
+                    user_roles.c.user_id == user_id,
+                    or_(
+                        user_roles.c.expires_at.is_(None),
+                        user_roles.c.expires_at > now_utc,
+                    ),
+                )
             )
         except POSTGRES_RETRYABLE:
             await self._session.rollback()
             raise
-        return set(result.scalars().all())
+        rows = result.all()
+        permissions = {str(code) for code, _ in rows}
+        expirations = [exp for _, exp in rows if exp is not None]
+        nearest_expires_at = min(expirations) if expirations else None
+        return permissions, nearest_expires_at
 
     async def _resolve_permissions(
         self,
