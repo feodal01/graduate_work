@@ -2,6 +2,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
 from fastapi import FastAPI, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.types import ExceptionHandler
@@ -126,7 +127,7 @@ async def validation_error_handler(
         status.HTTP_422_UNPROCESSABLE_CONTENT,
         'validation_error',
         'Request validation failed',
-        errors=list(exc.errors()),
+        errors=cast(list[Any], jsonable_encoder(exc.errors())),
     )
 
 

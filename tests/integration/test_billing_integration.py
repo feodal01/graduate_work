@@ -92,10 +92,11 @@ class BillingIntegrationCheck:
         self._check_auth_subscription_access_t14()
         self._check_immediate_auth_access_delivery_t16()
         self._check_worker_background_reconcile_t17()
+        self._check_yookassa_webhook_and_emulator_t18()
         self._check_degradation_and_worker_graceful_shutdown()
         print(
             'All Billing T-06 / T-07 / T-08 / T-09 / T-10 / T-11 / T-12 / T-13 / '
-            'T-14 / T-15 / T-16 / T-17 live Docker checks passed.'
+            'T-14 / T-15 / T-16 / T-17 / T-18 (FEAT-01) live Docker checks passed.'
         )
 
     def _http(
@@ -1370,6 +1371,93 @@ class BillingIntegrationCheck:
         ).strip()
         if 't17-worker-reconcile-ok' not in out:
             raise AssertionError(f'T-17 worker background reconcile failed: {out}')
+
+    def _check_yookassa_webhook_and_emulator_t18(self) -> None:
+        """T-18 (BIL-FR-07, BIL-API-05, BIL-NFR-SEC-04): live webhook & emulator."""
+        # 1. Invalid webhook body -> 422
+        bad_wh = self._http(
+            'POST',
+            '/api/v1/billing/webhooks/yookassa',
+            data=json.dumps({'object': {'id': '   '}}).encode(),
+            headers={'Content-Type': 'application/json'},
+        )
+        if bad_wh.status != 422:
+            raise AssertionError(f'Expected 422 on blank object.id: {bad_wh}')
+
+        # 2. Unknown provider_payment_id -> 200 OK
+        unk_wh = self._http(
+            'POST',
+            '/api/v1/billing/webhooks/yookassa',
+            data=json.dumps(
+                {
+                    'type': 'notification',
+                    'event': 'payment.succeeded',
+                    'object': {'id': f'yk-unk-{uuid4().hex[:8]}'},
+                }
+            ).encode(),
+            headers={'Content-Type': 'application/json'},
+        )
+        if unk_wh.status != 200:
+            raise AssertionError(f'Expected 200 on unknown webhook id: {unk_wh}')
+
+        # 3. Login & create real pending payment in YooKassa test shop, then send
+        # forged webhook claiming status='succeeded' via local emulator CLI
+        login_res = self._http(
+            'POST',
+            '/billing/login',
+            data=urllib.parse.urlencode(
+                {'login': 'admin', 'password': 'Cinema-Admin-2026!'}
+            ).encode(),
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            follow_redirects=False,
+        )
+        cookie_header = '; '.join([c.split(';', 1)[0] for c in login_res.set_cookies])
+        pay_res = self._http(
+            'POST',
+            '/api/v1/billing/payments',
+            headers={'Cookie': cookie_header},
+        )
+        if pay_res.status == 200:
+            pay_id = pay_res.json()['payment_id']
+            yk_id = self._psql(
+                f"SELECT provider_payment_id FROM payments WHERE id = '{pay_id}';"
+            ).stdout.strip()
+            try:
+                # Run local webhook emulator inside billing-api against http://127.0.0.1:8000
+                emu_out = self._compose(
+                    'exec',
+                    '-T',
+                    'billing-api',
+                    'python',
+                    '-m',
+                    'emulate_webhook',
+                    '--id',
+                    yk_id,
+                    '--event',
+                    'payment.succeeded',
+                    '--base-url',
+                    'http://127.0.0.1:8000',
+                ).strip()
+                if 'HTTP 200' not in emu_out:
+                    raise AssertionError(f'Webhook emulator failed: {emu_out}')
+
+                # Forged webhook claimed succeeded, GET returned pending -> pending
+                db_state = self._psql(
+                    f"SELECT status || '|' || (last_checked_at IS NOT NULL)::text "
+                    f"FROM payments WHERE id = '{pay_id}';"
+                ).stdout.strip()
+                if db_state != 'pending|true':
+                    raise AssertionError(
+                        f'Forged webhook corrupted DB or skipped GET check: {db_state}'
+                    )
+            finally:
+                self._psql(
+                    f"DELETE FROM operation_events WHERE operation_id = '{pay_id}';"
+                )
+                self._psql(f"DELETE FROM payments WHERE id = '{pay_id}';")
+        else:
+            self._psql("DELETE FROM operation_events WHERE operation_type = 'payment';")
+            self._psql('DELETE FROM payments;')
 
     def _check_degradation_and_worker_graceful_shutdown(self) -> None:
         """BIL-API-15, GW-NFR-R-01, BIL-NFR-R-09: DB outage yields 503; worker stops."""

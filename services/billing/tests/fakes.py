@@ -141,6 +141,8 @@ class InMemoryPurchaseRepository:
         provider_payment_id: str,
     ) -> FakePaymentRow | None:
         """Возвращает платёж по коду провайдера и внешнему номеру."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
         for payment in self.payments.values():
             if (
                 payment.provider_code == provider_code
