@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Callable, Sequence
+from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
@@ -246,9 +247,28 @@ class OutboxDispatcher:
                 raise ValueError('Missing subject or text in notifications payload')
 
             raw_available_at = task.payload.get('available_at')
-            available_at = (
-                str(raw_available_at) if raw_available_at is not None else None
-            )
+            if task.task_type == 'subscription_expiration_email' and (
+                not isinstance(raw_available_at, str) or not raw_available_at.strip()
+            ):
+                raise ValueError(
+                    'Missing available_at for subscription_expiration_email'
+                )
+            if raw_available_at is None:
+                available_at: str | None = None
+            else:
+                if (
+                    not isinstance(raw_available_at, str)
+                    or not raw_available_at.strip()
+                ):
+                    raise ValueError(
+                        'Invalid blank available_at in notifications payload'
+                    )
+                parsed_dt = datetime.fromisoformat(raw_available_at.strip())
+                if parsed_dt.tzinfo is None or parsed_dt.utcoffset() is None:
+                    raise ValueError(
+                        'available_at must be a timezone-aware ISO datetime'
+                    )
+                available_at = raw_available_at.strip()
         except (ValueError, TypeError) as exc:
             return 'permanent_error', f'Malformed notifications payload: {exc}'
 

@@ -94,8 +94,9 @@ class BillingIntegrationCheck:
         self._check_worker_background_reconcile_t17()
         self._check_yookassa_webhook_and_emulator_t18()
         self._check_outbox_worker_t19()
+        self._check_notifications_and_expiration_scheduling_t20_t21_t22()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06..T-19 live Docker checks passed.')
+        print('All Billing T-06..T-22 live Docker checks passed.')
 
     def _http(
         self,
@@ -1625,6 +1626,205 @@ class BillingIntegrationCheck:
         ).strip()
         if 't19-outbox-worker-ok' not in out:
             raise AssertionError(f'T-19 outbox worker live check failed: {out}')
+
+    def _ntf_psql(self, sql_query: str) -> subprocess.CompletedProcess[str]:
+        return self._compose_result(
+            'exec',
+            '-T',
+            'notifications-db',
+            'sh',
+            '-c',
+            f'psql -v ON_ERROR_STOP=1 -tA -U "$POSTGRES_USER" '
+            f'-d "$POSTGRES_DB" -c "{sql_query}"',
+        )
+
+    def _check_notifications_and_expiration_scheduling_t20_t21_t22(self) -> None:
+        """T-20, T-21, T-22 (NTF-FR-01, NTF-API-01, US-S-03): live campaign delivery."""
+        code = (
+            'import asyncio, httpx\n'
+            'from uuid import UUID, uuid4\n'
+            'from core.config import settings\n'
+            'async def check_t22():\n'
+            '    auth_url = str(settings.auth_client.service_url).rstrip("/")\n'
+            '    async with httpx.AsyncClient() as hc:\n'
+            '        signup = await hc.post(\n'
+            '            f"{auth_url}/api/v1/auth/signup",\n'
+            '            json={\n'
+            '                "login": f"SubT22_{uuid4().hex[:8]}",\n'
+            '                "password": "Saffron-Citadel-SubT22-2026!",\n'
+            '                "tz": "Europe/Moscow",\n'
+            '            },\n'
+            '            headers={"X-Request-Id": "t22-signup"},\n'
+            '        )\n'
+            '        real_uid = UUID(signup.json()["id"])\n'
+            '    print(f"real_uid={real_uid}")\n'
+            'asyncio.run(check_t22())\n'
+        )
+        uid_out = self._compose(
+            'exec', '-T', 'billing-api', 'python', '-c', code
+        ).strip()
+        real_uid = next(
+            line.split('=', 1)[1]
+            for line in uid_out.splitlines()
+            if line.startswith('real_uid=')
+        )
+        ins_real = self._ntf_psql(
+            f'INSERT INTO profiles '
+            f'(user_id, user_version, tz, likes, new_films, marketing) '
+            f"VALUES ('{real_uid}', 1, 'Europe/Moscow', false, false, false) "
+            f'ON CONFLICT (user_id) DO NOTHING;'
+        )
+        assert ins_real.returncode == 0, ins_real.stderr
+
+        run_code = (
+            'import asyncio, httpx\n'
+            'from uuid import UUID\n'
+            'from sqlalchemy import delete, select\n'
+            'from clients.auth import HttpAuthGateway\n'
+            'from clients.notifications import HttpNotificationsGateway\n'
+            'from clients.payment_provider import ProviderPaymentSnapshot\n'
+            'from core.config import ServiceSettings, settings\n'
+            'from db.sql.postgres import PostgresDatabase\n'
+            'from models import (\n'
+            '    OperationEvent,\n'
+            '    OutboxTask,\n'
+            '    Payment,\n'
+            '    Subscription,\n'
+            '    UserAccessVersion,\n'
+            ')\n'
+            'from repositories.purchase import SQLAlchemyPurchaseRepository\n'
+            'from services.outbox_dispatcher import OutboxDispatcher\n'
+            'from services.reconciler import PaymentReconciler\n'
+            'class StubProvT22:\n'
+            '    provider_code = "yookassa"\n'
+            '    def __init__(self, status, reason=None):\n'
+            '        self.status = status\n'
+            '        self.reason = reason\n'
+            '    async def create_payment(self, req):\n'
+            '        raise NotImplementedError\n'
+            '    async def get_payment(self, pid, **kwargs):\n'
+            '        return ProviderPaymentSnapshot(\n'
+            '            provider_code="yookassa",\n'
+            '            provider_payment_id=pid,\n'
+            '            domain_status=self.status,\n'
+            '            amount_kopeks=29900,\n'
+            '            currency="RUB",\n'
+            '            confirmation_url=None,\n'
+            '            failure_reason=self.reason,\n'
+            '            metadata_payment_id=str(kwargs.get("expected_payment_id")),\n'
+            '            provider_details={"status": self.status},\n'
+            '        )\n'
+            'async def run_t22():\n'
+            '    auth_url = str(settings.auth_client.service_url).rstrip("/")\n'
+            '    ntf_cfg = settings.notifications_client\n'
+            '    ntf_url = str(ntf_cfg.campaign_url).rstrip("/")\n'
+            '    ntf_key = ntf_cfg.campaign_api_key.get_secret_value()\n'
+            '    svc_key = ServiceSettings().api_key.get_secret_value()\n'
+            '    db = PostgresDatabase(settings.postgres.dsn)\n'
+            '    repo = SQLAlchemyPurchaseRepository(db.sessionmaker)\n'
+            f'    uid = UUID("{real_uid}")\n'
+            '    async with httpx.AsyncClient() as hc:\n'
+            '        auth_gw = HttpAuthGateway(\n'
+            '            http_client=hc, base_url=auth_url, service_api_key=svc_key\n'
+            '        )\n'
+            '        ntf_gw = HttpNotificationsGateway(\n'
+            '            http_client=hc, base_url=ntf_url, api_key=ntf_key\n'
+            '        )\n'
+            '        disp = OutboxDispatcher(\n'
+            '            repository=repo,\n'
+            '            auth_gateway=auth_gw,\n'
+            '            notifications_gateway=ntf_gw,\n'
+            '        )\n'
+            '        # 1. Failed payment -> payment_failed_email delivered\n'
+            '        p_fail, _ = await repo.get_or_create_pending_payment(uid)\n'
+            '        await repo.save_provider_payment_created(\n'
+            '            p_fail.id,\n'
+            '            provider_payment_id=f"yk-t22-f-{p_fail.id.hex[:8]}",\n'
+            '            confirmation_url="https://yoomoney.ru/checkout/t22f",\n'
+            '            provider_details={"id": "yk-t22-f"},\n'
+            '        )\n'
+            '        rec_f = PaymentReconciler(\n'
+            '            repository=repo,\n'
+            '            payment_provider=StubProvT22(\n'
+            '                "failed", "insufficient_funds"\n'
+            '            ),\n'
+            '            outbox_dispatcher=disp,\n'
+            '        )\n'
+            '        await rec_f.reconcile_payment(\n'
+            '            p_fail.id, source="webhook", respect_throttle=False\n'
+            '        )\n'
+            '        # 2. Succeeded -> sync_access + paid + expiration emails\n'
+            '        p_ok, _ = await repo.get_or_create_pending_payment(uid)\n'
+            '        await repo.save_provider_payment_created(\n'
+            '            p_ok.id,\n'
+            '            provider_payment_id=f"yk-t22-s-{p_ok.id.hex[:8]}",\n'
+            '            confirmation_url="https://yoomoney.ru/checkout/t22s",\n'
+            '            provider_details={"id": "yk-t22-s"},\n'
+            '        )\n'
+            '        rec_s = PaymentReconciler(\n'
+            '            repository=repo,\n'
+            '            payment_provider=StubProvT22("succeeded"),\n'
+            '            outbox_dispatcher=disp,\n'
+            '        )\n'
+            '        await rec_s.reconcile_payment(\n'
+            '            p_ok.id, source="webhook", respect_throttle=False\n'
+            '        )\n'
+            '        async with db.sessionmaker() as s:\n'
+            '            tasks = list((\n'
+            '                await s.scalars(\n'
+            '                    select(OutboxTask).where(\n'
+            '                        OutboxTask.user_id == uid\n'
+            '                    )\n'
+            '                )\n'
+            '            ).all())\n'
+            '            assert len(tasks) == 4\n'
+            '            assert all(t.status == "completed" for t in tasks)\n'
+            '            for pid in (p_fail.id, p_ok.id):\n'
+            '                await s.execute(\n'
+            '                    delete(OutboxTask).where(\n'
+            '                        OutboxTask.payment_id == pid\n'
+            '                    )\n'
+            '                )\n'
+            '                await s.execute(\n'
+            '                    delete(Subscription).where(\n'
+            '                        Subscription.payment_id == pid\n'
+            '                    )\n'
+            '                )\n'
+            '                await s.execute(\n'
+            '                    delete(OperationEvent).where(\n'
+            '                        OperationEvent.operation_id == pid\n'
+            '                    )\n'
+            '                )\n'
+            '                await s.execute(\n'
+            '                    delete(Payment).where(Payment.id == pid)\n'
+            '                )\n'
+            '            await s.execute(\n'
+            '                delete(UserAccessVersion).where(\n'
+            '                    UserAccessVersion.user_id == uid\n'
+            '                )\n'
+            '            )\n'
+            '            await s.commit()\n'
+            '    await db.close()\n'
+            '    print("t22-live-notifications-ok")\n'
+            'asyncio.run(run_t22())\n'
+        )
+        run_out = self._compose(
+            'exec', '-T', 'billing-api', 'python', '-c', run_code
+        ).strip()
+        if 't22-live-notifications-ok' not in run_out:
+            raise AssertionError(f'T-20/T-21/T-22 live check failed: {run_out}')
+
+        ntf_rows = self._ntf_psql(
+            f'SELECT count(*) FROM campaign_recipients r '
+            f'JOIN deliveries d ON d.delivery_id = r.delivery_id '
+            f"WHERE r.user_id = '{real_uid}' "
+            f"AND r.template_id = 'billing_notification' "
+            f'AND r.skip_reason IS NULL '
+            f"AND d.send_class = 'transactional' "
+            f'AND d.required_subscription IS NULL;'
+        ).stdout.strip()
+        if ntf_rows != '3':
+            raise AssertionError(f'Expected 3 transactional deliveries, got {ntf_rows}')
 
     def _check_degradation_and_worker_graceful_shutdown(self) -> None:
         """BIL-API-15, GW-NFR-R-01, BIL-NFR-R-09: DB outage yields 503; worker stops."""
