@@ -99,6 +99,38 @@ def test_personal_offer_has_external_policy_without_default_subject():
     assert get_template_spec("personal_offer").send_class == "bulk"
 
 
+def test_billing_notification_has_external_transactional_policy_without_subscription():
+    from notifications.template_registry import get_template_spec
+
+    spec = get_template_spec("billing_notification", external_only=True)
+    assert (spec.template_id, spec.html_file, spec.channel, spec.send_class) == (
+        "billing_notification",
+        "billing_notification.html",
+        "email",
+        "transactional",
+    )
+    assert spec.required_subscription is None
+    assert spec.external is True
+    assert spec.subject_file is None
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+def test_billing_notification_displays_literal_escaped_text_and_line_breaks(newline):
+    html = ENVIRONMENT.get_template("billing_notification.html").render(
+        first_name='<img src=x onerror="alert(1)">',
+        last_name="<script>surname</script>",
+        subject="Подписка <b>Премиум</b> {{ 6 * 7 }}",
+        text=newline.join(["<script>alert(1)</script>", "", "{{ 6 * 7 }} & МСК", ""]),
+    )
+    assert "<img src=x" not in html
+    assert "<script>" not in html
+    assert "<b>Премиум</b>" not in html
+    assert "&lt;img src=x onerror=&#34;alert(1)&#34;&gt;" in html
+    assert "&lt;script&gt;surname&lt;/script&gt;" in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;<br><br>{{ 6 * 7 }} &amp; МСК<br>" in html
+    assert "42" not in html
+
+
 @pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
 def test_personal_offer_displays_literal_escaped_text_and_line_breaks(newline):
     html = ENVIRONMENT.get_template("personal_offer.html").render(

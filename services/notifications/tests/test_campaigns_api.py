@@ -620,3 +620,69 @@ async def test_campaign_api_uses_configured_window(database_url):
                 == outbox.available_at
                 == datetime(2099, 1, 2, 5, 30, tzinfo=UTC)
             )
+
+
+async def test_billing_notification_ignores_marketing_optout_and_daytime_window(campaign_api):
+    """T-21 (NTF-FR-01, NTF-API-01): billing_notification принимается без marketing и окна."""
+    api, db = campaign_api
+    immediate_user, scheduled_user, campaign = uuid4(), uuid4(), uuid4()
+    await profiles(
+        db,
+        immediate_user,
+        scheduled_user,
+        likes=False,
+        new_films=False,
+        marketing=False,
+        tz="invalid-tz-still-ok-for-transactional",
+    )
+    future_night = "2099-01-01T23:15:00Z"
+    body = batch(
+        item(immediate_user)
+        | {
+            "template_id": "billing_notification",
+            "subject": "Подписка «Премиум» оплачена",
+            "text": "Доступ к новинкам открыт до 05.12.2026 15:00 МСК",
+            "available_at": None,
+        },
+        item(scheduled_user)
+        | {
+            "template_id": "billing_notification",
+            "subject": "Срок подписки «Премиум» закончился",
+            "text": "Срок действия вашей подписки истёк",
+            "available_at": future_night,
+        },
+    )
+    response = await api.post(f"{URL}/{campaign}/batches", json=body)
+    assert response.status_code == 202, response.text
+    assert response.json()["item_count"] == 2
+
+    async with db.transaction() as session:
+        imm_rec = await session.get(CampaignRecipient, (campaign, immediate_user))
+        sch_rec = await session.get(CampaignRecipient, (campaign, scheduled_user))
+        assert imm_rec is not None and imm_rec.skip_reason is None
+        assert sch_rec is not None and sch_rec.skip_reason is None
+
+        imm_del = await session.get(Delivery, imm_rec.delivery_id)
+        sch_del = await session.get(Delivery, sch_rec.delivery_id)
+        assert imm_del is not None
+        assert (imm_del.kind, imm_del.send_class, imm_del.required_subscription) == (
+            "external",
+            "transactional",
+            None,
+        )
+        assert sch_del is not None
+        assert (sch_del.kind, sch_del.send_class, sch_del.required_subscription) == (
+            "external",
+            "transactional",
+            None,
+        )
+        # Запланированное на ночное время письмо НЕ сдвигается на утро 10:00
+        sch_outbox = await session.scalar(
+            select(Outbox).where(Outbox.delivery_id == sch_del.delivery_id)
+        )
+        assert sch_outbox is not None
+        assert (
+            sch_del.next_attempt_at
+            == sch_outbox.available_at
+            == datetime(2099, 1, 1, 23, 15, tzinfo=UTC)
+        )

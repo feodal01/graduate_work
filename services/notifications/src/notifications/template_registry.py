@@ -53,6 +53,14 @@ _TEMPLATES = MappingProxyType(
             "marketing",
             True,
         ),
+        "billing_notification": TemplateSpec(
+            "billing_notification",
+            "billing_notification.html",
+            "email",
+            "transactional",
+            None,
+            True,
+        ),
     }
 )
 

@@ -493,3 +493,101 @@ async def test_recovered_uncertainty_survives_failure_but_not_acceptance(
     messages = await mail_messages(endpoints, uid)
     assert len(messages) == (2 if final_response is None else 1)
     assert len({message["MessageID"] for message in messages}) == 1
+
+
+async def test_billing_notification_sent_to_smtp_at_night_without_marketing(
+    database_url, endpoints, delivery_limiter, monkeypatch
+):
+    """T-21 (NTF-FR-01): billing_notification доставляется в Mailpit ночью при marketing=False."""
+    db = Database(database_url)
+    settings = Settings(
+        process="worker",
+        database_url=database_url,
+        rabbitmq_url=endpoints["RABBITMQ_URL"],
+        smtp_host=endpoints["SMTP_HOST"],
+        smtp_port=int(endpoints["SMTP_PORT"]),
+        smtp_from="sender@example.org",
+        smtp_starttls=False,
+        fallback_locale="ru",
+        fallback_tz="UTC",
+    )
+    worker = DeliveryWorker(
+        db,
+        settings,
+        send_class="transactional",
+        retry_seconds=1,
+        max_attempts=2,
+        limiter=delivery_limiter,
+        max_concurrency=2,
+        unavailable_retry_seconds=7,
+    )
+    night_utc = datetime(2026, 11, 5, 2, 15, tzinfo=UTC)
+    await clock(worker, monkeypatch, night_utc)
+    cid, bid, uid, did = uuid4(), uuid4(), uuid4(), uuid4()
+    async with db.transaction() as s:
+        s.add(
+            contact_profile(
+                user_id=uid,
+                user_version=1,
+                email=f"{uid}@example.org",
+                first_name="Иван",
+                last_name="Петров",
+                tz="Europe/Moscow",
+                likes=False,
+                new_films=False,
+                marketing=False,
+            )
+        )
+        s.add(Campaign(campaign_id=cid, created_at=night_utc))
+        await s.flush()
+        s.add(
+            CampaignBatch(
+                campaign_id=cid,
+                batch_id=bid,
+                request_hash="b" * 64,
+                item_count=1,
+                accepted_at=night_utc,
+            )
+        )
+        s.add(
+            Delivery(
+                delivery_id=did,
+                logical_key=f"campaign:{cid}:{uid}",
+                user_id=uid,
+                kind="external",
+                external_send_class="transactional",
+                required_subscription=None,
+                next_attempt_at=night_utc,
+            )
+        )
+        await s.flush()
+        s.add(
+            CampaignRecipient(
+                campaign_id=cid,
+                batch_id=bid,
+                user_id=uid,
+                delivery_id=did,
+                template_id="billing_notification",
+                channel="email",
+                subject="Подписка «Премиум» оплачена",
+                text="Оплата подтверждена.\nДоступ открыт до 05.12.2026 05:15 МСК.",
+                source_available_at=None,
+                effective_available_at=night_utc,
+            )
+        )
+        s.add(Outbox(delivery_id=did, available_at=night_utc))
+    try:
+        await worker.send_delivery(did)
+        async with db.transaction() as s:
+            delivery = await s.get(Delivery, did)
+            assert delivery is not None
+            assert (delivery.status, delivery.send_class, delivery.required_subscription) == (
+                "sent",
+                "transactional",
+                None,
+            )
+        messages = await mail_messages(endpoints, uid)
+        assert len(messages) == 1
+        assert messages[0]["Subject"] == "Подписка «Премиум» оплачена"
+    finally:
+        await db.close()

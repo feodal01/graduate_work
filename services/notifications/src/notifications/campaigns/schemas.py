@@ -126,7 +126,10 @@ class CampaignBatchRequest(BaseModel):
 
 
 # An external registry entry alone does not declare its accepted input schema.
-_TEMPLATE_INPUT_SCHEMAS = {"personal_offer": CampaignItem}
+_TEMPLATE_INPUT_SCHEMAS = {
+    "personal_offer": CampaignItem,
+    "billing_notification": CampaignItem,
+}
 
 
 def item_validation_error(index: int, field: str, message: str) -> ValidationError:
