@@ -48,7 +48,7 @@ def settings():
         bulk_rate=0.001,
         bulk_capacity=1,
         unavailable_retry_seconds=7,
-        redis_timeout_seconds=0.1,
+        redis_timeout_seconds=1.0,
     )
 
 
@@ -279,6 +279,7 @@ async def test_socket_timeout_fails_closed(settings):
             **{
                 **settings.model_dump(),
                 "redis_url": f"redis://127.0.0.1:{port}/0",
+                "redis_timeout_seconds": 0.1,
             }
         )
     )
