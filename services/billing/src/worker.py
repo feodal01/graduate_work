@@ -39,9 +39,11 @@ async def run_periodic_loop(
     stop_event: asyncio.Event,
 ) -> None:
     """Run step immediately on startup and then every interval_seconds until stopped."""
+    tracer = trace.get_tracer('billing.worker')
     while not stop_event.is_set():
         try:
-            await step()
+            with tracer.start_as_current_span(f'worker.{name}'):
+                await step()
         except Exception:
             logger.exception('Unexpected error in billing-worker %s loop', name)
         if await _sleep_or_stop(stop_event, interval_seconds):
@@ -177,13 +179,19 @@ async def main() -> None:
         outbox_dispatcher=outbox_dispatcher,
     )
 
+    runner_ref: list[BillingWorkerRunner] = []
+
+    def is_stopping() -> bool:
+        return bool(runner_ref and runner_ref[0].stop_event.is_set())
+
     async def reconcile_step() -> None:
         await reconciler.reconcile_due_pending_payments(
             min_age_seconds=settings.worker.reconcile_min_age_seconds,
+            should_stop=is_stopping,
         )
 
     async def outbox_step() -> None:
-        await outbox_dispatcher.process_due_tasks()
+        await outbox_dispatcher.process_due_tasks(should_stop=is_stopping)
 
     runner = BillingWorkerRunner(
         database,
@@ -193,6 +201,7 @@ async def main() -> None:
         outbox_step=outbox_step,
         tracer_provider=tracer_provider,
     )
+    runner_ref.append(runner)
     install_signal_handlers(asyncio.get_running_loop(), runner)
     try:
         await runner.run()

@@ -1,4 +1,5 @@
 import asyncio
+import signal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,7 +10,7 @@ import main
 from core.config import PostgresSettings, WorkerSettings
 from db.sql.postgres_health import PostgresHealthCheck
 from security.service_credentials import ServiceCredentials
-from worker import BillingWorkerRunner
+from worker import BillingWorkerRunner, install_signal_handlers, run_periodic_loop
 
 
 def test_postgres_and_worker_settings_defaults(
@@ -121,12 +122,56 @@ async def test_worker_runner_executes_initial_pass_and_stops_gracefully() -> Non
     tracer_provider.shutdown.assert_called_once_with()
 
 
-def test_gateway_and_compose_configuration_match_tz_requirements() -> None:
-    """Конфигурация gateway.conf и compose.yaml покрывает требования GW."""
+@pytest.mark.asyncio
+async def test_periodic_loop_survives_step_exception_and_signal_handlers() -> None:
+    """run_periodic_loop не падает при ошибке в step() и повторяет цикл по таймауту."""
+    stop_event = asyncio.Event()
+    calls = 0
+
+    async def flaky_step() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError('transient failure in step')
+        stop_event.set()
+
+    await asyncio.wait_for(
+        run_periodic_loop('flaky', flaky_step, 0.01, stop_event),
+        timeout=1.0,
+    )
+    assert calls == 2
+
+    # Проверяем регистрацию SIGINT и SIGTERM в install_signal_handlers
+    database = MagicMock()
+    database.close = AsyncMock()
+    runner = BillingWorkerRunner(
+        database,
+        reconcile_interval_seconds=60.0,
+        outbox_interval_seconds=60.0,
+    )
+    fake_loop = MagicMock()
+    install_signal_handlers(fake_loop, runner)
+    registered_signals = {
+        call.args[0] for call in fake_loop.add_signal_handler.call_args_list
+    }
+    assert registered_signals == {signal.SIGINT, signal.SIGTERM}
+
+
+def test_gateway_nginx_and_compose_configuration_match_tz_requirements() -> None:
+    """Конфигурация nginx.conf, gateway.conf и compose.yaml покрывает требования GW."""
     repo_root = Path(__file__).resolve().parents[3]
-    gateway_path = repo_root / 'infra' / 'nginx' / 'conf.d' / 'gateway.conf'
-    gateway_conf = gateway_path.read_text(encoding='utf-8')
+    nginx_conf = (repo_root / 'infra' / 'nginx' / 'nginx.conf').read_text(
+        encoding='utf-8'
+    )
+    gateway_conf = (
+        repo_root / 'infra' / 'nginx' / 'conf.d' / 'gateway.conf'
+    ).read_text(encoding='utf-8')
     compose_yaml = (repo_root / 'compose.yaml').read_text(encoding='utf-8')
+
+    assert 'map $http_x_request_id $req_id' in nginx_conf
+    assert 'proxy_set_header   X-Request-Id     $req_id;' in nginx_conf
+    assert 'proxy_set_header   X-Forwarded-Proto $scheme;' in nginx_conf
+    assert 'zone=billing_per_ip:10m rate=20r/s;' in nginx_conf
 
     assert 'set $billing_upstream billing-api:8000;' in gateway_conf
     assert 'location = /billing/health' in gateway_conf

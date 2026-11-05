@@ -5,6 +5,18 @@ import httpx
 import pytest
 from fastapi import Depends, FastAPI
 
+from clients.auth import (
+    AuthInvalidCredentialsError,
+    AuthRateLimitExceededError,
+    AuthServiceUnavailableError,
+    SubscriptionAccessSyncResult,
+)
+from dependencies import (
+    AuthenticatedUser,
+    get_auth_gateway,
+    require_api_user,
+    require_ui_user,
+)
 from main import create_app
 
 
@@ -30,24 +42,18 @@ class FakeAuthGateway:
         request_id: str,
     ) -> tuple[str, str]:
         """Эмулирует вход через Auth API."""
-        from clients.auth import (
-            AuthInvalidCredentialsError,
-            AuthRateLimitExceededError,
-            AuthServiceUnavailableError,
-        )
-
         self.last_request_id = request_id
+        if self.login_status == 429:
+            raise AuthRateLimitExceededError()
+        if self.login_status == 503:
+            raise AuthServiceUnavailableError()
         if (
             self.login_status == 200
             and login == self.user_login
             and password == 'secret'
         ):
             return self.access_token, self.refresh_token
-        if self.login_status == 401 or password != 'secret':
-            raise AuthInvalidCredentialsError()
-        if self.login_status == 429:
-            raise AuthRateLimitExceededError()
-        raise AuthServiceUnavailableError()
+        raise AuthInvalidCredentialsError()
 
     async def get_current_user(
         self,
@@ -56,11 +62,6 @@ class FakeAuthGateway:
         request_id: str,
     ) -> tuple[UUID, str, str]:
         """Эмулирует проверку токена и профиля пользователя в Auth."""
-        from clients.auth import (
-            AuthInvalidCredentialsError,
-            AuthServiceUnavailableError,
-        )
-
         self.last_request_id = request_id
         if self.profile_status == 503:
             raise AuthServiceUnavailableError()
@@ -86,10 +87,8 @@ class FakeAuthGateway:
         version: int,
         expires_at: str | None,
         request_id: str,
-    ) -> object:
+    ) -> SubscriptionAccessSyncResult:
         """Эмулирует запись состояния доступа."""
-        from clients.auth import SubscriptionAccessSyncResult
-
         return SubscriptionAccessSyncResult(applied=True, current_version=version)
 
 
@@ -99,8 +98,6 @@ async def login_client() -> AsyncGenerator[
     None,
 ]:
     """Создаёт тестовый клиент с подменённым AuthGateway."""
-    from dependencies import get_auth_gateway
-
     fake_auth = FakeAuthGateway()
     app = create_app(app_lifespan=None)
     app.dependency_overrides[get_auth_gateway] = lambda: fake_auth
@@ -128,6 +125,7 @@ async def test_get_login_renders_html_form_e1(
     html = response.text
     assert 'name="login"' in html
     assert 'name="password"' in html
+    assert 'name="next"' in html
     assert 'Войти' in html
 
 
@@ -135,7 +133,7 @@ async def test_get_login_renders_html_form_e1(
 async def test_post_login_valid_credentials_sets_httponly_cookies_and_redirects(
     login_client: tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],
 ) -> None:
-    """BIL-API-01: успешный вход ставит HttpOnly-cookie и редиректит на /billing/."""
+    """BIL-API-01: успешный вход ставит HttpOnly-cookie и редиректит."""
     client, _, fake_auth = login_client
 
     response = await client.post(
@@ -149,13 +147,78 @@ async def test_post_login_valid_credentials_sets_httponly_cookies_and_redirects(
 
     set_cookie_headers = response.headers.get_list('set-cookie')
     assert any(
-        'billing_access_token=valid-access-token' in header and 'HttpOnly' in header
+        'billing_access_token=valid-access-token' in header
+        and 'HttpOnly' in header
+        and 'SameSite=lax' in header
+        and 'Path=/' in header
         for header in set_cookie_headers
     )
     assert any(
-        'billing_refresh_token=valid-refresh-token' in header and 'HttpOnly' in header
+        'billing_refresh_token=valid-refresh-token' in header
+        and 'HttpOnly' in header
+        and 'SameSite=lax' in header
+        and 'Path=/' in header
         for header in set_cookie_headers
     )
+
+    # При X-Forwarded-Proto: https выставляется атрибут Secure
+    https_resp = await client.post(
+        '/billing/login',
+        data={
+            'login': 'cinema_viewer',
+            'password': 'secret',
+            'next': '/billing/payments/123',
+        },
+        headers={'X-Forwarded-Proto': 'https'},
+    )
+    assert https_resp.status_code == 303
+    assert https_resp.headers['location'] == '/billing/payments/123'
+    https_cookies = https_resp.headers.get_list('set-cookie')
+    assert all('Secure' in header for header in https_cookies)
+
+
+@pytest.mark.asyncio
+async def test_login_open_redirect_protection_and_xss_escaping(
+    login_client: tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],
+) -> None:
+    """Защита от Open Redirect в next и экранирование XSS (BIL-NFR-SEC-03)."""
+    client, _, fake_auth = login_client
+
+    for unsafe_next in (
+        'https://evil.example/phish',
+        '//evil.example/phish',
+        '/\\evil.example',
+        '/admin/billing/',
+        'javascript:alert(1)',
+    ):
+        resp = await client.post(
+            '/billing/login',
+            data={
+                'login': 'cinema_viewer',
+                'password': 'secret',
+                'next': unsafe_next,
+            },
+        )
+        assert resp.status_code == 303
+        assert resp.headers['location'] == '/billing/'
+
+    # Проверка экранирования XSS при 401 и 429
+    xss_payload = '"><script>alert(1)</script>'
+    resp_401 = await client.post(
+        '/billing/login',
+        data={'login': xss_payload, 'password': 'wrong'},
+    )
+    assert resp_401.status_code == 401
+    assert '<script>alert(1)</script>' not in resp_401.text
+    assert '&lt;script&gt;alert(1)&lt;/script&gt;' in resp_401.text
+
+    fake_auth.login_status = 429
+    resp_429 = await client.post(
+        '/billing/login',
+        data={'login': xss_payload, 'password': 'secret'},
+    )
+    assert resp_429.status_code == 429
+    assert '<script>alert(1)</script>' not in resp_429.text
 
 
 @pytest.mark.asyncio
@@ -215,8 +278,15 @@ async def test_post_login_when_auth_is_unavailable_renders_503_error_screen_e4(
 async def test_post_logout_clears_cookies_and_redirects_to_login(
     login_client: tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],
 ) -> None:
-    """BIL-API-01: POST /billing/logout чистит cookie и редиректит на /billing/login."""
+    """BIL-API-01: POST /billing/logout чистит cookie (и с ними, и без них)."""
     client, _, fake_auth = login_client
+
+    # Выход без cookie не вызывает Auth, но возвращает 303 на /billing/login
+    no_cookie_resp = await client.post('/billing/logout')
+    assert no_cookie_resp.status_code == 303
+    assert no_cookie_resp.headers['location'] == '/billing/login'
+    assert fake_auth.logout_called_with is None
+
     client.cookies.set('billing_access_token', 'valid-access-token')
     client.cookies.set('billing_refresh_token', 'valid-refresh-token')
 
@@ -236,9 +306,7 @@ async def test_post_logout_clears_cookies_and_redirects_to_login(
 async def test_ui_and_api_user_authentication_redirects_or_returns_401_and_503(
     login_client: tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],
 ) -> None:
-    """BIL-NFR-SEC-03: без токена экран редиректит на вход, а при сбое Auth даёт 503."""
-    from dependencies import AuthenticatedUser, require_api_user, require_ui_user
-
+    """BIL-NFR-SEC-03: без токена экран редиректит на вход с next, при сбое — 503."""
     client, app, fake_auth = login_client
 
     @app.get('/billing/protected-probe')
@@ -251,29 +319,45 @@ async def test_ui_and_api_user_authentication_redirects_or_returns_401_and_503(
     async def api_probe(
         user: AuthenticatedUser = Depends(require_api_user),
     ) -> dict[str, str]:
-        return {'user_id': str(user.user_id), 'login': user.login, 'tz': user.tz}
+        return {'login': user.login, 'tz': user.tz}
 
-    # 1. Без cookie экран редиректит на /billing/login, а API возвращает 401
-    ui_unauth = await client.get('/billing/protected-probe')
-    assert ui_unauth.status_code == 303
-    assert ui_unauth.headers['location'] == '/billing/login'
+    # 1. Экран без cookie -> 303 редирект на /billing/login?next=...
+    unauth_ui = await client.get('/billing/protected-probe')
+    assert unauth_ui.status_code == 303
+    assert (
+        unauth_ui.headers['location'] == '/billing/login?next=/billing/protected-probe'
+    )
 
-    api_unauth = await client.get('/api/v1/billing/protected-probe')
-    assert api_unauth.status_code == 401
-    assert api_unauth.json()['error_code'] == 'unauthenticated'
+    # 2. JSON API без токена -> 401
+    unauth_api = await client.get('/api/v1/billing/protected-probe')
+    assert unauth_api.status_code == 401
+    assert unauth_api.json()['error_code'] == 'unauthenticated'
 
-    # 2. С валидной cookie возвращается подтверждённый пользователь и его tz
+    # 3. С валидным cookie экран пропускает пользователя
     client.cookies.set('billing_access_token', 'valid-access-token')
-    ui_ok = await client.get('/billing/protected-probe')
-    assert ui_ok.status_code == 200
-    assert ui_ok.json() == {'login': 'cinema_viewer', 'tz': 'Europe/Moscow'}
+    ok_ui = await client.get('/billing/protected-probe')
+    assert ok_ui.status_code == 200
+    assert ok_ui.json() == {'login': 'cinema_viewer', 'tz': 'Europe/Moscow'}
 
-    # 3. При недоступности Auth возвращается 503 (экран Э4 для HTML и 503 JSON для API)
+    # 4. С валидным заголовком Authorization: Bearer JSON API тоже работает
+    client.cookies.clear()
+    ok_api = await client.get(
+        '/api/v1/billing/protected-probe',
+        headers={'Authorization': 'Bearer valid-access-token'},
+    )
+    assert ok_api.status_code == 200
+    assert ok_api.json() == {'login': 'cinema_viewer', 'tz': 'Europe/Moscow'}
+
+    # 5. При недоступности Auth экран возвращает 503 Э4, а JSON API — 503 JSON
     fake_auth.profile_status = 503
-    ui_degraded = await client.get('/billing/protected-probe')
-    assert ui_degraded.status_code == 503
-    assert 'Сервис авторизации временно недоступен' in ui_degraded.text
+    client.cookies.set('billing_access_token', 'valid-access-token')
+    down_ui = await client.get('/billing/protected-probe')
+    assert down_ui.status_code == 503
+    assert 'Сервис авторизации временно недоступен' in down_ui.text
 
-    api_degraded = await client.get('/api/v1/billing/protected-probe')
-    assert api_degraded.status_code == 503
-    assert api_degraded.json()['error_code'] == 'auth_unavailable'
+    down_api = await client.get(
+        '/api/v1/billing/protected-probe',
+        headers={'Authorization': 'Bearer valid-access-token'},
+    )
+    assert down_api.status_code == 503
+    assert down_api.json()['error_code'] == 'auth_unavailable'

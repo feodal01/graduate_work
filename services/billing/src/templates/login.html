@@ -10,6 +10,7 @@
 {% endif %}
 
 <form method="post" action="/billing/login">
+    <input type="hidden" name="next" value="{{ next_url or '/billing/' }}">
     <div class="field">
         <label for="login">Логин</label>
         <input id="login" name="login" type="text" value="{{ login_value or '' }}" required autocomplete="username">

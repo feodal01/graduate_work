@@ -1,7 +1,8 @@
 from typing import Annotated
+from urllib.parse import urlsplit
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Form, Request, status
+from fastapi import APIRouter, Depends, Form, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from api.errors import BillingDomainError
@@ -38,13 +39,46 @@ def parse_ui_payment_id(payment_id: str) -> UUID:
         ) from exc
 
 
+def sanitize_next_url(raw_next: str | None) -> str:
+    """Разрешает редирект только на локальные пути /billing* (без Open Redirect)."""
+    if not raw_next:
+        return '/billing/'
+    candidate = raw_next.strip()
+    if (
+        not candidate.startswith('/billing')
+        or candidate.startswith('//')
+        or candidate.startswith('/\\')
+        or '\\' in candidate
+        or '\r' in candidate
+        or '\n' in candidate
+    ):
+        return '/billing/'
+    parsed = urlsplit(candidate)
+    if parsed.scheme or parsed.netloc:
+        return '/billing/'
+    return candidate
+
+
+def _is_secure_request(request: Request) -> bool:
+    forwarded_proto = request.headers.get('X-Forwarded-Proto', '')
+    first_proto = forwarded_proto.split(',', 1)[0].strip().lower()
+    return request.url.scheme == 'https' or first_proto == 'https'
+
+
 @router.get('/login', response_class=HTMLResponse)
-async def get_login_page(request: Request) -> HTMLResponse:
+async def get_login_page(
+    request: Request,
+    next_url: Annotated[str | None, Query(alias='next')] = None,
+) -> HTMLResponse:
     """Экран входа Э1 (BIL-API-01, BIL-FR-12)."""
     return templates.TemplateResponse(
         request=request,
         name='login.html',
-        context={'error_message': None, 'login_value': ''},
+        context={
+            'error_message': None,
+            'login_value': '',
+            'next_url': sanitize_next_url(next_url),
+        },
     )
 
 
@@ -54,8 +88,10 @@ async def submit_login_form(
     auth_gateway: Annotated[AuthGateway, Depends(get_auth_gateway)],
     login: str = Form(default=''),
     password: str = Form(default=''),
+    next_url: Annotated[str, Form(alias='next')] = '/billing/',
 ) -> Response:
     """Проверка логина/пароля через Auth и сохранение токенов в HttpOnly-cookie."""
+    safe_next = sanitize_next_url(next_url)
     request_id = get_current_request_id()
     try:
         access_token, refresh_token = await auth_gateway.login(
@@ -70,6 +106,7 @@ async def submit_login_form(
             context={
                 'error_message': 'Неверный логин или пароль',
                 'login_value': login,
+                'next_url': safe_next,
             },
             status_code=status.HTTP_401_UNAUTHORIZED,
         )
@@ -82,6 +119,7 @@ async def submit_login_form(
                     'Слишком много попыток входа, попробуйте через минуту'
                 ),
                 'login_value': login,
+                'next_url': safe_next,
             },
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
         )
@@ -92,14 +130,16 @@ async def submit_login_form(
             message='Сервис авторизации временно недоступен',
         )
 
+    secure_cookie = _is_secure_request(request)
     redirect = RedirectResponse(
-        url='/billing/',
+        url=safe_next,
         status_code=status.HTTP_303_SEE_OTHER,
     )
     redirect.set_cookie(
         key=ACCESS_TOKEN_COOKIE,
         value=access_token,
         httponly=True,
+        secure=secure_cookie,
         samesite='lax',
         path='/',
     )
@@ -107,6 +147,7 @@ async def submit_login_form(
         key=REFRESH_TOKEN_COOKIE,
         value=refresh_token,
         httponly=True,
+        secure=secure_cookie,
         samesite='lax',
         path='/',
     )
@@ -127,12 +168,25 @@ async def submit_logout(
             refresh_token,
             request_id=get_current_request_id(),
         )
+    secure_cookie = _is_secure_request(request)
     redirect = RedirectResponse(
         url='/billing/login',
         status_code=status.HTTP_303_SEE_OTHER,
     )
-    redirect.delete_cookie(key=ACCESS_TOKEN_COOKIE, path='/')
-    redirect.delete_cookie(key=REFRESH_TOKEN_COOKIE, path='/')
+    redirect.delete_cookie(
+        key=ACCESS_TOKEN_COOKIE,
+        path='/',
+        httponly=True,
+        secure=secure_cookie,
+        samesite='lax',
+    )
+    redirect.delete_cookie(
+        key=REFRESH_TOKEN_COOKIE,
+        path='/',
+        httponly=True,
+        secure=secure_cookie,
+        samesite='lax',
+    )
     return redirect
 
 

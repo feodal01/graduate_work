@@ -97,8 +97,28 @@ async def migrated_billing_db() -> AsyncIterator[async_sessionmaker[AsyncSession
 async def test_migration_seeds_tariffs_and_providers_and_enforces_synchronous_commit(
     migrated_billing_db: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Миграция заполняет справочники и включает synchronous_commit=on."""
+    """Миграция обратима (downgrade -> upgrade) и включает synchronous_commit=on."""
     session_factory = migrated_billing_db
+    async with session_factory() as session:
+        db_name = str(await session.scalar(text('SELECT current_database()')))
+
+    # Проверяем обратимость миграции: downgrade base -> 0 таблиц -> upgrade head
+    await _run_alembic(db_name, 'downgrade', 'base')
+    async with session_factory() as session:
+        tables_after_down = list(
+            (
+                await session.scalars(
+                    text(
+                        'SELECT tablename FROM pg_tables '
+                        "WHERE schemaname = 'public' AND tablename <> 'alembic_version'"
+                    )
+                )
+            ).all()
+        )
+        assert tables_after_down == []
+
+    await _run_alembic(db_name, 'upgrade', 'head')
+
     async with session_factory() as session:
         sync_commit = await session.scalar(text('SHOW synchronous_commit'))
         assert sync_commit == 'on'
@@ -681,7 +701,24 @@ async def test_t11_atomic_reconciliation_succeeded_failed_and_concurrent_race(
         assert fail_tasks[0].task_type == 'payment_failed_email'
         assert fail_tasks[0].payload['failure_reason'] == 'insufficient_funds'
 
-    # 6. T-12: проверяем get_local_payment_result_for_user
+
+async def test_t12_t13_t16_and_t17_repository_queries_and_skip_locked(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """T-12, T-13, T-16, T-17: локальный результат и SKIP LOCKED в PostgreSQL."""
+    from repositories.purchase import (
+        DeliveryOutcome,
+        OutboxTaskRecordProtocol,
+        SQLAlchemyPurchaseRepository,
+    )
+
+    session_factory = migrated_billing_db
+    repo = SQLAlchemyPurchaseRepository(session_factory)
+    user_id = uuid4()
+    payment, _ = await repo.get_or_create_pending_payment(user_id)
+    await repo.finalize_payment_succeeded(payment.id, source='webhook')
+
+    # 1. T-12: проверяем get_local_payment_result_for_user
     local_own = await repo.get_local_payment_result_for_user(payment.id, user_id)
     assert local_own is not None
     assert local_own.status == 'succeeded'
@@ -708,20 +745,18 @@ async def test_t11_atomic_reconciliation_succeeded_failed_and_concurrent_race(
     local_foreign = await repo.get_local_payment_result_for_user(payment.id, uuid4())
     assert local_foreign is None
 
-    # 7. T-13: проверяем get_payment_for_user для своего и чужого пользователя
+    # 2. T-13: проверяем get_payment_for_user для своего и чужого пользователя
     own_pay = await repo.get_payment_for_user(payment.id, user_id)
     assert own_pay is not None and own_pay.id == payment.id
     foreign_pay = await repo.get_payment_for_user(payment.id, uuid4())
     assert foreign_pay is None
 
-    # 8. T-16: проверяем FOR UPDATE SKIP LOCKED в process_due_auth_outbox_tasks
+    # 3. T-16: проверяем FOR UPDATE SKIP LOCKED в process_due_auth_outbox_tasks
     user_3 = uuid4()
     pay_3, _ = await repo.get_or_create_pending_payment(user_3)
     await repo.finalize_payment_succeeded(pay_3.id, source='webhook')
 
     delivered_calls: list[int] = []
-
-    from repositories.purchase import DeliveryOutcome, OutboxTaskRecordProtocol
 
     async def deliver_ok(
         task: OutboxTaskRecordProtocol,
@@ -740,7 +775,7 @@ async def test_t11_atomic_reconciliation_succeeded_failed_and_concurrent_race(
     local_after = await repo.get_local_payment_result_for_user(pay_3.id, user_3)
     assert local_after is not None and local_after.auth_access_delivered is True
 
-    # 9. T-17: проверяем list_due_pending_payments с отступом min_age_seconds
+    # 4. T-17: проверяем list_due_pending_payments с отступом min_age_seconds
     now_t17 = datetime.now(UTC)
     young_pay_id = uuid4()
     mature_pay_id = uuid4()

@@ -1,9 +1,11 @@
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import UUID
+
+from opentelemetry import trace
 
 from clients.payment_provider import (
     CreateProviderPaymentRequest,
@@ -165,18 +167,31 @@ class PaymentReconciler:
         *,
         min_age_seconds: float,
         limit: int = 20,
+        should_stop: Callable[[], bool] | None = None,
     ) -> int:
         """Фоновая сверка платежей старше min_age_seconds (T-17, BIL-FR-05)."""
         processed = 0
         throttle_sec = CHECK_THROTTLE_WINDOW.total_seconds()
+        tracer = trace.get_tracer('billing.reconciler')
         for _ in range(limit):
+            if should_stop is not None and should_stop():
+                break
             payment = await self._repo.claim_next_due_pending_payment(
                 min_age_seconds=min_age_seconds,
                 throttle_seconds=throttle_sec,
             )
             if payment is None:
                 break
-            with correlation_request_id(f'reconcile-{payment.id}'):
+            with (
+                correlation_request_id(f'reconcile-{payment.id}') as req_id,
+                tracer.start_as_current_span(
+                    'billing.reconcile_payment',
+                    attributes={
+                        'request_id': req_id,
+                        'payment_id': str(payment.id),
+                    },
+                ),
+            ):
                 try:
                     await self._reconcile_background_payment(payment)
                     processed += 1

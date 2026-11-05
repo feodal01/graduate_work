@@ -141,7 +141,7 @@ class HttpAuthGateway:
             logger.warning('Auth profile check failed: %s', exc)
             raise AuthServiceUnavailableError() from exc
 
-        if response.status_code == 401:
+        if response.status_code in (401, 403, 422):
             raise AuthInvalidCredentialsError()
         if response.status_code != 200:
             logger.error(

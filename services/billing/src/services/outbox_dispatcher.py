@@ -1,6 +1,9 @@
 import logging
+from collections.abc import Callable
 from typing import Protocol
 from uuid import UUID
+
+from opentelemetry import trace
 
 from clients.auth import (
     AuthGateway,
@@ -25,6 +28,7 @@ class OutboxRepositoryProtocol(Protocol):
         payment_id: UUID | None = None,
         limit: int = 20,
         max_attempts: int = 20,
+        should_stop: Callable[[], bool] | None = None,
     ) -> int: ...
 
 
@@ -59,20 +63,37 @@ class OutboxDispatcher:
             )
             return 0
 
-    async def process_due_tasks(self, *, limit: int = 20) -> int:
+    async def process_due_tasks(
+        self,
+        *,
+        limit: int = 20,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> int:
         """Периодический проход по готовым задачам доступа (для воркера)."""
         return await self._repo.process_due_auth_outbox_tasks(
             self._deliver_auth_task,
             payment_id=None,
             limit=limit,
             max_attempts=self._max_attempts,
+            should_stop=should_stop,
         )
 
     async def _deliver_auth_task(
         self,
         task: OutboxTaskRecordProtocol,
     ) -> tuple[DeliveryOutcome, str | None]:
-        with correlation_request_id(f'outbox-{task.id}') as request_id:
+        tracer = trace.get_tracer('billing.outbox')
+        with (
+            correlation_request_id(f'outbox-{task.id}') as request_id,
+            tracer.start_as_current_span(
+                'billing.outbox_deliver',
+                attributes={
+                    'request_id': request_id,
+                    'task_id': str(task.id),
+                    'payment_id': str(task.payment_id),
+                },
+            ),
+        ):
             try:
                 raw_version = (
                     task.access_version

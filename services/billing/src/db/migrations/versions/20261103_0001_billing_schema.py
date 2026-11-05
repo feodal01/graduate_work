@@ -45,7 +45,7 @@ def upgrade() -> None:
         sa.Column('id', sa.Uuid(), nullable=False),
         sa.Column('code', sa.String(length=64), nullable=False),
         sa.Column('title', sa.String(length=128), nullable=False),
-        sa.Column('price_kopeks', sa.Integer(), nullable=False),
+        sa.Column('price_kopeks', sa.BigInteger(), nullable=False),
         sa.Column(
             'currency',
             sa.CHAR(length=3),
@@ -65,6 +65,8 @@ def upgrade() -> None:
             server_default=sa.text('now()'),
             nullable=False,
         ),
+        sa.CheckConstraint("btrim(code) <> ''", name='ck_tariffs_code'),
+        sa.CheckConstraint("btrim(title) <> ''", name='ck_tariffs_title'),
         sa.CheckConstraint('price_kopeks > 0', name='ck_tariffs_price_kopeks'),
         sa.CheckConstraint('duration_days > 0', name='ck_tariffs_duration_days'),
         sa.CheckConstraint("currency = 'RUB'", name='ck_tariffs_currency'),
@@ -78,7 +80,7 @@ def upgrade() -> None:
         sa.Column('user_id', sa.Uuid(), nullable=False),
         sa.Column('tariff_id', sa.Uuid(), nullable=False),
         sa.Column('provider_code', sa.String(length=32), nullable=False),
-        sa.Column('amount_kopeks', sa.Integer(), nullable=False),
+        sa.Column('amount_kopeks', sa.BigInteger(), nullable=False),
         sa.Column(
             'currency',
             sa.CHAR(length=3),
@@ -118,6 +120,10 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "status IN ('pending', 'succeeded', 'failed')",
             name='ck_payments_status',
+        ),
+        sa.CheckConstraint(
+            "provider_payment_id IS NULL OR btrim(provider_payment_id) <> ''",
+            name='ck_payments_provider_payment_id_nonblank',
         ),
         sa.ForeignKeyConstraint(
             ['provider_code'],
@@ -214,7 +220,7 @@ def upgrade() -> None:
         sa.Column('payment_id', sa.Uuid(), nullable=False),
         sa.Column('subscription_id', sa.Uuid(), nullable=False),
         sa.Column('provider_code', sa.String(length=32), nullable=False),
-        sa.Column('amount_kopeks', sa.Integer(), nullable=False),
+        sa.Column('amount_kopeks', sa.BigInteger(), nullable=False),
         sa.Column(
             'currency',
             sa.CHAR(length=3),
@@ -257,6 +263,10 @@ def upgrade() -> None:
             name='ck_refunds_status',
         ),
         sa.CheckConstraint("btrim(reason) <> ''", name='ck_refunds_reason_not_empty'),
+        sa.CheckConstraint(
+            "provider_refund_id IS NULL OR btrim(provider_refund_id) <> ''",
+            name='ck_refunds_provider_refund_id_nonblank',
+        ),
         sa.ForeignKeyConstraint(
             ['payment_id'],
             ['payments.id'],
@@ -403,6 +413,13 @@ def upgrade() -> None:
         unique=False,
     )
     op.create_index(
+        'ix_outbox_tasks_pending_poll',
+        'outbox_tasks',
+        ['target_service', 'next_retry_at', 'created_at'],
+        unique=False,
+        postgresql_where=sa.text("status = 'pending'"),
+    )
+    op.create_index(
         'ix_outbox_tasks_user_id',
         'outbox_tasks',
         ['user_id'],
@@ -533,6 +550,7 @@ def downgrade() -> None:
 
     op.drop_index('ix_outbox_tasks_payment_id', table_name='outbox_tasks')
     op.drop_index('ix_outbox_tasks_user_id', table_name='outbox_tasks')
+    op.drop_index('ix_outbox_tasks_pending_poll', table_name='outbox_tasks')
     op.drop_index('ix_outbox_tasks_status_next_retry_at', table_name='outbox_tasks')
     op.drop_table('outbox_tasks')
 

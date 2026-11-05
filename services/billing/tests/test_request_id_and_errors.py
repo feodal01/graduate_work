@@ -3,6 +3,7 @@ import pytest
 from pydantic import BaseModel, Field
 
 from api.errors import BillingDomainError, InvalidServiceCredentialsError
+from core.observability import get_current_request_id
 from db.sql.errors import DatabaseUnavailableError
 from main import create_app
 
@@ -12,8 +13,8 @@ class SamplePayload(BaseModel):
 
 
 @pytest.mark.asyncio
-async def test_request_without_request_id_is_rejected() -> None:
-    """Billing rejects requests without X-Request-Id (NFR-S-01, NFR-U-02)."""
+async def test_api_request_without_or_blank_request_id_is_rejected() -> None:
+    """API routes reject missing or whitespace X-Request-Id (NFR-S-01, NFR-U-02)."""
     app = create_app(app_lifespan=None)
     transport = httpx.ASGITransport(app=app)
 
@@ -21,13 +22,50 @@ async def test_request_without_request_id_is_rejected() -> None:
         transport=transport,
         base_url='http://testserver',
     ) as client:
-        response = await client.get('/billing/openapi.json')
+        missing_resp = await client.get('/billing/openapi.json')
+        blank_resp = await client.get(
+            '/billing/openapi.json',
+            headers={'X-Request-Id': '    '},
+        )
 
-    assert response.status_code == 400
-    assert response.json() == {
-        'error_code': 'missing_request_id',
-        'detail': 'X-Request-Id is required',
-    }
+    for response in (missing_resp, blank_resp):
+        assert response.status_code == 400
+        assert response.json() == {
+            'error_code': 'missing_request_id',
+            'detail': 'X-Request-Id is required',
+        }
+
+
+@pytest.mark.asyncio
+async def test_browser_ui_route_generates_request_id_and_echoes_header() -> None:
+    """Browser HTML routes under /billing/* auto-generate X-Request-Id if absent."""
+    app = create_app(app_lifespan=None)
+    seen_context_ids: list[str] = []
+
+    @app.get('/billing/probe-req-id')
+    async def probe_ui() -> dict[str, str]:
+        seen_context_ids.append(get_current_request_id())
+        return {'request_id': get_current_request_id()}
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url='http://testserver',
+    ) as client:
+        gen_resp = await client.get('/billing/probe-req-id')
+        pass_resp = await client.get(
+            '/billing/probe-req-id',
+            headers={'X-Request-Id': 'incoming-req-42'},
+        )
+
+    assert gen_resp.status_code == 200
+    generated_id = gen_resp.headers['X-Request-Id']
+    assert generated_id.startswith('ui-')
+    assert seen_context_ids[0] == generated_id
+
+    assert pass_resp.status_code == 200
+    assert pass_resp.headers['X-Request-Id'] == 'incoming-req-42'
+    assert seen_context_ids[1] == 'incoming-req-42'
 
 
 @pytest.mark.asyncio

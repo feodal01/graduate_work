@@ -65,6 +65,8 @@ class Tariff(Base):
     __tablename__ = 'tariffs'
     __table_args__ = (
         UniqueConstraint('code', name='uq_tariffs_code'),
+        CheckConstraint("btrim(code) <> ''", name='ck_tariffs_code'),
+        CheckConstraint("btrim(title) <> ''", name='ck_tariffs_title'),
         CheckConstraint('price_kopeks > 0', name='ck_tariffs_price_kopeks'),
         CheckConstraint('duration_days > 0', name='ck_tariffs_duration_days'),
         CheckConstraint("currency = 'RUB'", name='ck_tariffs_currency'),
@@ -78,7 +80,7 @@ class Tariff(Base):
     )
     code: Mapped[str] = mapped_column(String(64), nullable=False)
     title: Mapped[str] = mapped_column(String(128), nullable=False)
-    price_kopeks: Mapped[int] = mapped_column(Integer, nullable=False)
+    price_kopeks: Mapped[int] = mapped_column(BigInteger, nullable=False)
     currency: Mapped[str] = mapped_column(
         CHAR(3),
         default='RUB',
@@ -116,6 +118,10 @@ class Payment(Base):
             "status IN ('pending', 'succeeded', 'failed')",
             name='ck_payments_status',
         ),
+        CheckConstraint(
+            "provider_payment_id IS NULL OR btrim(provider_payment_id) <> ''",
+            name='ck_payments_provider_payment_id_nonblank',
+        ),
         Index(
             'uq_payments_user_pending',
             'user_id',
@@ -144,7 +150,7 @@ class Payment(Base):
         ForeignKey('payment_providers.code', ondelete='RESTRICT'),
         nullable=False,
     )
-    amount_kopeks: Mapped[int] = mapped_column(Integer, nullable=False)
+    amount_kopeks: Mapped[int] = mapped_column(BigInteger, nullable=False)
     currency: Mapped[str] = mapped_column(
         CHAR(3),
         default='RUB',
@@ -186,17 +192,15 @@ class Payment(Base):
         nullable=False,
     )
 
-    tariff: Mapped[Tariff] = relationship(lazy='selectin')
+    tariff: Mapped[Tariff] = relationship()
     subscription: Mapped['Subscription | None'] = relationship(
         back_populates='payment',
         uselist=False,
-        lazy='selectin',
     )
     refunds: Mapped[list['Refund']] = relationship(
         back_populates='payment',
         foreign_keys='[Refund.payment_id]',
         primaryjoin='Payment.id == Refund.payment_id',
-        lazy='selectin',
     )
 
 
@@ -244,14 +248,12 @@ class Subscription(Base):
         nullable=False,
     )
 
-    tariff: Mapped[Tariff] = relationship(lazy='selectin')
+    tariff: Mapped[Tariff] = relationship()
     payment: Mapped[Payment] = relationship(
         back_populates='subscription',
-        lazy='selectin',
     )
     refunds: Mapped[list['Refund']] = relationship(
         back_populates='subscription',
-        lazy='selectin',
     )
 
 
@@ -277,6 +279,10 @@ class Refund(Base):
             name='ck_refunds_status',
         ),
         CheckConstraint("btrim(reason) <> ''", name='ck_refunds_reason_not_empty'),
+        CheckConstraint(
+            "provider_refund_id IS NULL OR btrim(provider_refund_id) <> ''",
+            name='ck_refunds_provider_refund_id_nonblank',
+        ),
         Index(
             'uq_refunds_payment_active_or_succeeded',
             'payment_id',
@@ -309,7 +315,7 @@ class Refund(Base):
         ForeignKey('payment_providers.code', ondelete='RESTRICT'),
         nullable=False,
     )
-    amount_kopeks: Mapped[int] = mapped_column(Integer, nullable=False)
+    amount_kopeks: Mapped[int] = mapped_column(BigInteger, nullable=False)
     currency: Mapped[str] = mapped_column(
         CHAR(3),
         default='RUB',
@@ -356,11 +362,9 @@ class Refund(Base):
         back_populates='refunds',
         foreign_keys=[payment_id],
         primaryjoin='Refund.payment_id == Payment.id',
-        lazy='selectin',
     )
     subscription: Mapped[Subscription] = relationship(
         back_populates='refunds',
-        lazy='selectin',
     )
 
 
@@ -403,6 +407,13 @@ class OutboxTask(Base):
         ),
         CheckConstraint('attempts >= 0', name='ck_outbox_tasks_attempts'),
         Index('ix_outbox_tasks_status_next_retry_at', 'status', 'next_retry_at'),
+        Index(
+            'ix_outbox_tasks_pending_poll',
+            'target_service',
+            'next_retry_at',
+            'created_at',
+            postgresql_where=text("status = 'pending'"),
+        ),
         Index('ix_outbox_tasks_user_id', 'user_id'),
         Index('ix_outbox_tasks_payment_id', 'payment_id'),
     )

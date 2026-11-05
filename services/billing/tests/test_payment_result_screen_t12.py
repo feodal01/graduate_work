@@ -314,13 +314,16 @@ async def test_result_screen_unhappy_foreign_unknown_unauth_and_auth_down(
     assert 'text/html' in resp_bad_uuid.headers['content-type']
     assert 'Платёж не найден' in resp_bad_uuid.text
 
-    # 4. Запрос без токена -> 303 редирект на /billing/login
+    # 4. Запрос без токена -> 303 редирект на /billing/login?next=...
     resp_unauth = await client.get(
         f'/billing/payments/{foreign_payment.id}',
         headers={'X-Request-Id': 'unauth-req', 'Authorization': ''},
     )
     assert resp_unauth.status_code == 303
-    assert resp_unauth.headers['location'] == '/billing/login'
+    assert (
+        resp_unauth.headers['location']
+        == f'/billing/login?next=/billing/payments/{foreign_payment.id}'
+    )
 
     # 5. Auth недоступен -> 503 экран ошибки Э4 без раскрытия данных платежа
     auth.unavailable = True

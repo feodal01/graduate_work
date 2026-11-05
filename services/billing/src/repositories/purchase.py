@@ -182,6 +182,7 @@ class PurchaseRepository(Protocol):
         payment_id: UUID | None = None,
         limit: int = 20,
         max_attempts: int = 20,
+        should_stop: Callable[[], bool] | None = None,
     ) -> int: ...
 
 
@@ -859,11 +860,14 @@ class SQLAlchemyPurchaseRepository:
         payment_id: UUID | None = None,
         limit: int = 20,
         max_attempts: int = 20,
+        should_stop: Callable[[], bool] | None = None,
     ) -> int:
         """Выбирает и обрабатывает задачи Auth под SKIP LOCKED (BIL-FR-11)."""
         processed = 0
         try:
             for _ in range(limit):
+                if should_stop is not None and should_stop():
+                    break
                 async with self._session_factory() as session:
                     now_utc = datetime.now(UTC)
                     stmt = (

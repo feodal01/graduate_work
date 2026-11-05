@@ -66,7 +66,13 @@ async def bind_request_id(
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
     """Делает X-Request-Id от nginx доступным логам и Sentry."""
-    request_id = request.headers.get(REQUEST_ID_HEADER) or NO_REQUEST_ID
+    state_req_id = getattr(request.state, 'request_id', None)
+    header_req_id = request.headers.get(REQUEST_ID_HEADER, '').strip()
+    request_id = (
+        state_req_id
+        if isinstance(state_req_id, str) and state_req_id
+        else (header_req_id or NO_REQUEST_ID)
+    )
     token = _request_id.set(request_id)
     sentry_sdk.set_tag('request_id', request_id)
     try:

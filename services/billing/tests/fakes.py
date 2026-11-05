@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -485,6 +486,7 @@ class InMemoryPurchaseRepository:
         payment_id: UUID | None = None,
         limit: int = 20,
         max_attempts: int = 20,
+        should_stop: Callable[[], bool] | None = None,
     ) -> int:
         """Обрабатывает готовые задачи Auth в in-memory репозитории."""
         import logging
@@ -506,6 +508,8 @@ class InMemoryPurchaseRepository:
             and (payment_id is None or task.payment_id == payment_id)
         ]
         for task in candidates[:limit]:
+            if should_stop is not None and should_stop():
+                break
             if task.access_version is not None:
                 delivered_versions = [
                     int(t.access_version)

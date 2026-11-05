@@ -112,8 +112,8 @@ def create_app(
         default_response_class=UTF8JSONResponse,
         lifespan=app_lifespan,
     )
-    application.middleware('http')(require_request_id)
     application.middleware('http')(bind_request_id)
+    application.middleware('http')(require_request_id)
     if settings.tracing.enabled or tracer_provider is not None:
         provider = tracer_provider or create_tracer_provider(settings.tracing)
         instrument_fastapi(application, provider)

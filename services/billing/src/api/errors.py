@@ -1,5 +1,6 @@
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
+from urllib.parse import quote
 
 from fastapi import FastAPI, Request, status
 from fastapi.encoders import jsonable_encoder
@@ -132,11 +133,22 @@ async def validation_error_handler(
 
 
 async def ui_login_redirect_handler(
-    _request: Request,
+    request: Request,
     _exc: UILoginRedirectError,
 ) -> RedirectResponse:
+    target_path = request.url.path
+    if request.url.query:
+        target_path = f'{target_path}?{request.url.query}'
+    if (
+        request.method == 'GET'
+        and target_path.startswith('/billing')
+        and target_path not in ('/billing/', '/billing/login')
+    ):
+        login_url = f'/billing/login?next={quote(target_path, safe="/")}'
+    else:
+        login_url = '/billing/login'
     return RedirectResponse(
-        url='/billing/login',
+        url=login_url,
         status_code=status.HTTP_303_SEE_OTHER,
     )
 

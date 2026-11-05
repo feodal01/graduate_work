@@ -8,7 +8,7 @@ os.environ['TRACING_ENABLED'] = 'false'
 
 import pytest
 
-_INTEGRATION_FIXTURES = frozenset({'session', 'session_factory'})
+_INTEGRATION_FIXTURES = frozenset({'migrated_billing_db'})
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
