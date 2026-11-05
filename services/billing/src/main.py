@@ -12,6 +12,7 @@ from api.errors import register_exception_handlers
 from api.request_id import require_request_id
 from api.v1 import health, payments, webhooks
 from clients.auth import HttpAuthGateway
+from clients.notifications import HttpNotificationsGateway
 from clients.payment_provider import YooKassaProviderAdapter
 from core.config import ServiceSettings, TokenSettings, settings
 from core.logger import LOGGING, add_logstash_handler
@@ -65,6 +66,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     auth_http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(settings.auth_client.timeout_seconds)
     )
+    notifications_http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(settings.notifications_client.timeout_seconds)
+    )
     yookassa_http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(settings.yookassa.timeout_seconds)
     )
@@ -72,6 +76,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         http_client=auth_http_client,
         base_url=str(settings.auth_client.service_url),
         service_api_key=service_settings.api_key.get_secret_value(),
+    )
+    app.state.notifications_gateway = HttpNotificationsGateway(
+        http_client=notifications_http_client,
+        base_url=str(settings.notifications_client.campaign_url),
+        api_key=settings.notifications_client.campaign_api_key.get_secret_value(),
     )
     app.state.payment_provider = YooKassaProviderAdapter(
         http_client=yookassa_http_client,
@@ -87,18 +96,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             await yookassa_http_client.aclose()
         finally:
             try:
-                await auth_http_client.aclose()
+                await notifications_http_client.aclose()
             finally:
                 try:
-                    await database.close()
+                    await auth_http_client.aclose()
                 finally:
-                    tracer_provider = getattr(
-                        app.state,
-                        'tracer_provider',
-                        None,
-                    )
-                    if tracer_provider is not None:
-                        tracer_provider.shutdown()
+                    try:
+                        await database.close()
+                    finally:
+                        tracer_provider = getattr(
+                            app.state,
+                            'tracer_provider',
+                            None,
+                        )
+                        if tracer_provider is not None:
+                            tracer_provider.shutdown()
 
 
 def create_app(

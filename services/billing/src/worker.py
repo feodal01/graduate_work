@@ -9,6 +9,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 
 from clients.auth import HttpAuthGateway
+from clients.notifications import HttpNotificationsGateway
 from clients.payment_provider import YooKassaProviderAdapter
 from core.config import ServiceSettings, settings
 from core.logger import LOGGING, add_logstash_handler
@@ -152,6 +153,9 @@ async def main() -> None:
     auth_http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(settings.auth_client.timeout_seconds)
     )
+    notifications_http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(settings.notifications_client.timeout_seconds)
+    )
     yookassa_http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(settings.yookassa.timeout_seconds)
     )
@@ -159,6 +163,11 @@ async def main() -> None:
         http_client=auth_http_client,
         base_url=str(settings.auth_client.service_url),
         service_api_key=service_settings.api_key.get_secret_value(),
+    )
+    notifications_gateway = HttpNotificationsGateway(
+        http_client=notifications_http_client,
+        base_url=str(settings.notifications_client.campaign_url),
+        api_key=settings.notifications_client.campaign_api_key.get_secret_value(),
     )
     payment_provider = YooKassaProviderAdapter(
         http_client=yookassa_http_client,
@@ -170,6 +179,7 @@ async def main() -> None:
     outbox_dispatcher = OutboxDispatcher(
         repository=repo,
         auth_gateway=auth_gateway,
+        notifications_gateway=notifications_gateway,
         max_attempts=settings.worker.billing_outbox_max_attempts,
     )
     reconciler = PaymentReconciler(
@@ -209,7 +219,10 @@ async def main() -> None:
         try:
             await yookassa_http_client.aclose()
         finally:
-            await auth_http_client.aclose()
+            try:
+                await notifications_http_client.aclose()
+            finally:
+                await auth_http_client.aclose()
 
 
 if __name__ == '__main__':  # pragma: no cover

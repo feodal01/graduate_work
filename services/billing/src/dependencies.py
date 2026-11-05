@@ -10,6 +10,7 @@ from clients.auth import (
     AuthInvalidCredentialsError,
     AuthServiceUnavailableError,
 )
+from clients.notifications import NotificationsGateway
 from clients.payment_provider import PaymentProviderGateway
 from core.config import settings
 from core.observability import get_current_request_id
@@ -45,6 +46,15 @@ async def get_auth_gateway(request: Request) -> AuthGateway:
     return cast(AuthGateway, request.app.state.auth_gateway)
 
 
+async def get_notifications_gateway(
+    request: Request,
+) -> NotificationsGateway | None:
+    return cast(
+        NotificationsGateway | None,
+        getattr(request.app.state, 'notifications_gateway', None),
+    )
+
+
 async def get_payment_provider(request: Request) -> PaymentProviderGateway:
     return cast(PaymentProviderGateway, request.app.state.payment_provider)
 
@@ -52,12 +62,16 @@ async def get_payment_provider(request: Request) -> PaymentProviderGateway:
 async def get_outbox_dispatcher(
     request: Request,
     auth_gateway: AuthGateway = Depends(get_auth_gateway),
+    notifications_gateway: NotificationsGateway | None = Depends(
+        get_notifications_gateway
+    ),
 ) -> OutboxDispatcher:
     database = cast(PostgresDatabase, request.app.state.database)
     repo = SQLAlchemyPurchaseRepository(database.sessionmaker)
     return OutboxDispatcher(
         repository=repo,
         auth_gateway=auth_gateway,
+        notifications_gateway=notifications_gateway,
         max_attempts=settings.worker.billing_outbox_max_attempts,
     )
 

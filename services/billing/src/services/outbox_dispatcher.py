@@ -10,12 +10,25 @@ from clients.auth import (
     AuthPermanentDeliveryError,
     AuthServiceUnavailableError,
 )
+from clients.notifications import (
+    NotificationsGateway,
+    NotificationsPermanentError,
+    NotificationsTransientError,
+)
 from core.observability import correlation_request_id
 from repositories.purchase import (
     DeliveryOutcome,
     OutboxDeliverFn,
     OutboxTaskRecordProtocol,
 )
+
+__all__ = [
+    'NotificationsGateway',
+    'NotificationsPermanentError',
+    'NotificationsTransientError',
+    'OutboxDispatcher',
+    'OutboxRepositoryProtocol',
+]
 
 logger = logging.getLogger(__name__)
 
@@ -27,41 +40,6 @@ _EMAIL_BATCH_TASK_TYPES = frozenset(
         'refund_succeeded_email',
     }
 )
-
-
-class NotificationsTransientError(Exception):
-    """Временная ошибка Notifications (5xx, 429, 409 profile_not_ready, сеть)."""
-
-
-class NotificationsPermanentError(Exception):
-    """Постоянная ошибка запроса к Notifications (4xx, кроме 429 и 409)."""
-
-    def __init__(self, status_code: int, detail: str) -> None:
-        self.status_code = status_code
-        self.detail = detail
-        super().__init__(f'Notifications returned {status_code}: {detail}')
-
-
-class NotificationsGateway(Protocol):
-    async def send_campaign_batch(
-        self,
-        *,
-        campaign_id: UUID,
-        batch_id: UUID,
-        user_id: UUID,
-        template_id: str,
-        subject: str,
-        text: str,
-        available_at: str | None,
-        request_id: str,
-    ) -> None: ...
-
-    async def cancel_campaign(
-        self,
-        campaign_id: UUID,
-        *,
-        request_id: str,
-    ) -> None: ...
 
 
 class OutboxRepositoryProtocol(Protocol):

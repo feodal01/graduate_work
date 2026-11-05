@@ -125,6 +125,11 @@ class PaymentReconciler:
         self._public_base_url = public_base_url.rstrip('/')
         self._outbox_dispatcher = outbox_dispatcher
 
+    async def notify_payment_tasks(self, payment_id: UUID) -> None:
+        """Немедленно запускает отправку задач outbox для платежа (US-S-02)."""
+        if self._outbox_dispatcher is not None:
+            await self._outbox_dispatcher.try_deliver_payment_tasks(payment_id)
+
     async def reconcile_payment(
         self,
         payment_id: UUID,
@@ -238,6 +243,8 @@ class PaymentReconciler:
                     source='reconcile',
                     public_base_url=self._public_base_url,
                 )
+                if transitioned and self._outbox_dispatcher is not None:
+                    await self._outbox_dispatcher.try_deliver_payment_tasks(payment.id)
                 return ReconcileOutcome(
                     payment_id=updated.id,
                     user_id=updated.user_id,
@@ -268,6 +275,8 @@ class PaymentReconciler:
                     source='reconcile',
                     public_base_url=self._public_base_url,
                 )
+                if transitioned and self._outbox_dispatcher is not None:
+                    await self._outbox_dispatcher.try_deliver_payment_tasks(payment.id)
                 return ReconcileOutcome(
                     payment_id=updated.id,
                     user_id=updated.user_id,
@@ -388,6 +397,8 @@ class PaymentReconciler:
             provider_details=snapshot.provider_details,
             public_base_url=self._public_base_url,
         )
+        if transitioned and self._outbox_dispatcher is not None:
+            await self._outbox_dispatcher.try_deliver_payment_tasks(payment.id)
         return ReconcileOutcome(
             payment_id=updated.id,
             user_id=updated.user_id,

@@ -239,12 +239,14 @@ class PurchaseService:
                 )
             )
         except ProviderPermanentError as exc:
-            await self._repo.finalize_payment_failed(
+            _, transitioned = await self._repo.finalize_payment_failed(
                 payment.id,
                 failure_reason=exc.message,
                 source='continue',
                 public_base_url=self._public_base_url,
             )
+            if transitioned and self._reconciler is not None:
+                await self._reconciler.notify_payment_tasks(payment.id)
             raise BillingDomainError(
                 'Не удалось связаться с платёжной системой, попробуйте ещё раз',
                 error_code='payment_provider_rejected',

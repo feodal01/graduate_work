@@ -15,7 +15,12 @@ from clients.payment_provider import (
     ProviderPaymentSnapshot,
 )
 from db.sql.errors import DatabaseUnavailableError
-from domain.subscription import ReconcileSource, deterministic_id, format_msk_datetime
+from domain.subscription import (
+    ReconcileSource,
+    build_payment_failed_email_payload,
+    build_payment_succeeded_email_payload,
+    build_subscription_expiration_email_payload,
+)
 from repositories.purchase import (
     DeliveryOutcome,
     LocalPaymentResultData,
@@ -346,13 +351,6 @@ class InMemoryPurchaseRepository:
             )
         )
 
-        base_url = public_base_url.rstrip('/')
-        ends_msk = format_msk_datetime(ends_at)
-        paid_campaign_id = deterministic_id('payment_succeeded_email', payment_id)
-        paid_batch_id = deterministic_id('payment_succeeded_batch', payment_id)
-        exp_campaign_id = deterministic_id('subscription_expiration', sub_id)
-        exp_batch_id = deterministic_id('subscription_expiration_batch', sub_id)
-
         tasks = [
             FakeOutboxTaskRow(
                 id=uuid4(),
@@ -376,21 +374,13 @@ class InMemoryPurchaseRepository:
                 payment_id=payment_id,
                 user_id=row.user_id,
                 access_version=None,
-                payload={
-                    'campaign_id': str(paid_campaign_id),
-                    'batch_id': str(paid_batch_id),
-                    'user_id': str(row.user_id),
-                    'template_id': 'billing_notification',
-                    'subject': 'Подписка «Премиум» оплачена',
-                    'text': (
-                        f'Оплата подписки «Премиум» подтверждена. '
-                        f'Доступ к новинкам открыт до {ends_msk}. '
-                        f'Страница подписки: {base_url}/billing/'
-                    ),
-                    'available_at': None,
-                    'subscription_id': str(sub_id),
-                    'ends_at': ends_at.isoformat(),
-                },
+                payload=build_payment_succeeded_email_payload(
+                    payment_id=payment_id,
+                    subscription_id=sub_id,
+                    user_id=row.user_id,
+                    ends_at=ends_at,
+                    public_base_url=public_base_url,
+                ),
             ),
             FakeOutboxTaskRow(
                 id=uuid4(),
@@ -400,20 +390,12 @@ class InMemoryPurchaseRepository:
                 payment_id=payment_id,
                 user_id=row.user_id,
                 access_version=None,
-                payload={
-                    'campaign_id': str(exp_campaign_id),
-                    'batch_id': str(exp_batch_id),
-                    'user_id': str(row.user_id),
-                    'template_id': 'billing_notification',
-                    'subject': 'Срок подписки «Премиум» закончился',
-                    'text': (
-                        f'Срок действия вашей подписки «Премиум» истёк '
-                        f'({ends_msk}). Вы можете оформить новую подписку '
-                        f'на странице: {base_url}/billing/'
-                    ),
-                    'available_at': ends_at.isoformat(),
-                    'subscription_id': str(sub_id),
-                },
+                payload=build_subscription_expiration_email_payload(
+                    subscription_id=sub_id,
+                    user_id=row.user_id,
+                    ends_at=ends_at,
+                    public_base_url=public_base_url,
+                ),
             ),
         ]
         for task in tasks:
@@ -452,8 +434,6 @@ class InMemoryPurchaseRepository:
             ('payment', payment_id, old_status, 'failed', source, event_details)
         )
         dedup_key = f'payment_failed:{payment_id}:notify_failed'
-        failed_campaign_id = deterministic_id('payment_failed_email', payment_id)
-        failed_batch_id = deterministic_id('payment_failed_batch', payment_id)
         self.outbox_tasks[dedup_key] = FakeOutboxTaskRow(
             id=uuid4(),
             dedup_key=dedup_key,
@@ -462,21 +442,12 @@ class InMemoryPurchaseRepository:
             payment_id=payment_id,
             user_id=row.user_id,
             access_version=None,
-            payload={
-                'campaign_id': str(failed_campaign_id),
-                'batch_id': str(failed_batch_id),
-                'user_id': str(row.user_id),
-                'template_id': 'billing_notification',
-                'subject': 'Оплата подписки «Премиум» не прошла',
-                'text': (
-                    f'Не удалось провести оплату подписки «Премиум» '
-                    f'(причина: {failure_reason}). '
-                    f'Попробовать снова можно на странице: '
-                    f'{public_base_url.rstrip("/")}/billing/'
-                ),
-                'available_at': None,
-                'failure_reason': failure_reason,
-            },
+            payload=build_payment_failed_email_payload(
+                payment_id=payment_id,
+                user_id=row.user_id,
+                failure_reason=failure_reason,
+                public_base_url=public_base_url,
+            ),
         )
         return row, True
 

@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -122,3 +122,92 @@ def humanize_failure_reason(reason: str | None) -> str:
 def deterministic_id(kind: str, operation_id: UUID) -> UUID:
     """Генерирует детерминированный UUID (v5) для campaign_id и batch_id (инв. 12)."""
     return uuid5(BILLING_NAMESPACE, f'{kind}:{operation_id}')
+
+
+def build_payment_succeeded_email_payload(
+    *,
+    payment_id: UUID,
+    subscription_id: UUID,
+    user_id: UUID,
+    ends_at: datetime,
+    public_base_url: str,
+) -> dict[str, Any]:
+    """Формирует payload письма «Оплата прошла» (4.4, US-U-01, инв. 12)."""
+    base_url = public_base_url.rstrip('/')
+    ends_msk = format_msk_datetime(ends_at)
+    my_sub_url = f'{base_url}/billing/'
+    campaign_id = deterministic_id('payment_succeeded_email', payment_id)
+    batch_id = deterministic_id('payment_succeeded_batch', payment_id)
+    return {
+        'campaign_id': str(campaign_id),
+        'batch_id': str(batch_id),
+        'user_id': str(user_id),
+        'template_id': 'billing_notification',
+        'subject': 'Подписка «Премиум» оплачена',
+        'text': (
+            f'Оплата подписки «Премиум» подтверждена. '
+            f'Доступ к новинкам открыт до {ends_msk}. '
+            f'Страница подписки: {my_sub_url}'
+        ),
+        'available_at': None,
+        'subscription_id': str(subscription_id),
+        'ends_at': _ensure_utc(ends_at).isoformat(),
+    }
+
+
+def build_subscription_expiration_email_payload(
+    *,
+    subscription_id: UUID,
+    user_id: UUID,
+    ends_at: datetime,
+    public_base_url: str,
+) -> dict[str, Any]:
+    """Формирует payload отложенного письма «Подписка закончилась» на момент T."""
+    base_url = public_base_url.rstrip('/')
+    ends_msk = format_msk_datetime(ends_at)
+    my_sub_url = f'{base_url}/billing/'
+    campaign_id = deterministic_id('subscription_expiration', subscription_id)
+    batch_id = deterministic_id('subscription_expiration_batch', subscription_id)
+    return {
+        'campaign_id': str(campaign_id),
+        'batch_id': str(batch_id),
+        'user_id': str(user_id),
+        'template_id': 'billing_notification',
+        'subject': 'Срок подписки «Премиум» закончился',
+        'text': (
+            f'Срок действия вашей подписки «Премиум» истёк '
+            f'({ends_msk}). Вы можете оформить новую подписку '
+            f'на странице: {my_sub_url}'
+        ),
+        'available_at': _ensure_utc(ends_at).isoformat(),
+        'subscription_id': str(subscription_id),
+    }
+
+
+def build_payment_failed_email_payload(
+    *,
+    payment_id: UUID,
+    user_id: UUID,
+    failure_reason: str,
+    public_base_url: str,
+) -> dict[str, Any]:
+    """Формирует payload письма «Оплата не прошла» без утечки сырых ошибок (4.4)."""
+    base_url = public_base_url.rstrip('/')
+    retry_url = f'{base_url}/billing/'
+    human_reason = humanize_failure_reason(failure_reason)
+    campaign_id = deterministic_id('payment_failed_email', payment_id)
+    batch_id = deterministic_id('payment_failed_batch', payment_id)
+    return {
+        'campaign_id': str(campaign_id),
+        'batch_id': str(batch_id),
+        'user_id': str(user_id),
+        'template_id': 'billing_notification',
+        'subject': 'Оплата подписки «Премиум» не прошла',
+        'text': (
+            f'Не удалось провести оплату подписки «Премиум» '
+            f'({human_reason}). '
+            f'Попробовать снова можно на странице: {retry_url}'
+        ),
+        'available_at': None,
+        'failure_reason': failure_reason,
+    }

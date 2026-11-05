@@ -13,7 +13,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from api.errors import BillingDomainError
 from db.sql.errors import DatabaseUnavailableError
-from domain.subscription import ReconcileSource, deterministic_id, format_msk_datetime
+from domain.subscription import (
+    ReconcileSource,
+    build_payment_failed_email_payload,
+    build_payment_succeeded_email_payload,
+    build_subscription_expiration_email_payload,
+)
 from models import (
     DEFAULT_PROVIDER_CODE,
     DEFAULT_TARIFF_CODE,
@@ -670,7 +675,6 @@ class SQLAlchemyPurchaseRepository:
     ) -> tuple[Payment, bool]:
         """Атомарно фиксирует оплату (BIL-FR-08, BIL-FR-11, BIL-FR-13, BIL-NFR-R-03)."""
         now_utc = datetime.now(UTC)
-        base_url = public_base_url.rstrip('/')
         try:
             async with self._session_factory() as session:
                 payment = await self._lock_user_and_payment(session, payment_id)
@@ -716,15 +720,6 @@ class SQLAlchemyPurchaseRepository:
                     )
                 )
 
-                ends_msk = format_msk_datetime(ends_at)
-                my_sub_url = f'{base_url}/billing/'
-                paid_campaign_id = deterministic_id(
-                    'payment_succeeded_email', payment.id
-                )
-                paid_batch_id = deterministic_id('payment_succeeded_batch', payment.id)
-                exp_campaign_id = deterministic_id('subscription_expiration', sub_id)
-                exp_batch_id = deterministic_id('subscription_expiration_batch', sub_id)
-
                 session.add_all(
                     [
                         OutboxTask(
@@ -748,21 +743,13 @@ class SQLAlchemyPurchaseRepository:
                             payment_id=payment.id,
                             user_id=payment.user_id,
                             access_version=None,
-                            payload={
-                                'campaign_id': str(paid_campaign_id),
-                                'batch_id': str(paid_batch_id),
-                                'user_id': str(payment.user_id),
-                                'template_id': 'billing_notification',
-                                'subject': 'Подписка «Премиум» оплачена',
-                                'text': (
-                                    f'Оплата подписки «Премиум» подтверждена. '
-                                    f'Доступ к новинкам открыт до {ends_msk}. '
-                                    f'Страница подписки: {my_sub_url}'
-                                ),
-                                'available_at': None,
-                                'subscription_id': str(sub_id),
-                                'ends_at': ends_at.isoformat(),
-                            },
+                            payload=build_payment_succeeded_email_payload(
+                                payment_id=payment.id,
+                                subscription_id=sub_id,
+                                user_id=payment.user_id,
+                                ends_at=ends_at,
+                                public_base_url=public_base_url,
+                            ),
                             next_retry_at=now_utc,
                         ),
                         OutboxTask(
@@ -772,20 +759,12 @@ class SQLAlchemyPurchaseRepository:
                             payment_id=payment.id,
                             user_id=payment.user_id,
                             access_version=None,
-                            payload={
-                                'campaign_id': str(exp_campaign_id),
-                                'batch_id': str(exp_batch_id),
-                                'user_id': str(payment.user_id),
-                                'template_id': 'billing_notification',
-                                'subject': 'Срок подписки «Премиум» закончился',
-                                'text': (
-                                    f'Срок действия вашей подписки «Премиум» истёк '
-                                    f'({ends_msk}). Вы можете оформить новую подписку '
-                                    f'на странице: {my_sub_url}'
-                                ),
-                                'available_at': ends_at.isoformat(),
-                                'subscription_id': str(sub_id),
-                            },
+                            payload=build_subscription_expiration_email_payload(
+                                subscription_id=sub_id,
+                                user_id=payment.user_id,
+                                ends_at=ends_at,
+                                public_base_url=public_base_url,
+                            ),
                             next_retry_at=now_utc,
                         ),
                     ]
@@ -806,7 +785,6 @@ class SQLAlchemyPurchaseRepository:
     ) -> tuple[Payment, bool]:
         """Атомарно переводит платёж в failed и ставит письмо (BIL-FR-06, BIL-FR-11)."""
         now_utc = datetime.now(UTC)
-        base_url = public_base_url.rstrip('/')
         try:
             async with self._session_factory() as session:
                 payment = await self._lock_user_and_payment(session, payment_id)
@@ -836,11 +814,6 @@ class SQLAlchemyPurchaseRepository:
                     )
                 )
 
-                retry_url = f'{base_url}/billing/'
-                failed_campaign_id = deterministic_id(
-                    'payment_failed_email', payment.id
-                )
-                failed_batch_id = deterministic_id('payment_failed_batch', payment.id)
                 session.add(
                     OutboxTask(
                         dedup_key=f'payment_failed:{payment.id}:notify_failed',
@@ -849,20 +822,12 @@ class SQLAlchemyPurchaseRepository:
                         payment_id=payment.id,
                         user_id=payment.user_id,
                         access_version=None,
-                        payload={
-                            'campaign_id': str(failed_campaign_id),
-                            'batch_id': str(failed_batch_id),
-                            'user_id': str(payment.user_id),
-                            'template_id': 'billing_notification',
-                            'subject': 'Оплата подписки «Премиум» не прошла',
-                            'text': (
-                                f'Не удалось провести оплату подписки «Премиум» '
-                                f'(причина: {failure_reason}). '
-                                f'Попробовать снова можно на странице: {retry_url}'
-                            ),
-                            'available_at': None,
-                            'failure_reason': failure_reason,
-                        },
+                        payload=build_payment_failed_email_payload(
+                            payment_id=payment.id,
+                            user_id=payment.user_id,
+                            failure_reason=failure_reason,
+                            public_base_url=public_base_url,
+                        ),
                         next_retry_at=now_utc,
                     )
                 )
