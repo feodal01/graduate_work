@@ -1007,3 +1007,91 @@ async def test_t19_outbox_worker_skip_locked_backoff_intervention_and_stale_vers
         assert row_after_2.status == 'requires_intervention'
         assert row_after_2.attempts == 2
         assert row_after_2.last_error == 'Notifications 503 Service Unavailable'
+
+
+async def test_t23_get_user_billing_overview_in_real_postgres(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """T-23 (BIL-FR-09, BIL-API-02): get_user_billing_overview в PostgreSQL."""
+    from repositories.purchase import SQLAlchemyPurchaseRepository
+
+    session_factory = migrated_billing_db
+    repo = SQLAlchemyPurchaseRepository(session_factory)
+    user_id = uuid4()
+    other_user_id = uuid4()
+
+    # 1. Пустой пользователь -> нет подписки, пустая история
+    empty_ov = await repo.get_user_billing_overview(user_id)
+    assert empty_ov.pending_payment_id is None
+    assert empty_ov.latest_subscription_ends_at is None
+    assert empty_ov.payments == []
+
+    # 2. Чужой платёж не попадает в выборку
+    other_pay, _ = await repo.get_or_create_pending_payment(other_user_id)
+    await repo.finalize_payment_succeeded(other_pay.id, source='webhook')
+
+    # 3. Неуспешный платёж, затем успешный платёж с подпиской и возвратом в обработке
+    pay_fail, _ = await repo.get_or_create_pending_payment(user_id)
+    await repo.finalize_payment_failed(
+        pay_fail.id,
+        failure_reason='insufficient_funds',
+        source='webhook',
+    )
+    pay_ok, _ = await repo.get_or_create_pending_payment(user_id)
+    await repo.finalize_payment_succeeded(pay_ok.id, source='webhook')
+
+    ov_activating = await repo.get_user_billing_overview(user_id)
+    assert ov_activating.pending_payment_id is None
+    assert ov_activating.latest_subscription_ends_at is not None
+    assert ov_activating.latest_subscription_auth_delivered is False
+    assert len(ov_activating.payments) == 2
+    assert ov_activating.payments[0].payment_id == pay_ok.id
+    assert ov_activating.payments[1].payment_id == pay_fail.id
+
+    # Доставляем задачу Auth и добавляем возврат processing
+    async with session_factory() as session:
+        sub_row = await session.scalar(
+            select(Subscription).where(Subscription.payment_id == pay_ok.id)
+        )
+        assert sub_row is not None
+        auth_task = await session.scalar(
+            select(OutboxTask).where(
+                OutboxTask.payment_id == pay_ok.id,
+                OutboxTask.target_service == 'auth',
+            )
+        )
+        assert auth_task is not None
+        auth_task.status = 'completed'
+        refund_id = uuid4()
+        session.add(
+            Refund(
+                id=refund_id,
+                payment_id=pay_ok.id,
+                subscription_id=sub_row.id,
+                provider_code=DEFAULT_PROVIDER_CODE,
+                amount_kopeks=DEFAULT_TARIFF_PRICE_KOPEKS,
+                status='processing',
+                reason='Проверка отметки возврата в истории',
+                admin_user_id=uuid4(),
+                idempotency_key=refund_id,
+            )
+        )
+        await session.commit()
+
+    ov_active_ref = await repo.get_user_billing_overview(user_id)
+    assert ov_active_ref.latest_subscription_auth_delivered is True
+    assert ov_active_ref.latest_subscription_has_processing_refund is True
+    assert ov_active_ref.latest_subscription_has_succeeded_refund is False
+    assert ov_active_ref.payments[0].refund_status == 'processing'
+
+    # Переводим возврат в succeeded -> отражается как succeeded
+    async with session_factory() as session:
+        ref_row = await session.get(Refund, refund_id)
+        assert ref_row is not None
+        ref_row.status = 'succeeded'
+        await session.commit()
+
+    ov_refunded = await repo.get_user_billing_overview(user_id)
+    assert ov_refunded.latest_subscription_has_succeeded_refund is True
+    assert ov_refunded.latest_subscription_has_processing_refund is False
+    assert ov_refunded.payments[0].refund_status == 'succeeded'

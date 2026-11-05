@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -211,3 +212,157 @@ def build_payment_failed_email_payload(
         'available_at': None,
         'failure_reason': failure_reason,
     }
+
+
+MySubscriptionStatusKey = Literal[
+    'pending_payment',
+    'activating',
+    'active',
+    'expired_refund_processing',
+    'expired',
+    'refunded',
+    'no_subscription',
+]
+MySubscriptionActionType = Literal['continue_payment', 'subscribe', 'none']
+
+_PAYMENT_STATUS_LABELS: dict[str, str] = {
+    'pending': 'Ожидает оплаты',
+    'succeeded': 'Оплачен',
+    'failed': 'Не оплачен',
+}
+
+_REFUND_BADGE_LABELS: dict[str, str] = {
+    'processing': 'Возврат в обработке',
+    'succeeded': 'Возвращён',
+}
+
+
+def format_payment_status_display(status: str) -> str:
+    """Возвращает человекочитаемый статус платежа для таблицы истории (US-U-05)."""
+    return _PAYMENT_STATUS_LABELS.get(status, status)
+
+
+def format_refund_badge_display(refund_status: str | None) -> str | None:
+    """Возвращает отметку о возврате («Возврат в обработке» / «Возвращён»)."""
+    if refund_status is None:
+        return None
+    return _REFUND_BADGE_LABELS.get(refund_status)
+
+
+@dataclass(frozen=True, slots=True)
+class MySubscriptionSummaryResult:
+    rule_number: int
+    status_key: MySubscriptionStatusKey
+    status_display: str
+    action_type: MySubscriptionActionType
+    action_label: str | None
+    action_url: str | None
+    can_subscribe: bool
+    subscription_ends_display: str | None
+
+
+def compute_my_subscription_summary(
+    *,
+    pending_payment_id: UUID | None,
+    latest_subscription_ends_at: datetime | None,
+    latest_subscription_has_succeeded_refund: bool,
+    latest_subscription_has_processing_refund: bool,
+    latest_subscription_auth_delivered: bool,
+    user_tz: str,
+    tariff_price_display: str = '299 ₽',
+    now_utc: datetime | None = None,
+) -> MySubscriptionSummaryResult:
+    """Вычисляет статус и действие экрана «Моя подписка» по 7 правилам US-U-05."""
+    # Правило 1: Есть платёж в состоянии «Ожидает оплаты»
+    if pending_payment_id is not None:
+        return MySubscriptionSummaryResult(
+            rule_number=1,
+            status_key='pending_payment',
+            status_display='Ожидает оплаты',
+            action_type='continue_payment',
+            action_label='Продолжить оплату',
+            action_url=f'/billing/payments/{pending_payment_id}/continue',
+            can_subscribe=False,
+            subscription_ends_display=None,
+        )
+
+    subscribe_label = f'Оформить за {tariff_price_display}'
+    # Правило 7: Подписок не было (в том числе если все платежи «Не оплачен»)
+    if latest_subscription_ends_at is None:
+        return MySubscriptionSummaryResult(
+            rule_number=7,
+            status_key='no_subscription',
+            status_display='Нет подписки',
+            action_type='subscribe',
+            action_label=subscribe_label,
+            action_url='/billing/subscribe',
+            can_subscribe=True,
+            subscription_ends_display=None,
+        )
+
+    sub_state = compute_subscription_state(
+        ends_at=latest_subscription_ends_at,
+        has_succeeded_refund=latest_subscription_has_succeeded_refund,
+        now_utc=now_utc,
+    )
+    ends_display = format_user_datetime(latest_subscription_ends_at, user_tz)
+
+    # Правила 2 и 3: Последняя подписка активна
+    if sub_state == SubscriptionState.ACTIVE:
+        if not latest_subscription_auth_delivered:
+            return MySubscriptionSummaryResult(
+                rule_number=2,
+                status_key='activating',
+                status_display='Оплачено, доступ активируется',
+                action_type='none',
+                action_label=None,
+                action_url=None,
+                can_subscribe=False,
+                subscription_ends_display=ends_display,
+            )
+        return MySubscriptionSummaryResult(
+            rule_number=3,
+            status_key='active',
+            status_display=f'Активна до {ends_display}',
+            action_type='none',
+            action_label=None,
+            action_url=None,
+            can_subscribe=False,
+            subscription_ends_display=ends_display,
+        )
+
+    # Правила 4 и 5: Последняя подписка завершена
+    if sub_state == SubscriptionState.EXPIRED:
+        if latest_subscription_has_processing_refund:
+            return MySubscriptionSummaryResult(
+                rule_number=4,
+                status_key='expired_refund_processing',
+                status_display=f'Завершена {ends_display}',
+                action_type='none',
+                action_label=None,
+                action_url=None,
+                can_subscribe=False,
+                subscription_ends_display=ends_display,
+            )
+        return MySubscriptionSummaryResult(
+            rule_number=5,
+            status_key='expired',
+            status_display=f'Завершена {ends_display}',
+            action_type='subscribe',
+            action_label=subscribe_label,
+            action_url='/billing/subscribe',
+            can_subscribe=True,
+            subscription_ends_display=ends_display,
+        )
+
+    # Правило 6: Последняя подписка возвращена
+    return MySubscriptionSummaryResult(
+        rule_number=6,
+        status_key='refunded',
+        status_display='Возвращена',
+        action_type='subscribe',
+        action_label=subscribe_label,
+        action_url='/billing/subscribe',
+        can_subscribe=True,
+        subscription_ends_display=ends_display,
+    )

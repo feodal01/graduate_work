@@ -9,8 +9,13 @@ from clients.payment_provider import (
     ProviderPermanentError,
 )
 from domain.subscription import (
+    MySubscriptionActionType,
+    MySubscriptionStatusKey,
     PaymentResultBlock,
+    compute_my_subscription_summary,
     format_amount_rubles,
+    format_payment_status_display,
+    format_refund_badge_display,
     format_user_datetime,
     humanize_failure_reason,
 )
@@ -19,6 +24,8 @@ from services.reconciler import CHECK_THROTTLE_WINDOW, PaymentReconciler
 
 __all__ = [
     'CHECK_THROTTLE_WINDOW',
+    'MySubscriptionPaymentRowView',
+    'MySubscriptionView',
     'PaymentResultView',
     'PurchaseOutcome',
     'PurchaseService',
@@ -42,6 +49,33 @@ class PaymentResultView:
     subscription_ends_display: str | None
     failure_reason_display: str | None
     auto_refresh_seconds: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class MySubscriptionPaymentRowView:
+    payment_id: UUID
+    created_at_display: str
+    tariff_title: str
+    amount_kopeks: int
+    amount_display: str
+    status: str
+    status_display: str
+    refund_status: str | None
+    refund_badge_display: str | None
+    result_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class MySubscriptionView:
+    rule_number: int
+    status_key: MySubscriptionStatusKey
+    status_display: str
+    action_type: MySubscriptionActionType
+    action_label: str | None
+    action_url: str | None
+    can_subscribe: bool
+    subscription_ends_display: str | None
+    payments: list[MySubscriptionPaymentRowView]
 
 
 class PurchaseService:
@@ -172,6 +206,57 @@ class PurchaseService:
             subscription_ends_display=None,
             failure_reason_display=None,
             auto_refresh_seconds=5,
+        )
+
+    async def get_my_subscription_view(
+        self,
+        *,
+        user_id: UUID,
+        user_tz: str,
+    ) -> MySubscriptionView:
+        """Возвращает статус по 7 правилам US-U-05 и историю платежей (BIL-FR-09)."""
+        overview = await self._repo.get_user_billing_overview(user_id)
+        tariff_price_display = format_amount_rubles(overview.tariff_price_kopeks)
+        summary = compute_my_subscription_summary(
+            pending_payment_id=overview.pending_payment_id,
+            latest_subscription_ends_at=overview.latest_subscription_ends_at,
+            latest_subscription_has_succeeded_refund=(
+                overview.latest_subscription_has_succeeded_refund
+            ),
+            latest_subscription_has_processing_refund=(
+                overview.latest_subscription_has_processing_refund
+            ),
+            latest_subscription_auth_delivered=(
+                overview.latest_subscription_auth_delivered
+            ),
+            user_tz=user_tz,
+            tariff_price_display=tariff_price_display,
+        )
+        rows = [
+            MySubscriptionPaymentRowView(
+                payment_id=item.payment_id,
+                created_at_display=format_user_datetime(item.created_at, user_tz),
+                tariff_title=item.tariff_title,
+                amount_kopeks=item.amount_kopeks,
+                amount_display=format_amount_rubles(item.amount_kopeks),
+                status=item.status,
+                status_display=format_payment_status_display(item.status),
+                refund_status=item.refund_status,
+                refund_badge_display=format_refund_badge_display(item.refund_status),
+                result_url=f'/billing/payments/{item.payment_id}',
+            )
+            for item in overview.payments
+        ]
+        return MySubscriptionView(
+            rule_number=summary.rule_number,
+            status_key=summary.status_key,
+            status_display=summary.status_display,
+            action_type=summary.action_type,
+            action_label=summary.action_label,
+            action_url=summary.action_url,
+            can_subscribe=summary.can_subscribe,
+            subscription_ends_display=summary.subscription_ends_display,
+            payments=rows,
         )
 
     async def _verify_existing_pending_and_resolve(

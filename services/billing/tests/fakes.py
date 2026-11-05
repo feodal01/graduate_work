@@ -1,7 +1,7 @@
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from api.errors import BillingDomainError
@@ -25,6 +25,8 @@ from repositories.purchase import (
     DeliveryOutcome,
     LocalPaymentResultData,
     OutboxDeliverFn,
+    UserBillingOverviewData,
+    UserPaymentHistoryItemData,
     compute_outbox_backoff_seconds,
 )
 
@@ -60,6 +62,23 @@ class FakeSubscriptionRow:
 
 
 @dataclass
+class FakeRefundRow:
+    id: UUID
+    payment_id: UUID
+    subscription_id: UUID
+    provider_code: str
+    amount_kopeks: int
+    status: str
+    reason: str
+    admin_user_id: UUID
+    idempotency_key: UUID
+    currency: str = 'RUB'
+    provider_refund_id: str | None = None
+    rejection_reason: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass
 class FakeOutboxTaskRow:
     id: UUID
     dedup_key: str
@@ -84,6 +103,7 @@ class InMemoryPurchaseRepository:
         self.db_unavailable: bool = False
         self.payments: dict[UUID, FakePaymentRow] = {}
         self.subscriptions: dict[UUID, FakeSubscriptionRow] = {}
+        self.refunds: dict[UUID, FakeRefundRow] = {}
         self.access_versions: dict[UUID, int] = {}
         self.outbox_tasks: dict[str, FakeOutboxTaskRow] = {}
         self.events: list[
@@ -140,6 +160,79 @@ class InMemoryPurchaseRepository:
             failure_reason=payment.failure_reason,
             subscription_ends_at=sub_ends_at,
             auth_access_delivered=auth_delivered,
+        )
+
+    async def get_user_billing_overview(
+        self,
+        user_id: UUID,
+    ) -> UserBillingOverviewData:
+        """Читает сводные данные для экрана Э2 «Моя подписка» (T-23)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+
+        user_subs = sorted(
+            [sub for sub in self.subscriptions.values() if sub.user_id == user_id],
+            key=lambda s: (s.ends_at, s.created_at),
+            reverse=True,
+        )
+        latest_sub = user_subs[0] if user_subs else None
+        latest_ends_at = latest_sub.ends_at if latest_sub is not None else None
+        has_succeeded_refund = False
+        has_processing_refund = False
+        auth_delivered = False
+
+        if latest_sub is not None:
+            auth_task = self.outbox_tasks.get(
+                f'payment_succeeded:{latest_sub.payment_id}:auth_access'
+            )
+            auth_delivered = auth_task is not None and auth_task.status == 'completed'
+            for refund in self.refunds.values():
+                if refund.payment_id == latest_sub.payment_id:
+                    if refund.status == 'succeeded':
+                        has_succeeded_refund = True
+                    elif refund.status == 'processing':
+                        has_processing_refund = True
+
+        user_payments = sorted(
+            [p for p in self.payments.values() if p.user_id == user_id],
+            key=lambda p: p.created_at,
+            reverse=True,
+        )
+        pending_pid: UUID | None = None
+        history: list[UserPaymentHistoryItemData] = []
+        for p in user_payments:
+            if p.status == 'pending' and pending_pid is None:
+                pending_pid = p.id
+            active_refund: Literal['processing', 'succeeded'] | None = None
+            for refund in self.refunds.values():
+                if refund.payment_id == p.id and refund.status in (
+                    'processing',
+                    'succeeded',
+                ):
+                    active_refund = (
+                        'succeeded' if refund.status == 'succeeded' else 'processing'
+                    )
+                    break
+            history.append(
+                UserPaymentHistoryItemData(
+                    payment_id=p.id,
+                    created_at=p.created_at,
+                    tariff_title='Премиум',
+                    amount_kopeks=p.amount_kopeks,
+                    currency=p.currency,
+                    status=p.status,
+                    failure_reason=p.failure_reason,
+                    refund_status=active_refund,
+                )
+            )
+        return UserBillingOverviewData(
+            pending_payment_id=pending_pid,
+            latest_subscription_ends_at=latest_ends_at,
+            latest_subscription_has_succeeded_refund=has_succeeded_refund,
+            latest_subscription_has_processing_refund=has_processing_refund,
+            latest_subscription_auth_delivered=auth_delivered,
+            tariff_price_kopeks=29_900,
+            payments=history,
         )
 
     async def get_payment_by_provider_id(

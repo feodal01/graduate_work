@@ -95,8 +95,9 @@ class BillingIntegrationCheck:
         self._check_yookassa_webhook_and_emulator_t18()
         self._check_outbox_worker_t19()
         self._check_notifications_and_expiration_scheduling_t20_t21_t22()
+        self._check_my_subscription_screen_and_summary_t23()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06..T-22 live Docker checks passed.')
+        print('All Billing T-06..T-23 live Docker checks passed.')
 
     def _http(
         self,
@@ -1825,6 +1826,130 @@ class BillingIntegrationCheck:
         ).stdout.strip()
         if ntf_rows != '3':
             raise AssertionError(f'Expected 3 transactional deliveries, got {ntf_rows}')
+
+    def _check_my_subscription_screen_and_summary_t23(self) -> None:
+        """T-23 (US-U-05, BIL-FR-09, BIL-API-02): live /billing/ and /me/summary."""
+        # 1. Unauthenticated browser request redirects to /billing/login
+        unauth = self._http('GET', '/billing/', follow_redirects=False)
+        if unauth.status != 303 or '/billing/login' not in (
+            unauth.header('location') or ''
+        ):
+            raise AssertionError(f'Expected 303 redirect to login, got {unauth}')
+
+        unauth_api = self._http(
+            'GET',
+            '/api/v1/billing/me/summary',
+            headers={'X-Request-Id': 't23-unauth'},
+        )
+        if unauth_api.status != 401:
+            raise AssertionError(f'Expected 401 on /me/summary, got {unauth_api}')
+
+        # 2. Sign up and log in user via /billing/login
+        login = f'SubT23_{uuid4().hex[:8]}'
+        password = 'Saffron-Citadel-SubT23-2026!'
+        signup_code = (
+            'import asyncio, httpx\n'
+            'from core.config import settings\n'
+            'async def s():\n'
+            '    base = str(settings.auth_client.service_url).rstrip("/")\n'
+            '    async with httpx.AsyncClient() as c:\n'
+            '        r = await c.post(\n'
+            '            f"{base}/api/v1/auth/signup",\n'
+            '            json={\n'
+            f'                "login": "{login}",\n'
+            f'                "password": "{password}",\n'
+            '                "tz": "Europe/Moscow",\n'
+            '            },\n'
+            '            headers={"X-Request-Id": "t23-signup"},\n'
+            '        )\n'
+            '        print("uid=" + r.json()["id"])\n'
+            'asyncio.run(s())\n'
+        )
+        out = self._compose(
+            'exec', '-T', 'billing-api', 'python', '-c', signup_code
+        ).strip()
+        uid = next(
+            line.split('=', 1)[1]
+            for line in out.splitlines()
+            if line.startswith('uid=')
+        )
+
+        form_data = urllib.parse.urlencode(
+            {'login': login, 'password': password, 'next': '/billing/'}
+        ).encode('utf-8')
+        login_res = self._http(
+            'POST',
+            '/billing/login',
+            data=form_data,
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            follow_redirects=False,
+        )
+        assert login_res.status == 303, login_res.text()
+        cookie_header = '; '.join(
+            c.split(';', 1)[0] for c in login_res.set_cookies if '=' in c
+        )
+
+        # Rule 7: No subscription yet
+        r7_html = self._http(
+            'GET', '/billing/', headers={'Cookie': cookie_header}
+        ).text()
+        if 'Нет подписки' not in r7_html or 'Оформить за 299 ₽' not in r7_html:
+            raise AssertionError(f'Expected Rule 7 on /billing/, got {r7_html}')
+
+        r7_json = self._http(
+            'GET',
+            '/api/v1/billing/me/summary',
+            headers={'Cookie': cookie_header, 'X-Request-Id': 't23-r7'},
+        ).json()
+        assert r7_json['rule_number'] == 7
+        assert r7_json['status_display'] == 'Нет подписки'
+        assert r7_json['can_subscribe'] is True
+
+        # Insert active subscription + completed auth outbox task -> Rule 3
+        pid = str(uuid4())
+        sid = str(uuid4())
+        tid = str(uuid4())
+        sql = (
+            f'INSERT INTO payments (id, user_id, tariff_id, provider_code, '
+            f'amount_kopeks, currency, status, idempotency_key) VALUES '
+            f"('{pid}', '{uid}', '00000000-0000-0000-0000-000000000001', "
+            f"'yookassa', 29900, 'RUB', 'succeeded', '{pid}'); "
+            f'INSERT INTO subscriptions (id, user_id, tariff_id, payment_id, '
+            f'starts_at, ends_at) VALUES '
+            f"('{sid}', '{uid}', '00000000-0000-0000-0000-000000000001', "
+            f"'{pid}', now(), now() + interval '30 days'); "
+            f'INSERT INTO outbox_tasks (id, dedup_key, target_service, task_type, '
+            f'payment_id, user_id, access_version, payload, status) VALUES '
+            f"('{tid}', 't23:{pid}', 'auth', 'sync_access', '{pid}', '{uid}', "
+            f"1, '{{}}'::jsonb, 'completed');"
+        )
+        assert self._psql(sql).returncode == 0
+
+        r3_html = self._http(
+            'GET', '/billing/', headers={'Cookie': cookie_header}
+        ).text()
+        if 'Активна до ' not in r3_html or pid not in r3_html:
+            raise AssertionError(
+                f'Expected Rule 3 and payment in history, got {r3_html}'
+            )
+
+        r3_json = self._http(
+            'GET',
+            '/api/v1/billing/me/summary',
+            headers={'Cookie': cookie_header, 'X-Request-Id': 't23-r3'},
+        ).json()
+        assert r3_json['rule_number'] == 3
+        assert r3_json['can_subscribe'] is False
+        assert len(r3_json['payments']) == 1
+        assert r3_json['payments'][0]['payment_id'] == pid
+
+        # Clean up test records
+        cleanup_sql = (
+            f"DELETE FROM outbox_tasks WHERE payment_id = '{pid}'; "
+            f"DELETE FROM subscriptions WHERE payment_id = '{pid}'; "
+            f"DELETE FROM payments WHERE id = '{pid}';"
+        )
+        assert self._psql(cleanup_sql).returncode == 0
 
     def _check_degradation_and_worker_graceful_shutdown(self) -> None:
         """BIL-API-15, GW-NFR-R-01, BIL-NFR-R-09: DB outage yields 503; worker stops."""

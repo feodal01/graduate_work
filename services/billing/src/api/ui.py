@@ -65,6 +65,24 @@ def _is_secure_request(request: Request) -> bool:
     return request.url.scheme == 'https' or first_proto == 'https'
 
 
+@router.get('/', response_class=HTMLResponse)
+async def get_my_subscription_page(
+    request: Request,
+    user: Annotated[AuthenticatedUser, Depends(require_ui_user)],
+    purchase_service: Annotated[PurchaseService, Depends(get_purchase_service)],
+) -> HTMLResponse:
+    """Экран «Моя подписка» Э2: статус и история (BIL-FR-09, BIL-API-02)."""
+    view = await purchase_service.get_my_subscription_view(
+        user_id=user.user_id,
+        user_tz=user.tz,
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name='my_subscription.html',
+        context={'view': view, 'user': user},
+    )
+
+
 @router.get('/login', response_class=HTMLResponse)
 async def get_login_page(
     request: Request,

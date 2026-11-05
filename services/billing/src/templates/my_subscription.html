@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+
+{% block title %}Моя подписка — Биллинг{% endblock %}
+
+{% block content %}
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+    <h1 style="margin: 0;">Моя подписка</h1>
+    <div style="display: flex; align-items: center; gap: 12px;">
+        <span>Пользователь: <strong>{{ user.login }}</strong> ({{ user.tz }})</span>
+        <form method="post" action="/billing/logout" style="margin: 0;">
+            <button type="submit" class="btn" style="background-color: #475569; padding: 6px 12px; font-size: 14px;">Выйти</button>
+        </form>
+    </div>
+</div>
+
+<div class="{% if view.status_key == 'active' %}alert-success{% else %}alert-info{% endif %}" role="status">
+    <p style="margin: 0;"><strong>Статус подписки:</strong> {{ view.status_display }}</p>
+</div>
+
+{% if view.action_type == 'continue_payment' and view.action_url %}
+<p style="margin-bottom: 24px;">
+    <a href="{{ view.action_url }}" class="btn">{{ view.action_label }}</a>
+</p>
+{% elif view.action_type == 'subscribe' %}
+<form method="post" action="/billing/subscribe" style="margin-bottom: 24px;">
+    <button type="submit" class="btn">{{ view.action_label }}</button>
+</form>
+{% endif %}
+
+<h2 style="font-size: 18px; margin-top: 28px; margin-bottom: 12px;">История платежей</h2>
+{% if view.payments %}
+<table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+    <thead>
+        <tr style="border-bottom: 2px solid #cbd5e1; text-align: left;">
+            <th style="padding: 8px;">Дата</th>
+            <th style="padding: 8px;">Тариф</th>
+            <th style="padding: 8px;">Сумма</th>
+            <th style="padding: 8px;">Статус</th>
+            <th style="padding: 8px;">Возврат</th>
+            <th style="padding: 8px;">Детали</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for row in view.payments %}
+        <tr style="border-bottom: 1px solid #e2e8f0;">
+            <td style="padding: 8px;">{{ row.created_at_display }}</td>
+            <td style="padding: 8px;">{{ row.tariff_title }}</td>
+            <td style="padding: 8px;">{{ row.amount_display }}</td>
+            <td style="padding: 8px;">{{ row.status_display }}</td>
+            <td style="padding: 8px;">{{ row.refund_badge_display or '—' }}</td>
+            <td style="padding: 8px;">
+                <a href="{{ row.result_url }}">{{ row.payment_id }}</a>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p style="color: #64748b;">Платежей пока не было.</p>
+{% endif %}
+{% endblock %}
