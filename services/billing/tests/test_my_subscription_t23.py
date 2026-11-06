@@ -351,3 +351,112 @@ def test_my_subscription_html_and_json_summary_all_rules_and_history_isolation()
         assert r_503.status_code == 503
         assert 'Сервис авторизации временно недоступен' in r_503.text
         assert str(paid_pid) not in r_503.text
+
+        r_503_json = client.get(
+            '/api/v1/billing/me/summary',
+            headers={
+                'X-Request-Id': 'req-t23-auth-503',
+                'Authorization': f'Bearer {token}',
+            },
+        )
+        assert r_503_json.status_code == 503
+        assert r_503_json.json()['error_code'] == 'auth_unavailable'
+        assert str(paid_pid) not in r_503_json.text
+
+
+def test_my_subscription_unhappy_paths_per_scenario_step() -> None:
+    """T-23 (US-U-05, 03-us-u-05): unhappy paths для каждого шага сценария Э2."""
+    user_id = uuid4()
+    tariff_id = UUID('00000000-0000-0000-0000-000000000001')
+    repo = InMemoryPurchaseRepository()
+    provider = FakeProviderGateway()
+    auth = ConfigurableAuthGateway(
+        user_id=user_id,
+        login='<script>alert(1)</script>',
+        tz='Invalid/Timezone_From_Auth',
+    )
+    app = _build_t23_app(repo, provider, auth)
+    token = 'expired-or-revoked-token'
+
+    paid_pid = uuid4()
+    now_utc = datetime(2026, 11, 5, 12, 0, tzinfo=UTC)
+    repo.payments[paid_pid] = FakePaymentRow(
+        id=paid_pid,
+        user_id=user_id,
+        tariff_id=tariff_id,
+        provider_code='yookassa',
+        amount_kopeks=29_950,
+        currency='RUB',
+        status='succeeded',
+        idempotency_key=paid_pid,
+        created_at=now_utc,
+    )
+
+    with TestClient(app) as client:
+        client.cookies.set(ACCESS_TOKEN_COOKIE, token)
+
+        # Шаг 1 (проверка токена в Auth): токен протух/отозван -> редирект на вход / 401
+        auth.invalid_token = True
+        expired_ui = client.get('/billing/', follow_redirects=False)
+        assert expired_ui.status_code == 303
+        assert expired_ui.headers['location'].startswith('/billing/login')
+
+        expired_json = client.get(
+            '/api/v1/billing/me/summary',
+            headers={
+                'X-Request-Id': 'req-t23-expired',
+                'Authorization': f'Bearer {token}',
+            },
+        )
+        assert expired_json.status_code == 401
+        assert expired_json.json()['error_code'] == 'unauthenticated'
+        auth.invalid_token = False
+
+        # Шаг 1b (JSON API без X-Request-Id): отклоняется с 400
+        missing_req_id = client.get(
+            '/api/v1/billing/me/summary',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+        assert missing_req_id.status_code == 400
+
+        # Шаг 2 (чтение из БД Биллинга): БД недоступна -> 503 без раскрытия данных
+        repo.db_unavailable = True
+        db_down_ui = client.get('/billing/')
+        assert db_down_ui.status_code == 503
+        assert str(paid_pid) not in db_down_ui.text
+
+        db_down_json = client.get(
+            '/api/v1/billing/me/summary',
+            headers={
+                'X-Request-Id': 'req-t23-db-down',
+                'Authorization': f'Bearer {token}',
+            },
+        )
+        assert db_down_json.status_code == 503
+        assert db_down_json.json()['error_code'] == 'database_unavailable'
+        repo.db_unavailable = False
+
+        # Шаг 3 (перевод часового пояса и экранирование HTML):
+        # невалидный tz из Auth безопасно деградирует в UTC (12:00),
+        # а HTML в логине экранируется шаблоном Jinja2
+        fallback_ui = client.get('/billing/')
+        assert fallback_ui.status_code == 200
+        assert '05.11.2026 12:00' in fallback_ui.text
+        assert '299,50 ₽' in fallback_ui.text
+        assert '<script>alert(1)</script>' not in fallback_ui.text
+        assert '&lt;script&gt;alert(1)&lt;/script&gt;' in fallback_ui.text
+
+        # Шаг 4 (попытка купить подписку POST /billing/subscribe при блокирующих
+        # правилах 2/3 и 4): отклоняется с 409 Conflict без вызова ЮKassa
+        repo.has_active_subscription = True
+        sub_409_active = client.post('/billing/subscribe')
+        assert sub_409_active.status_code == 409
+        assert 'Подписка уже активна' in sub_409_active.text
+        assert provider.create_calls == []
+
+        repo.has_active_subscription = False
+        repo.has_processing_refund = True
+        sub_409_refund = client.post('/billing/subscribe')
+        assert sub_409_refund.status_code == 409
+        assert 'возврат находится в обработке' in sub_409_refund.text
+        assert provider.create_calls == []

@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 from api.errors import BillingDomainError
 from clients.auth import (
+    AuthInvalidCredentialsError,
     AuthPermanentDeliveryError,
     AuthServiceUnavailableError,
     SubscriptionAccessSyncResult,
@@ -747,6 +748,7 @@ class ConfigurableAuthGateway:
         self.user_login = login
         self.tz = tz
         self.unavailable = unavailable
+        self.invalid_token = False
         self.permanent_error: AuthPermanentDeliveryError | None = None
         self.synced_access_calls: list[tuple[UUID, int, str | None]] = []
         self.seen_request_ids: list[str] = []
@@ -757,6 +759,8 @@ class ConfigurableAuthGateway:
         """Эмулирует вход."""
         if self.unavailable:
             raise AuthServiceUnavailableError('Auth is down')
+        if self.invalid_token:
+            raise AuthInvalidCredentialsError('Invalid credentials')
         return 'acc', 'ref'
 
     async def get_current_user(
@@ -765,6 +769,8 @@ class ConfigurableAuthGateway:
         """Возвращает пользователя или имитирует отказ Auth."""
         if self.unavailable:
             raise AuthServiceUnavailableError('Auth is down')
+        if self.invalid_token:
+            raise AuthInvalidCredentialsError('Token expired or revoked')
         return self.user_id, self.user_login, self.tz
 
     async def logout(

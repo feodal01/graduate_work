@@ -1943,6 +1943,52 @@ class BillingIntegrationCheck:
         assert len(r3_json['payments']) == 1
         assert r3_json['payments'][0]['payment_id'] == pid
 
+        # Unhappy path: POST /billing/subscribe while Rule 3 active -> 409 error screen
+        sub_409 = self._http(
+            'POST',
+            '/billing/subscribe',
+            headers={'Cookie': cookie_header},
+            follow_redirects=False,
+        )
+        if sub_409.status != 409 or 'Подписка уже активна' not in sub_409.text():
+            raise AssertionError(
+                f'Expected 409 error page on subscribe while active, got {sub_409}'
+            )
+
+        # Unhappy path: Auth outage on /billing/ and /me/summary -> 503 without leak
+        self._compose('stop', 'auth')
+        try:
+            auth_down_ui = self._http(
+                'GET',
+                '/billing/',
+                headers={'Cookie': cookie_header},
+                follow_redirects=False,
+            )
+            if (
+                auth_down_ui.status != 503
+                or 'Сервис авторизации временно недоступен' not in auth_down_ui.text()
+                or pid in auth_down_ui.text()
+            ):
+                raise AssertionError(
+                    f'Expected 503 without data leak on /billing/, got {auth_down_ui}'
+                )
+
+            auth_down_json = self._http(
+                'GET',
+                '/api/v1/billing/me/summary',
+                headers={'Cookie': cookie_header, 'X-Request-Id': 't23-auth-down'},
+            )
+            if (
+                auth_down_json.status != 503
+                or auth_down_json.json().get('error_code') != 'auth_unavailable'
+            ):
+                raise AssertionError(
+                    f'Expected 503 on /me/summary, got {auth_down_json}'
+                )
+        finally:
+            self._compose('start', 'auth')
+            self._wait_for_billing_and_auth_health()
+
         # Clean up test records
         cleanup_sql = (
             f"DELETE FROM outbox_tasks WHERE payment_id = '{pid}'; "
