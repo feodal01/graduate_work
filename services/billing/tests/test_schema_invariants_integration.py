@@ -1331,3 +1331,70 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
         )
     assert not_found_exc.value.status_code == 404
     assert not_found_exc.value.error_code == 'payment_not_found'
+
+    # 5. T-31 (BIL-API-11): выборка проблемных задач outbox в PostgreSQL
+    from repositories.purchase import InternalOutboxFilter
+
+    now_utc = datetime.now(UTC)
+    intervene_task_id = uuid4()
+    old_pending_task_id = uuid4()
+    fresh_pending_task_id = uuid4()
+    async with session_factory() as session:
+        session.add_all(
+            [
+                OutboxTask(
+                    id=intervene_task_id,
+                    dedup_key=f't31_intervene:{intervene_task_id}',
+                    target_service='auth',
+                    task_type='sync_access',
+                    payment_id=payment.id,
+                    user_id=user_id,
+                    access_version=3,
+                    payload={'version': 3},
+                    status='requires_intervention',
+                    attempts=20,
+                    last_error='Auth HTTP 404',
+                    created_at=now_utc - timedelta(seconds=10),
+                    updated_at=now_utc - timedelta(seconds=10),
+                ),
+                OutboxTask(
+                    id=old_pending_task_id,
+                    dedup_key=f't31_old:{old_pending_task_id}',
+                    target_service='notifications',
+                    task_type='payment_succeeded_email',
+                    payment_id=payment.id,
+                    user_id=user_id,
+                    access_version=None,
+                    payload={'subject': 'Test'},
+                    status='pending',
+                    attempts=4,
+                    last_error='Notifications HTTP 503',
+                    created_at=now_utc - timedelta(minutes=15),
+                    updated_at=now_utc - timedelta(minutes=1),
+                ),
+                OutboxTask(
+                    id=fresh_pending_task_id,
+                    dedup_key=f't31_fresh:{fresh_pending_task_id}',
+                    target_service='notifications',
+                    task_type='payment_succeeded_email',
+                    payment_id=payment.id,
+                    user_id=user_id,
+                    access_version=None,
+                    payload={'subject': 'Fresh'},
+                    status='pending',
+                    attempts=0,
+                    last_error=None,
+                    created_at=now_utc - timedelta(minutes=1),
+                    updated_at=now_utc - timedelta(minutes=1),
+                ),
+            ]
+        )
+        await session.commit()
+
+    ob_total, ob_items = await repo.list_internal_outbox_tasks(
+        InternalOutboxFilter(user_id=user_id),
+        stuck_threshold_seconds=600,
+        now_utc=now_utc,
+    )
+    assert ob_total == 2
+    assert [t.id for t in ob_items] == [intervene_task_id, old_pending_task_id]

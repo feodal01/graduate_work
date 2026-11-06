@@ -134,6 +134,14 @@ class BillingOutboxTaskItem:
     created_at: datetime
     updated_at: datetime
     can_retry_or_close: bool
+    payment_id: UUID | None = None
+    user_id: UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BillingOutboxTasksPage:
+    total: int
+    items: tuple[BillingOutboxTaskItem, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,6 +507,10 @@ class BillingAdminClient:
                     created_at=_parse_iso_datetime(t['created_at']),
                     updated_at=_parse_iso_datetime(t['updated_at']),
                     can_retry_or_close=bool(t.get('can_retry_or_close', False)),
+                    payment_id=(
+                        _parse_uuid(t['payment_id']) if t.get('payment_id') is not None else None
+                    ),
+                    user_id=_parse_uuid(t['user_id']) if t.get('user_id') is not None else None,
                 )
                 for t in raw_tasks
             )
@@ -531,6 +543,64 @@ class BillingAdminClient:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise BillingContractError('Invalid payment card payload') from exc
+
+    def list_outbox_tasks(
+        self,
+        *,
+        request_id: str,
+        target_service: str | None = None,
+        status: str | None = None,
+        user_id: UUID | None = None,
+        payment_id: UUID | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> BillingOutboxTasksPage:
+        params: dict[str, Any] = {'limit': limit, 'offset': offset}
+        if target_service:
+            params['target_service'] = target_service
+        if status:
+            params['status'] = status
+        if user_id is not None:
+            params['user_id'] = str(user_id)
+        if payment_id is not None:
+            params['payment_id'] = str(payment_id)
+        if date_from:
+            params['date_from'] = date_from
+        if date_to:
+            params['date_to'] = date_to
+
+        body = self._get_json('/outbox-tasks', params=params, request_id=request_id)
+        try:
+            total = int(body['total'])
+            raw_items = body['items']
+            if not isinstance(raw_items, list):
+                raise TypeError('items must be a list')
+            items = tuple(
+                BillingOutboxTaskItem(
+                    id=_parse_uuid(t['id']),
+                    target_service=str(t['target_service']),
+                    task_type=str(t['task_type']),
+                    access_version=(
+                        int(t['access_version']) if t.get('access_version') is not None else None
+                    ),
+                    status=str(t['status']),
+                    attempts=int(t['attempts']),
+                    last_error=(str(t['last_error']) if t.get('last_error') is not None else None),
+                    created_at=_parse_iso_datetime(t['created_at']),
+                    updated_at=_parse_iso_datetime(t['updated_at']),
+                    can_retry_or_close=bool(t.get('can_retry_or_close', False)),
+                    payment_id=(
+                        _parse_uuid(t['payment_id']) if t.get('payment_id') is not None else None
+                    ),
+                    user_id=_parse_uuid(t['user_id']) if t.get('user_id') is not None else None,
+                )
+                for t in raw_items
+            )
+            return BillingOutboxTasksPage(total=total, items=items)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BillingContractError('Invalid outbox tasks payload') from exc
 
     def create_refund(
         self,

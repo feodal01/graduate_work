@@ -13,6 +13,7 @@ from dependencies import (
     require_internal_service,
 )
 from repositories.purchase import (
+    InternalOutboxFilter,
     InternalPaymentFilter,
     InternalSubscriptionFilter,
     PurchaseRepository,
@@ -107,6 +108,13 @@ class InternalOutboxTaskItemResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     can_retry_or_close: bool
+    payment_id: UUID | None = None
+    user_id: UUID | None = None
+
+
+class InternalOutboxTasksListResponse(BaseModel):
+    total: int
+    items: list[InternalOutboxTaskItemResponse]
 
 
 class InternalPaymentCardResponse(BaseModel):
@@ -402,8 +410,71 @@ async def get_internal_payment_card(
                 created_at=t.created_at,
                 updated_at=t.updated_at,
                 can_retry_or_close=t.can_retry_or_close,
+                payment_id=t.payment_id,
+                user_id=t.user_id,
             )
             for t in card.outbox_tasks
+        ],
+    )
+
+
+@router.get(
+    '/outbox-tasks',
+    response_model=InternalOutboxTasksListResponse,
+    responses={
+        401: {'description': 'Invalid or missing service API key'},
+        422: {'description': 'Invalid filter parameters'},
+        503: {'description': 'Database is unavailable'},
+    },
+)
+async def get_internal_outbox_tasks(
+    repo: Annotated[PurchaseRepository, Depends(get_purchase_repository)],
+    target_service: Literal['auth', 'notifications'] | None = None,
+    status: Literal['pending', 'requires_intervention'] | None = None,
+    user_id: UUID | None = None,
+    payment_id: UUID | None = None,
+    created_from: datetime | None = None,
+    created_to: datetime | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> InternalOutboxTasksListResponse:
+    lower = _normalize_bound(created_from, date_from, is_upper=False)
+    upper = _normalize_bound(created_to, date_to, is_upper=True)
+    _validate_date_range(lower, upper)
+
+    total, rows = await repo.list_internal_outbox_tasks(
+        InternalOutboxFilter(
+            target_service=target_service,
+            status=status,
+            user_id=user_id,
+            payment_id=payment_id,
+            created_from=lower,
+            created_to=upper,
+            limit=limit,
+            offset=offset,
+        ),
+        stuck_threshold_seconds=settings.worker.billing_stuck_threshold_seconds,
+    )
+    return InternalOutboxTasksListResponse(
+        total=total,
+        items=[
+            InternalOutboxTaskItemResponse(
+                id=t.id,
+                target_service=t.target_service,
+                task_type=t.task_type,
+                access_version=t.access_version,
+                status=t.status,
+                attempts=t.attempts,
+                last_error=t.last_error,
+                created_at=t.created_at,
+                updated_at=t.updated_at,
+                can_retry_or_close=t.can_retry_or_close,
+                payment_id=t.payment_id,
+                user_id=t.user_id,
+            )
+            for t in rows
         ],
     )
 

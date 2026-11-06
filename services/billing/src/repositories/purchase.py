@@ -6,7 +6,7 @@ from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
 import sentry_sdk
-from sqlalchemy import and_, exists, func, or_, select, text
+from sqlalchemy import and_, case, exists, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -214,6 +214,20 @@ class InternalOutboxTaskItemData:
     created_at: datetime
     updated_at: datetime
     can_retry_or_close: bool
+    payment_id: UUID | None = None
+    user_id: UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class InternalOutboxFilter:
+    target_service: Literal['auth', 'notifications'] | None = None
+    status: Literal['pending', 'requires_intervention'] | None = None
+    user_id: UUID | None = None
+    payment_id: UUID | None = None
+    created_from: datetime | None = None
+    created_to: datetime | None = None
+    limit: int = 50
+    offset: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,6 +329,14 @@ class PurchaseRepository(Protocol):
         *,
         now_utc: datetime | None = None,
     ) -> InternalPaymentCardData | None: ...
+
+    async def list_internal_outbox_tasks(
+        self,
+        filters: InternalOutboxFilter,
+        *,
+        stuck_threshold_seconds: int = 600,
+        now_utc: datetime | None = None,
+    ) -> tuple[int, list[InternalOutboxTaskItemData]]: ...
 
     async def get_payment_by_provider_id(
         self,
@@ -1248,6 +1270,8 @@ class SQLAlchemyPurchaseRepository:
                             created_at=t.created_at,
                             updated_at=t.updated_at,
                             can_retry_or_close=(t_status == 'requires_intervention'),
+                            payment_id=t.payment_id,
+                            user_id=t.user_id,
                         )
                     )
 
@@ -1271,6 +1295,101 @@ class SQLAlchemyPurchaseRepository:
                     operation_events=event_items,
                     outbox_tasks=task_items,
                 )
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def list_internal_outbox_tasks(
+        self,
+        filters: InternalOutboxFilter,
+        *,
+        stuck_threshold_seconds: int = 600,
+        now_utc: datetime | None = None,
+    ) -> tuple[int, list[InternalOutboxTaskItemData]]:
+        now = now_utc or datetime.now(UTC)
+        stuck_cutoff = now - timedelta(seconds=stuck_threshold_seconds)
+
+        conditions: list[Any] = []
+        if filters.status == 'requires_intervention':
+            conditions.append(OutboxTask.status == 'requires_intervention')
+        elif filters.status == 'pending':
+            conditions.append(
+                and_(
+                    OutboxTask.status == 'pending',
+                    OutboxTask.created_at <= stuck_cutoff,
+                )
+            )
+        else:
+            conditions.append(
+                or_(
+                    OutboxTask.status == 'requires_intervention',
+                    and_(
+                        OutboxTask.status == 'pending',
+                        OutboxTask.created_at <= stuck_cutoff,
+                    ),
+                )
+            )
+        if filters.target_service is not None:
+            conditions.append(OutboxTask.target_service == filters.target_service)
+        if filters.user_id is not None:
+            conditions.append(OutboxTask.user_id == filters.user_id)
+        if filters.payment_id is not None:
+            conditions.append(OutboxTask.payment_id == filters.payment_id)
+        if filters.created_from is not None:
+            conditions.append(OutboxTask.created_at >= filters.created_from)
+        if filters.created_to is not None:
+            conditions.append(OutboxTask.created_at <= filters.created_to)
+
+        try:
+            async with self._session_factory() as session:
+                count_stmt = select(func.count(OutboxTask.id)).where(*conditions)
+                total = int(await session.scalar(count_stmt) or 0)
+
+                priority_order = case(
+                    (OutboxTask.status == 'requires_intervention', 0),
+                    else_=1,
+                )
+                stmt = (
+                    select(OutboxTask)
+                    .where(*conditions)
+                    .order_by(
+                        priority_order.asc(),
+                        OutboxTask.created_at.desc(),
+                        OutboxTask.id.desc(),
+                    )
+                    .limit(filters.limit)
+                    .offset(filters.offset)
+                )
+                rows = list(await session.scalars(stmt))
+                items: list[InternalOutboxTaskItemData] = []
+                for t in rows:
+                    t_status: Literal[
+                        'pending', 'completed', 'requires_intervention', 'closed'
+                    ] = (
+                        'requires_intervention'
+                        if t.status == 'requires_intervention'
+                        else 'pending'
+                    )
+                    items.append(
+                        InternalOutboxTaskItemData(
+                            id=t.id,
+                            target_service=(
+                                'notifications'
+                                if t.target_service == 'notifications'
+                                else 'auth'
+                            ),
+                            task_type=t.task_type,
+                            access_version=t.access_version,
+                            status=t_status,
+                            attempts=t.attempts,
+                            last_error=t.last_error,
+                            created_at=t.created_at,
+                            updated_at=t.updated_at,
+                            can_retry_or_close=(t_status == 'requires_intervention'),
+                            payment_id=t.payment_id,
+                            user_id=t.user_id,
+                        )
+                    )
+                return total, items
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 

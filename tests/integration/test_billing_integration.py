@@ -102,7 +102,7 @@ class BillingIntegrationCheck:
         self._check_admin_billing_lists_t27()
         self._check_refund_lifecycle_t29()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06..T-30 (FEAT-01..FEAT-03) live Docker checks passed.')
+        print('All Billing T-06..T-31 live Docker checks passed.')
 
     def _http(
         self,
@@ -2567,6 +2567,45 @@ class BillingIntegrationCheck:
             ):
                 raise AssertionError(
                     f'Expected 400 on empty refund reason, got {empty_ref_post}'
+                )
+
+            # 5c. T-31 (ADM-FR-03, BIL-API-11): undelivered outbox tasks tab in admin
+            tid_t31 = str(uuid4())
+            assert (
+                self._psql(
+                    f'INSERT INTO outbox_tasks '
+                    f'(id, dedup_key, target_service, task_type, payment_id, '
+                    f'user_id, access_version, payload, status, attempts, last_error) '
+                    f"VALUES ('{tid_t31}', 't31:{tid_t31}', 'auth', 'sync_access', "
+                    f"'{pid}', '{uid}', 1, '{{}}'::jsonb, 'requires_intervention', "
+                    f"20, 'Auth HTTP 404 user not found');"
+                ).returncode
+                == 0
+            )
+            try:
+                undeliv_res = self._admin_http(
+                    'GET',
+                    f'/admin/billing/payments/?tab=undelivered&q={login}',
+                    admin_cookie=admin_cookie,
+                )
+                undeliv_body = undeliv_res.text()
+                if (
+                    undeliv_res.status != 200
+                    or tid_t31 not in undeliv_body
+                    or login not in undeliv_body
+                    or 'Auth HTTP 404 user not found' not in undeliv_body
+                    or 'Повторить' not in undeliv_body
+                    or 'Закрыть с причиной' not in undeliv_body
+                ):
+                    raise AssertionError(
+                        f'Unexpected undelivered outbox tab: {undeliv_body}'
+                    )
+            finally:
+                assert (
+                    self._psql(
+                        f"DELETE FROM outbox_tasks WHERE id = '{tid_t31}';"
+                    ).returncode
+                    == 0
                 )
 
             # 6. Auth unavailable -> admin lists still return 200 OK with UUID & UTC

@@ -30,6 +30,7 @@ from domain.subscription import (
 from repositories.purchase import (
     DeliveryOutcome,
     InternalOperationEventItemData,
+    InternalOutboxFilter,
     InternalOutboxTaskItemData,
     InternalPaymentCardData,
     InternalPaymentFilter,
@@ -120,6 +121,8 @@ class FakeOutboxTaskRow:
     attempts: int = 0
     last_error: str | None = None
     next_retry_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class InMemoryPurchaseRepository:
@@ -991,9 +994,11 @@ class InMemoryPurchaseRepository:
                     status=t_status,
                     attempts=t.attempts,
                     last_error=t.last_error,
-                    created_at=pay.created_at,
-                    updated_at=pay.updated_at,
+                    created_at=t.created_at,
+                    updated_at=t.updated_at,
                     can_retry_or_close=(t_status == 'requires_intervention'),
+                    payment_id=t.payment_id,
+                    user_id=t.user_id,
                 )
             )
 
@@ -1030,6 +1035,87 @@ class InMemoryPurchaseRepository:
             operation_events=event_items,
             outbox_tasks=task_items,
         )
+
+    async def list_internal_outbox_tasks(
+        self,
+        filters: InternalOutboxFilter,
+        *,
+        stuck_threshold_seconds: int = 600,
+        now_utc: datetime | None = None,
+    ) -> tuple[int, list[InternalOutboxTaskItemData]]:
+        """Возвращает проблемные задачи outbox для админки (T-31, BIL-API-11)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        now = now_utc or datetime.now(UTC)
+        stuck_cutoff = now - timedelta(seconds=stuck_threshold_seconds)
+        matched_rows: list[FakeOutboxTaskRow] = []
+
+        for t in self.outbox_tasks.values():
+            if filters.status == 'requires_intervention':
+                if t.status != 'requires_intervention':
+                    continue
+            elif filters.status == 'pending':
+                if not (t.status == 'pending' and t.created_at <= stuck_cutoff):
+                    continue
+            else:
+                if not (
+                    t.status == 'requires_intervention'
+                    or (t.status == 'pending' and t.created_at <= stuck_cutoff)
+                ):
+                    continue
+            if (
+                filters.target_service is not None
+                and t.target_service != filters.target_service
+            ):
+                continue
+            if filters.user_id is not None and t.user_id != filters.user_id:
+                continue
+            if filters.payment_id is not None and t.payment_id != filters.payment_id:
+                continue
+            if filters.created_from is not None and t.created_at < filters.created_from:
+                continue
+            if filters.created_to is not None and t.created_at > filters.created_to:
+                continue
+            matched_rows.append(t)
+
+        matched_rows.sort(
+            key=lambda r: (
+                0 if r.status == 'requires_intervention' else 1,
+                -r.created_at.timestamp(),
+                r.id,
+            )
+        )
+        items: list[InternalOutboxTaskItemData] = []
+        for t in matched_rows:
+            t_status: Literal[
+                'pending', 'completed', 'requires_intervention', 'closed'
+            ] = (
+                'requires_intervention'
+                if t.status == 'requires_intervention'
+                else 'pending'
+            )
+            items.append(
+                InternalOutboxTaskItemData(
+                    id=t.id,
+                    target_service=(
+                        'notifications'
+                        if t.target_service == 'notifications'
+                        else 'auth'
+                    ),
+                    task_type=t.task_type,
+                    access_version=t.access_version,
+                    status=t_status,
+                    attempts=t.attempts,
+                    last_error=t.last_error,
+                    created_at=t.created_at,
+                    updated_at=t.updated_at,
+                    can_retry_or_close=(t_status == 'requires_intervention'),
+                    payment_id=t.payment_id,
+                    user_id=t.user_id,
+                )
+            )
+        total = len(items)
+        return total, items[filters.offset : filters.offset + filters.limit]
 
     async def get_refund(self, refund_id: UUID) -> FakeRefundRow | None:
         """Возвращает возврат по ID (T-29)."""

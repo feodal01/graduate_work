@@ -131,6 +131,9 @@ class OutboxTaskCardRowView:
     created_utc_display: str
     created_local_display: str
     can_retry_or_close: bool
+    payment_id: UUID | None = None
+    user_id: UUID | None = None
+    user_login: str | None = None
 
 
 def format_amount_rub(amount_kopeks: int, currency: str = 'RUB') -> str:
@@ -419,6 +422,8 @@ def payments_list(request: HttpRequest) -> HttpResponse:
     elif tab == 'stuck' or (not tab and stuck_param == 'true'):
         stuck = True
         active_tab = 'stuck'
+    elif tab == 'undelivered':
+        active_tab = 'undelivered'
     else:
         active_tab = 'all'
 
@@ -545,6 +550,68 @@ def payments_list(request: HttpRequest) -> HttpResponse:
                     )
                 user_id_filter = found.user_id
                 known_profiles[found.user_id] = found
+
+    if active_tab == 'undelivered':
+        try:
+            outbox_page = get_billing_client().list_outbox_tasks(
+                request_id=request_id,
+                user_id=user_id_filter,
+                payment_id=payment_id_filter,
+                date_from=date_from,
+                date_to=date_to,
+                limit=limit,
+                offset=offset,
+            )
+        except BillingUnavailableError:
+            return render(
+                request,
+                'admin/billing/unavailable.html',
+                status=503,
+            )
+
+        task_uids = [t.user_id for t in outbox_page.items if t.user_id is not None]
+        profiles, enrich_degraded = _enrich_profiles(
+            task_uids,
+            request_id=request_id,
+            known_profiles=known_profiles,
+        )
+        if enrich_degraded and auth_warning is None:
+            auth_warning = (
+                'Сервис Auth временно недоступен: показаны UUID пользователей и даты в UTC.'
+            )
+
+        outbox_rows = tuple(
+            _build_task_card_row(
+                t,
+                profiles[t.user_id].tz if t.user_id and t.user_id in profiles else None,
+                user_login=(
+                    profiles[t.user_id].login if t.user_id and t.user_id in profiles else None
+                ),
+            )
+            for t in outbox_page.items
+        )
+        prev_offset = max(0, offset - limit) if offset > 0 else None
+        next_offset = offset + limit if offset + limit < outbox_page.total else None
+        return render(
+            request,
+            'admin/billing/payments_list.html',
+            {
+                'rows': (),
+                'outbox_rows': outbox_rows,
+                'total': outbox_page.total,
+                'q': query,
+                'search_by': search_by,
+                'active_tab': active_tab,
+                'date_from': date_from or '',
+                'date_to': date_to or '',
+                'limit': limit,
+                'offset': offset,
+                'prev_offset': prev_offset,
+                'next_offset': next_offset,
+                'auth_warning': auth_warning,
+                'filter_error': None,
+            },
+        )
 
     try:
         billing_client = get_billing_client()
@@ -800,6 +867,8 @@ def _build_event_card_row(
 def _build_task_card_row(
     item: BillingOutboxTaskItem,
     user_tz: str | None,
+    *,
+    user_login: str | None = None,
 ) -> OutboxTaskCardRowView:
     return OutboxTaskCardRowView(
         id=item.id,
@@ -813,6 +882,9 @@ def _build_task_card_row(
         created_utc_display=format_utc_datetime(item.created_at),
         created_local_display=format_user_tz_datetime(item.created_at, user_tz),
         can_retry_or_close=item.can_retry_or_close,
+        payment_id=item.payment_id,
+        user_id=item.user_id,
+        user_login=user_login,
     )
 
 

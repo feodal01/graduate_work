@@ -28,7 +28,8 @@
   <a href="{% url 'admin:billing_payments' %}?tab=succeeded&amp;search_by={{ search_by }}&amp;q={{ q }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}">{% if active_tab == 'succeeded' %}<strong>[Оплачен]</strong>{% else %}Оплачен{% endif %}</a> |
   <a href="{% url 'admin:billing_payments' %}?tab=failed&amp;search_by={{ search_by }}&amp;q={{ q }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}">{% if active_tab == 'failed' %}<strong>[Не оплачен]</strong>{% else %}Не оплачен{% endif %}</a> |
   <a href="{% url 'admin:billing_payments' %}?tab=has_refund&amp;search_by={{ search_by }}&amp;q={{ q }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}">{% if active_tab == 'has_refund' %}<strong>[Есть возврат]</strong>{% else %}Есть возврат{% endif %}</a> |
-  <a href="{% url 'admin:billing_payments' %}?tab=stuck&amp;search_by={{ search_by }}&amp;q={{ q }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}">{% if active_tab == 'stuck' %}<strong>[Зависшие операции]</strong>{% else %}Зависшие операции{% endif %}</a>
+  <a href="{% url 'admin:billing_payments' %}?tab=stuck&amp;search_by={{ search_by }}&amp;q={{ q }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}">{% if active_tab == 'stuck' %}<strong>[Зависшие операции]</strong>{% else %}Зависшие операции{% endif %}</a> |
+  <a href="{% url 'admin:billing_payments' %}?tab=undelivered&amp;search_by={{ search_by }}&amp;q={{ q }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}">{% if active_tab == 'undelivered' %}<strong>[Не доставлено в Auth или Notifications]</strong>{% else %}Не доставлено в Auth или Notifications{% endif %}</a>
 </p>
 
 <form method="get" action="{% url 'admin:billing_payments' %}" style="margin-bottom: 16px;">
@@ -37,7 +38,9 @@
   <select id="id_search_by" name="search_by">
     <option value="user" {% if search_by == 'user' %}selected{% endif %}>Логин или UUID пользователя</option>
     <option value="payment_id" {% if search_by == 'payment_id' %}selected{% endif %}>UUID платежа</option>
+    {% if active_tab != 'undelivered' %}
     <option value="provider_payment_id" {% if search_by == 'provider_payment_id' %}selected{% endif %}>Номер в ЮKassa</option>
+    {% endif %}
   </select>
   <label for="id_q">Значение:</label>
   <input id="id_q" type="text" name="q" value="{{ q }}" placeholder="Логин, UUID или номер ЮKassa" size="40">
@@ -46,9 +49,72 @@
   <label for="id_date_to">по:</label>
   <input id="id_date_to" type="date" name="date_to" value="{{ date_to }}">
   <button type="submit" class="button">Найти</button>
-  <a href="{% url 'admin:billing_payments' %}">Сбросить</a>
+  <a href="{% url 'admin:billing_payments' %}?tab={{ active_tab }}">Сбросить</a>
 </form>
 
+{% if active_tab == 'undelivered' %}
+<p>Найдено проблемных задач доставки: <strong>{{ total }}</strong></p>
+
+<table>
+  <thead>
+    <tr>
+      <th>ID задачи</th>
+      <th>Пользователь (логин и UUID)</th>
+      <th>Платёж</th>
+      <th>Сервис</th>
+      <th>Тип задачи</th>
+      <th>Версия доступа</th>
+      <th>Статус</th>
+      <th>Попыток</th>
+      <th>Последняя ошибка</th>
+      <th>Создана (UTC)</th>
+      <th>Создана (часовой пояс пользователя)</th>
+      <th>Действия</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for task in outbox_rows %}
+    <tr>
+      <td><code>{{ task.id }}</code></td>
+      <td>
+        {% if task.user_login %}<strong>{{ task.user_login }}</strong><br>{% endif %}
+        {% if task.user_id %}<code>{{ task.user_id }}</code>{% else %}—{% endif %}
+      </td>
+      <td>
+        {% if task.payment_id %}
+          <a href="{% url 'admin:billing_payment_detail' task.payment_id %}"><code>{{ task.payment_id }}</code></a>
+        {% else %}
+          —
+        {% endif %}
+      </td>
+      <td><code>{{ task.target_service }}</code></td>
+      <td><code>{{ task.task_type }}</code></td>
+      <td>{{ task.access_version }}</td>
+      <td>{{ task.status_label }} (<code>{{ task.status_code }}</code>)</td>
+      <td>{{ task.attempts }}</td>
+      <td>{{ task.last_error }}</td>
+      <td>{{ task.created_utc_display }}</td>
+      <td>{{ task.created_local_display }}</td>
+      <td>
+        {% if task.can_retry_or_close %}
+          <form method="post" action="/admin/billing/outbox-tasks/{{ task.id }}/retry/" style="display:inline;">
+            {% csrf_token %}
+            <button type="submit" class="button">Повторить</button>
+          </form>
+          <a class="button" href="/admin/billing/outbox-tasks/{{ task.id }}/close/">Закрыть с причиной</a>
+        {% else %}
+          —
+        {% endif %}
+      </td>
+    </tr>
+  {% empty %}
+    <tr>
+      <td colspan="12">Нет записей по выбранному фильтру.</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
 <p>Найдено платежей: <strong>{{ total }}</strong></p>
 
 <table>
@@ -92,6 +158,7 @@
   {% endfor %}
   </tbody>
 </table>
+{% endif %}
 
 {% if prev_offset is not None or next_offset is not None %}
 <p style="margin-top: 12px;">

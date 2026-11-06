@@ -18,6 +18,7 @@
       <th scope="row"><a href="{% url 'admin:billing_subscriptions' %}">Подписки пользователей</a></th>
       <td><a href="{% url 'admin:billing_payments' %}">Платежи и проблемные операции</a></td>
       <td><a href="{% url 'admin:billing_payments' %}?tab=stuck">Зависшие операции</a></td>
+      <td><a href="{% url 'admin:billing_payments' %}?tab=undelivered">Не доставлено в Auth или Notifications</a></td>
     </tr>
   </table>
 </div>
