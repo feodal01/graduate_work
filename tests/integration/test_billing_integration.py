@@ -102,7 +102,7 @@ class BillingIntegrationCheck:
         self._check_admin_billing_lists_t27()
         self._check_refund_lifecycle_t29()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06..T-33 live Docker checks passed.')
+        print('All Billing T-06..T-34 (FEAT-01..FEAT-04) live Docker checks passed.')
 
     def _http(
         self,
@@ -2893,8 +2893,17 @@ class BillingIntegrationCheck:
             '            confirmation_url="https://yookassa.test/confirm",\n'
             '            provider_details={"id": "yk_t29"},\n'
             '        )\n'
-            '        await rec.reconcile_payment(\n'
-            '            pay.id, source="webhook", respect_throttle=False\n'
+            '        # T-34: manual admin reconcile bypasses 5s throttle\n'
+            '        await repo.record_payment_checked(pay.id)\n'
+            '        adm_res = await rec.reconcile_operation_by_admin(\n'
+            '            "payment", pay.id\n'
+            '        )\n'
+            '        assert adm_res == (pay.id, "succeeded", True)\n'
+            '        card_after = await repo.get_internal_payment_card(pay.id)\n'
+            '        assert card_after is not None\n'
+            '        assert any(\n'
+            '            ev.to_status == "succeeded" and ev.source == "admin"\n'
+            '            for ev in card_after.operation_events\n'
             '        )\n'
             '        auth_url = str(settings.auth_client.service_url).rstrip("/")\n'
             '        chk_1 = await hc.post(\n'

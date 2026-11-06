@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from api.errors import BillingDomainError
+from clients.payment_provider import PaymentProviderError
 from core.config import settings
 from dependencies import (
     get_outbox_dispatcher,
@@ -136,6 +137,14 @@ class InternalAdminActionItemResponse(BaseModel):
 class InternalAdminActionsListResponse(BaseModel):
     total: int
     items: list[InternalAdminActionItemResponse]
+
+
+class ManualReconcileResponse(BaseModel):
+    operation_type: Literal['payment', 'refund']
+    operation_id: UUID
+    payment_id: UUID
+    status: str
+    transitioned: bool
 
 
 class InternalPaymentCardResponse(BaseModel):
@@ -689,4 +698,50 @@ async def get_internal_admin_actions(
             )
             for r in rows
         ],
+    )
+
+
+@router.post(
+    '/operations/{operation_type}/{operation_id}/reconcile',
+    response_model=ManualReconcileResponse,
+    responses={
+        401: {'description': 'Invalid or missing service API key'},
+        404: {'description': 'Operation not found'},
+        422: {'description': 'Invalid operation type or UUID'},
+        503: {'description': 'YooKassa or database is unavailable'},
+    },
+)
+async def post_internal_operation_reconcile(
+    operation_type: Literal['payment', 'refund'],
+    operation_id: UUID,
+    reconciler: Annotated[PaymentReconciler, Depends(get_payment_reconciler)],
+) -> ManualReconcileResponse:
+    try:
+        (
+            payment_id,
+            status_val,
+            transitioned,
+        ) = await reconciler.reconcile_operation_by_admin(
+            operation_type,
+            operation_id,
+        )
+    except LookupError as exc:
+        raise BillingDomainError(
+            'Operation not found',
+            error_code='operation_not_found',
+            status_code=404,
+        ) from exc
+    except PaymentProviderError as exc:
+        raise BillingDomainError(
+            'Не удалось связаться с платёжной системой ЮKassa',
+            error_code='payment_provider_unavailable',
+            status_code=503,
+        ) from exc
+
+    return ManualReconcileResponse(
+        operation_type=operation_type,
+        operation_id=operation_id,
+        payment_id=payment_id,
+        status=status_val,
+        transitioned=transitioned,
     )

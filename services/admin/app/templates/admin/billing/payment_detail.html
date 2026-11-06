@@ -24,7 +24,7 @@
     <a class="button" href="{% url 'admin:billing_payment_refund' payment_id %}">Вернуть</a>
   {% endif %}
   {% if card.can_reconcile_payment %}
-    <form method="post" action="/admin/billing/operations/payment/{{ payment_id }}/reconcile/" style="display:inline;">
+    <form method="post" action="{% url 'admin:billing_operation_reconcile' 'payment' payment_id %}" style="display:inline;">
       {% csrf_token %}
       <button type="submit" class="button">Проверить в ЮKassa</button>
     </form>
@@ -138,7 +138,7 @@
       <td>{{ ref.created_utc_display }}<br>{{ ref.created_local_display }}</td>
       <td>
         {% if ref.can_reconcile %}
-          <form method="post" action="/admin/billing/operations/refund/{{ ref.id }}/reconcile/" style="display:inline;">
+          <form method="post" action="{% url 'admin:billing_operation_reconcile' 'refund' ref.id %}" style="display:inline;">
             {% csrf_token %}
             <button type="submit" class="button">Проверить в ЮKassa</button>
           </form>

@@ -164,6 +164,15 @@ class BillingAdminActionsPage:
 
 
 @dataclass(frozen=True, slots=True)
+class BillingReconcileResult:
+    operation_type: str
+    operation_id: UUID
+    payment_id: UUID
+    status: str
+    transitioned: bool
+
+
+@dataclass(frozen=True, slots=True)
 class BillingPaymentCardData:
     id: UUID
     user_id: UUID
@@ -777,6 +786,29 @@ class BillingAdminClient:
             return BillingAdminActionsPage(total=total, items=items)
         except (KeyError, TypeError, ValueError) as exc:
             raise BillingContractError('Invalid admin actions payload') from exc
+
+    def reconcile_operation(
+        self,
+        operation_type: str,
+        operation_id: UUID,
+        *,
+        request_id: str,
+    ) -> BillingReconcileResult:
+        body = self._post_json(
+            f'/operations/{operation_type}/{operation_id}/reconcile',
+            json_body={},
+            request_id=request_id,
+        )
+        try:
+            return BillingReconcileResult(
+                operation_type=str(body['operation_type']),
+                operation_id=_parse_uuid(body['operation_id']),
+                payment_id=_parse_uuid(body['payment_id']),
+                status=str(body['status']),
+                transitioned=bool(body.get('transitioned', False)),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BillingContractError('Invalid reconcile payload') from exc
 
     def _post_json(
         self,

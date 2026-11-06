@@ -2,7 +2,7 @@ import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
 from opentelemetry import trace
@@ -271,6 +271,8 @@ class PaymentReconciler:
     async def _reconcile_background_payment(
         self,
         payment: PaymentRecordProtocol,
+        *,
+        source: ReconcileSource = 'reconcile',
     ) -> ReconcileOutcome:
         if payment.status != 'pending':
             return ReconcileOutcome(
@@ -296,7 +298,7 @@ class PaymentReconciler:
                 updated, transitioned = await self._repo.finalize_payment_failed(
                     payment.id,
                     failure_reason='idempotency_key_expired',
-                    source='reconcile',
+                    source=source,
                     public_base_url=self._public_base_url,
                 )
                 if transitioned and self._outbox_dispatcher is not None:
@@ -328,7 +330,7 @@ class PaymentReconciler:
                 updated, transitioned = await self._repo.finalize_payment_failed(
                     payment.id,
                     failure_reason=exc.message,
-                    source='reconcile',
+                    source=source,
                     public_base_url=self._public_base_url,
                 )
                 if transitioned and self._outbox_dispatcher is not None:
@@ -352,7 +354,7 @@ class PaymentReconciler:
 
         return await self.reconcile_payment_record(
             payment,
-            source='reconcile',
+            source=source,
             respect_throttle=False,
         )
 
@@ -618,6 +620,8 @@ class PaymentReconciler:
     async def _reconcile_background_refund(
         self,
         refund: RefundRecordProtocol,
+        *,
+        source: ReconcileSource = 'reconcile',
     ) -> RefundReconcileOutcome:
         if refund.status != 'processing':
             return self._build_refund_outcome(
@@ -656,7 +660,7 @@ class PaymentReconciler:
                     updated, transitioned = await finalize_rejected_fn(
                         refund.id,
                         rejection_reason='not_created_in_provider',
-                        source='reconcile',
+                        source=source,
                     )
                     return self._build_refund_outcome(
                         updated,
@@ -684,7 +688,7 @@ class PaymentReconciler:
                     updated, transitioned = await finalize_rejected_fn(
                         refund.id,
                         rejection_reason=exc.message,
-                        source='reconcile',
+                        source=source,
                     )
                     return self._build_refund_outcome(
                         updated,
@@ -699,9 +703,35 @@ class PaymentReconciler:
 
         return await self.reconcile_refund_record(
             refund,
-            source='reconcile',
+            source=source,
             respect_throttle=False,
         )
+
+    async def reconcile_operation_by_admin(
+        self,
+        operation_type: Literal['payment', 'refund'],
+        operation_id: UUID,
+    ) -> tuple[UUID, str, bool]:
+        """Принудительная сверка по кнопке администратора без лимита 5 с (BIL-FR-15)."""
+        if operation_type == 'payment':
+            payment = await self._repo.get_payment(operation_id)
+            if payment is None:
+                raise LookupError(f'Payment {operation_id} not found')
+            pay_out = await self._reconcile_background_payment(
+                payment,
+                source='admin',
+            )
+            return pay_out.payment_id, pay_out.status, pay_out.transitioned
+
+        get_refund_fn = getattr(self._repo, 'get_refund')
+        refund = await get_refund_fn(operation_id)
+        if refund is None:
+            raise LookupError(f'Refund {operation_id} not found')
+        ref_out = await self._reconcile_background_refund(
+            refund,
+            source='admin',
+        )
+        return ref_out.payment_id, ref_out.status, ref_out.transitioned
 
     async def reconcile_refund_record(
         self,

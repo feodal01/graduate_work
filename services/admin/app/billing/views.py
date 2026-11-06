@@ -945,6 +945,45 @@ def reverse_payments_url() -> str:
     return reverse('admin:billing_payments')
 
 
+def operation_reconcile(
+    request: HttpRequest,
+    operation_type: str,
+    operation_id: UUID,
+) -> HttpResponse:
+    if request.method != 'POST':
+        return redirect(reverse_payments_url())
+    if operation_type not in ('payment', 'refund'):
+        raise Http404('Неизвестный тип операции')
+
+    request_id = get_request_id(request)
+    try:
+        result = get_billing_client().reconcile_operation(
+            operation_type,
+            operation_id,
+            request_id=request_id,
+        )
+    except BillingNotFoundError as exc:
+        raise Http404('Операция не найдена') from exc
+    except BillingUnavailableError:
+        return render(
+            request,
+            'admin/billing/unavailable.html',
+            status=503,
+        )
+
+    if result.transitioned:
+        messages.success(
+            request,
+            f'Статус операции обновлён по данным ЮKassa: {result.status}.',
+        )
+    else:
+        messages.info(
+            request,
+            f'Статус операции в ЮKassa проверен (текущий статус: {result.status}).',
+        )
+    return redirect('admin:billing_payment_detail', payment_id=result.payment_id)
+
+
 def admin_actions_list(request: HttpRequest) -> HttpResponse:
     request_id = get_request_id(request)
     query = (request.GET.get('q') or '').strip()

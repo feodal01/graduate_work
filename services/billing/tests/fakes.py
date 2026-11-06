@@ -154,6 +154,8 @@ class InMemoryPurchaseRepository:
 
     async def get_payment(self, payment_id: UUID) -> FakePaymentRow | None:
         """Возвращает платёж по внутреннему UUID."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
         return self.payments.get(payment_id)
 
     async def get_payment_for_user(

@@ -101,6 +101,11 @@ class IntegratedAdminSite(admin.AdminSite):
                 self.admin_view(billing_views.admin_actions_list),
                 name='billing_admin_actions',
             ),
+            path(
+                'billing/operations/<str:operation_type>/<uuid:operation_id>/reconcile/',
+                self.admin_view(billing_views.operation_reconcile),
+                name='billing_operation_reconcile',
+            ),
         ]
         return custom_urls + super().get_urls()
 
