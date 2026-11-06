@@ -1227,3 +1227,107 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
     assert card_ref.refunds[0].status == 'succeeded'
 
     assert await repo.get_internal_payment_card(uuid4(), now_utc=now_utc) is None
+
+
+async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """T-29 (BIL-FR-10, BIL-NFR-R-02..03, инв. 4, 5, 7, 9, 11): возврат в БД."""
+    from api.errors import BillingDomainError
+    from repositories.purchase import SQLAlchemyPurchaseRepository
+
+    session_factory = migrated_billing_db
+    repo = SQLAlchemyPurchaseRepository(session_factory)
+    user_id = uuid4()
+    admin_id = uuid4()
+
+    payment, _ = await repo.get_or_create_pending_payment(user_id)
+    await repo.save_provider_payment_created(
+        payment.id,
+        provider_payment_id='yk_t29_pg_pay',
+        confirmation_url='https://yookassa.test/confirm',
+        provider_details={'id': 'yk_t29_pg_pay'},
+    )
+    await repo.finalize_payment_succeeded(payment.id, source='webhook')
+
+    # 1. Две параллельные попытки создать возврат дают 1 возврат processing (инв. 4)
+    res_1, res_2 = await asyncio.gather(
+        repo.get_or_create_processing_refund(
+            payment.id,
+            admin_user_id=admin_id,
+            reason='Первая попытка возврата',
+        ),
+        repo.get_or_create_processing_refund(
+            payment.id,
+            admin_user_id=admin_id,
+            reason='Первая попытка возврата',
+        ),
+    )
+    assert res_1[0].id == res_2[0].id
+    assert {res_1[1], res_2[1]} == {True, False}
+    ref_1 = res_1[0]
+
+    # 2. Первая попытка отменяется (rejected), после чего разрешена новая (инв. 4)
+    await repo.finalize_refund_rejected(
+        ref_1.id,
+        rejection_reason='rejected_by_provider',
+        source='reconcile',
+    )
+    ref_2, created_2 = await repo.get_or_create_processing_refund(
+        payment.id,
+        admin_user_id=admin_id,
+        reason='Вторая попытка возврата',
+    )
+    assert created_2 is True
+    assert ref_2.id != ref_1.id
+
+    # 3. Атомарная фиксация succeeded при гонке двух процессов (инв. 7)
+    await repo.save_provider_refund_created(
+        ref_2.id,
+        provider_refund_id='yk_t29_pg_ref_2',
+        provider_details={'id': 'yk_t29_pg_ref_2'},
+    )
+    fin_1, fin_2 = await asyncio.gather(
+        repo.finalize_refund_succeeded(ref_2.id, source='admin'),
+        repo.finalize_refund_succeeded(ref_2.id, source='webhook'),
+    )
+    assert {fin_1[1], fin_2[1]} == {True, False}
+
+    # Проверяем версию доступа (2) и 3 новые задачи outbox для возврата
+    async with session_factory() as session:
+        ver = await session.get(UserAccessVersion, user_id)
+        assert ver is not None and ver.last_version == 2
+        ref_tasks = list(
+            await session.scalars(
+                select(OutboxTask).where(
+                    OutboxTask.payment_id == payment.id,
+                    OutboxTask.dedup_key.like(f'refund_succeeded:{ref_2.id}:%'),
+                )
+            )
+        )
+        assert len(ref_tasks) == 3
+        actions = list(
+            await session.scalars(
+                select(AdminAction).where(AdminAction.admin_user_id == admin_id)
+            )
+        )
+        assert len(actions) == 2
+
+    # 4. Повторный возврат после succeeded запрещён с 409 (инв. 4, 5),
+    #    а для несуществующего payment_id возвращается 404 payment_not_found
+    with pytest.raises(BillingDomainError) as exc_info:
+        await repo.get_or_create_processing_refund(
+            payment.id,
+            admin_user_id=admin_id,
+            reason='Третья попытка',
+        )
+    assert exc_info.value.status_code == 409
+
+    with pytest.raises(BillingDomainError) as not_found_exc:
+        await repo.get_or_create_processing_refund(
+            uuid4(),
+            admin_user_id=admin_id,
+            reason='Неизвестный платёж',
+        )
+    assert not_found_exc.value.status_code == 404
+    assert not_found_exc.value.error_code == 'payment_not_found'

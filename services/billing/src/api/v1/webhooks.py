@@ -57,7 +57,12 @@ async def handle_yookassa_webhook(
 ) -> YooKassaWebhookResponse:
     """Обработчик входящих уведомлений ЮKassa (BIL-FR-07, BIL-API-05, US-S-01)."""
     try:
-        await reconciler.reconcile_by_provider_payment_id(
+        reconcile_fn = getattr(
+            reconciler,
+            'reconcile_by_provider_operation_id',
+            reconciler.reconcile_by_provider_payment_id,
+        )
+        await reconcile_fn(
             payload.object.id,
             source='webhook',
             respect_throttle=False,

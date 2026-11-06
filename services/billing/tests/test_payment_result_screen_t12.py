@@ -21,17 +21,19 @@ from tests.fakes import (
     ConfigurableAuthGateway,
     FakeOutboxTaskRow,
     FakePaymentRow,
+    FakeProviderGateway,
     FakeSubscriptionRow,
     InMemoryPurchaseRepository,
 )
 
 
-class ForbiddenProviderGateway:
+class ForbiddenProviderGateway(FakeProviderGateway):
     """Адаптер провайдера, падающий при любом вызове (0 запросов в ЮKassa)."""
 
     provider_code = 'yookassa'
 
     def __init__(self) -> None:
+        super().__init__()
         self.calls: int = 0
 
     async def create_payment(

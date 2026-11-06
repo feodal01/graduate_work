@@ -13,13 +13,17 @@ from clients.auth import (
 )
 from clients.payment_provider import (
     CreateProviderPaymentRequest,
+    CreateProviderRefundRequest,
     ProviderPaymentSnapshot,
+    ProviderRefundSnapshot,
 )
 from db.sql.errors import DatabaseUnavailableError
 from domain.subscription import (
     ReconcileSource,
+    build_cancel_expiration_email_payload,
     build_payment_failed_email_payload,
     build_payment_succeeded_email_payload,
+    build_refund_succeeded_email_payload,
     build_subscription_expiration_email_payload,
     compute_subscription_state,
 )
@@ -85,6 +89,20 @@ class FakeRefundRow:
     currency: str = 'RUB'
     provider_refund_id: str | None = None
     rejection_reason: str | None = None
+    provider_details: dict[str, Any] | None = None
+    last_checked_at: datetime | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass
+class FakeAdminActionRow:
+    id: UUID
+    admin_user_id: UUID
+    action_type: str
+    target_type: str
+    target_id: UUID
+    reason: str
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -116,6 +134,7 @@ class InMemoryPurchaseRepository:
         self.refunds: dict[UUID, FakeRefundRow] = {}
         self.access_versions: dict[UUID, int] = {}
         self.outbox_tasks: dict[str, FakeOutboxTaskRow] = {}
+        self.admin_actions: list[FakeAdminActionRow] = []
         self.events: list[
             tuple[str, UUID, str | None, str, str, dict[str, Any] | None]
         ] = []
@@ -1012,6 +1031,331 @@ class InMemoryPurchaseRepository:
             outbox_tasks=task_items,
         )
 
+    async def get_refund(self, refund_id: UUID) -> FakeRefundRow | None:
+        """Возвращает возврат по ID (T-29)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        return self.refunds.get(refund_id)
+
+    async def get_refund_by_provider_id(
+        self,
+        provider_code: str,
+        provider_refund_id: str,
+    ) -> FakeRefundRow | None:
+        """Возвращает возврат по provider_refund_id (T-29)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        for r in self.refunds.values():
+            if (
+                r.provider_code == provider_code
+                and r.provider_refund_id == provider_refund_id
+            ):
+                return r
+        return None
+
+    async def claim_next_due_processing_refund(
+        self,
+        *,
+        min_age_seconds: float,
+        throttle_seconds: float = 5.0,
+    ) -> FakeRefundRow | None:
+        """Выбирает возврат в статусе processing старше min_age_seconds (T-29)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        now_utc = datetime.now(UTC)
+        age_cutoff = now_utc - timedelta(seconds=min_age_seconds)
+        throttle_cutoff = now_utc - timedelta(seconds=throttle_seconds)
+        candidates = sorted(
+            [
+                r
+                for r in self.refunds.values()
+                if r.status == 'processing'
+                and r.created_at <= age_cutoff
+                and (r.last_checked_at is None or r.last_checked_at <= throttle_cutoff)
+            ],
+            key=lambda r: (
+                r.last_checked_at is not None,
+                r.last_checked_at or r.created_at,
+                r.created_at,
+            ),
+        )
+        if not candidates:
+            return None
+        chosen = candidates[0]
+        chosen.last_checked_at = now_utc
+        chosen.updated_at = now_utc
+        return chosen
+
+    async def get_or_create_processing_refund(
+        self,
+        payment_id: UUID,
+        *,
+        admin_user_id: UUID,
+        reason: str,
+        now_utc: datetime | None = None,
+    ) -> tuple[FakeRefundRow, bool]:
+        """Создаёт или возвращает существующий возврат в обработке (T-29, инв. 4, 5)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        pay = self.payments.get(payment_id)
+        if pay is None:
+            raise BillingDomainError(
+                'Payment not found',
+                error_code='payment_not_found',
+                status_code=404,
+            )
+        now = now_utc or datetime.now(UTC)
+        cleaned_reason = reason.strip()
+
+        for existing in self.refunds.values():
+            if existing.payment_id == payment_id and existing.status in (
+                'processing',
+                'succeeded',
+            ):
+                if existing.status == 'processing':
+                    return existing, False
+                raise BillingDomainError(
+                    'Возврат по данному платежу уже выполнен',
+                    error_code='refund_already_succeeded',
+                    status_code=409,
+                )
+
+        if pay.status != 'succeeded':
+            raise BillingDomainError(
+                'Возврат возможен только для оплаченного платежа активной подписки',
+                error_code='refund_not_allowed',
+                status_code=409,
+            )
+        sub = next(
+            (s for s in self.subscriptions.values() if s.payment_id == payment_id),
+            None,
+        )
+        if (
+            sub is None
+            or compute_subscription_state(
+                ends_at=sub.ends_at,
+                has_succeeded_refund=False,
+                now_utc=now,
+            )
+            != 'active'
+        ):
+            raise BillingDomainError(
+                'Возврат возможен только для платежа текущей активной подписки',
+                error_code='refund_not_allowed',
+                status_code=409,
+            )
+
+        refund_id = uuid4()
+        refund = FakeRefundRow(
+            id=refund_id,
+            payment_id=payment_id,
+            subscription_id=sub.id,
+            provider_code=pay.provider_code,
+            amount_kopeks=pay.amount_kopeks,
+            currency=pay.currency.strip(),
+            status='processing',
+            reason=cleaned_reason,
+            admin_user_id=admin_user_id,
+            idempotency_key=refund_id,
+            created_at=now,
+            updated_at=now,
+        )
+        self.refunds[refund_id] = refund
+        self.events.append(
+            (
+                'refund',
+                refund_id,
+                None,
+                'processing',
+                'admin',
+                {
+                    'payment_id': str(payment_id),
+                    'admin_user_id': str(admin_user_id),
+                    'reason': cleaned_reason,
+                },
+            )
+        )
+        self.admin_actions.append(
+            FakeAdminActionRow(
+                id=uuid4(),
+                admin_user_id=admin_user_id,
+                action_type='refund_requested',
+                target_type='refund',
+                target_id=refund_id,
+                reason=cleaned_reason,
+                created_at=now,
+            )
+        )
+        return refund, True
+
+    async def save_provider_refund_created(
+        self,
+        refund_id: UUID,
+        *,
+        provider_refund_id: str,
+        provider_details: dict[str, Any],
+    ) -> FakeRefundRow:
+        """Сохраняет номер возврата от провайдера (T-29)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        row = self.refunds[refund_id]
+        if row.status == 'processing':
+            row.provider_refund_id = provider_refund_id
+            row.provider_details = provider_details
+            row.updated_at = datetime.now(UTC)
+        return row
+
+    async def record_refund_checked(
+        self,
+        refund_id: UUID,
+        *,
+        provider_details: dict[str, Any] | None = None,
+    ) -> FakeRefundRow:
+        """Обновляет last_checked_at при сверке возврата в processing (T-29)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        now_utc = datetime.now(UTC)
+        row = self.refunds[refund_id]
+        if row.status == 'processing':
+            row.last_checked_at = now_utc
+            row.updated_at = now_utc
+            if provider_details is not None:
+                row.provider_details = provider_details
+        return row
+
+    async def record_refund_reconcile_error(
+        self,
+        refund_id: UUID,
+        *,
+        error_message: str,
+    ) -> FakeRefundRow:
+        """Фиксирует ошибку фоновой сверки возврата с backoff (T-29)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        now_utc = datetime.now(UTC)
+        row = self.refunds[refund_id]
+        if row.status == 'processing':
+            details = dict(row.provider_details or {})
+            prev_errors = details.get('_reconcile_errors', 0)
+            err_count = (
+                int(prev_errors) + 1 if isinstance(prev_errors, (int, str)) else 1
+            )
+            backoff_sec = min(300, 5 * (2 ** min(err_count - 1, 6)))
+            details['_reconcile_errors'] = err_count
+            details['_last_reconcile_error'] = error_message[:250]
+            row.provider_details = details
+            row.last_checked_at = now_utc + timedelta(seconds=max(0, backoff_sec - 5))
+            row.updated_at = now_utc
+        return row
+
+    async def finalize_refund_succeeded(
+        self,
+        refund_id: UUID,
+        *,
+        source: ReconcileSource,
+        provider_details: dict[str, Any] | None = None,
+        public_base_url: str = 'http://localhost',
+    ) -> tuple[FakeRefundRow, bool]:
+        """Атомарно переводит возврат в succeeded и ставит задачи в outbox (T-29)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        row = self.refunds[refund_id]
+        if row.status != 'processing':
+            return row, False
+        pay = self.payments[row.payment_id]
+        now_utc = datetime.now(UTC)
+        old_status = row.status
+        row.status = 'succeeded'
+        if provider_details is not None:
+            row.provider_details = provider_details
+        row.last_checked_at = now_utc
+        row.updated_at = now_utc
+
+        self.events.append(
+            ('refund', refund_id, old_status, 'succeeded', source, provider_details)
+        )
+        new_version = self.access_versions.get(pay.user_id, 0) + 1
+        self.access_versions[pay.user_id] = new_version
+
+        k1 = f'refund_succeeded:{refund_id}:sync_access'
+        self.outbox_tasks[k1] = FakeOutboxTaskRow(
+            id=uuid4(),
+            dedup_key=k1,
+            target_service='auth',
+            task_type='sync_access',
+            payment_id=pay.id,
+            user_id=pay.user_id,
+            access_version=new_version,
+            payload={'version': new_version, 'expires_at': None},
+        )
+        k2 = f'refund_succeeded:{refund_id}:cancel_expiration'
+        self.outbox_tasks[k2] = FakeOutboxTaskRow(
+            id=uuid4(),
+            dedup_key=k2,
+            target_service='notifications',
+            task_type='cancel_expiration_email',
+            payment_id=pay.id,
+            user_id=pay.user_id,
+            access_version=None,
+            payload=build_cancel_expiration_email_payload(
+                subscription_id=row.subscription_id,
+                user_id=pay.user_id,
+            ),
+        )
+        k3 = f'refund_succeeded:{refund_id}:notify_refund'
+        self.outbox_tasks[k3] = FakeOutboxTaskRow(
+            id=uuid4(),
+            dedup_key=k3,
+            target_service='notifications',
+            task_type='refund_succeeded_email',
+            payment_id=pay.id,
+            user_id=pay.user_id,
+            access_version=None,
+            payload=build_refund_succeeded_email_payload(
+                refund_id=refund_id,
+                payment_id=pay.id,
+                user_id=pay.user_id,
+                amount_kopeks=row.amount_kopeks,
+                currency=row.currency.strip(),
+                public_base_url=public_base_url,
+            ),
+        )
+        return row, True
+
+    async def finalize_refund_rejected(
+        self,
+        refund_id: UUID,
+        *,
+        rejection_reason: str,
+        source: ReconcileSource,
+        provider_details: dict[str, Any] | None = None,
+    ) -> tuple[FakeRefundRow, bool]:
+        """Переводит возврат в rejected с сохранением причины отказа (T-29)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        row = self.refunds[refund_id]
+        if row.status != 'processing':
+            return row, False
+        now_utc = datetime.now(UTC)
+        old_status = row.status
+        row.status = 'rejected'
+        row.rejection_reason = rejection_reason
+        if provider_details is not None:
+            row.provider_details = provider_details
+        row.last_checked_at = now_utc
+        row.updated_at = now_utc
+        self.events.append(
+            (
+                'refund',
+                refund_id,
+                old_status,
+                'rejected',
+                source,
+                {**(provider_details or {}), 'rejection_reason': rejection_reason},
+            )
+        )
+        return row, True
+
 
 class FakeProviderGateway:
     """Единый in-memory стаб платёжного провайдера для модульных TDD-тестов."""
@@ -1026,6 +1370,15 @@ class FakeProviderGateway:
         self.get_error: Exception | None = None
         self.get_status: str = 'pending'
         self.next_provider_num: int = 1
+        self.create_refund_calls: list[CreateProviderRefundRequest] = []
+        self.get_refund_calls: list[str] = []
+        self.create_refund_error: Exception | None = None
+        self.get_refund_error: Exception | None = None
+        self.find_refund_error: Exception | None = None
+        self.next_get_refund_status: str = 'succeeded'
+        self.next_get_refund_rejection_reason: str | None = None
+        self.metadata_refunds: dict[UUID, str] = {}
+        self.next_refund_num: int = 1
 
     async def create_payment(
         self,
@@ -1079,6 +1432,87 @@ class FakeProviderGateway:
                 str(expected_payment_id) if expected_payment_id else None
             ),
             provider_details={'id': provider_payment_id, 'status': self.get_status},
+        )
+
+    async def create_refund(
+        self,
+        request: CreateProviderRefundRequest,
+    ) -> ProviderRefundSnapshot:
+        """Эмулирует создание возврата в ЮKassa (T-29)."""
+        self.create_refund_calls.append(request)
+        if self.create_refund_error is not None:
+            raise self.create_refund_error
+        provider_refund_id = f'yk-ref-{self.next_refund_num}'
+        self.next_refund_num += 1
+        return ProviderRefundSnapshot(
+            provider_code='yookassa',
+            provider_refund_id=provider_refund_id,
+            provider_payment_id=request.provider_payment_id,
+            domain_status='processing',
+            amount_kopeks=request.amount_kopeks,
+            currency=request.currency,
+            rejection_reason=None,
+            metadata_refund_id=str(request.refund_id),
+            provider_details={'id': provider_refund_id, 'status': 'pending'},
+        )
+
+    async def get_refund(
+        self,
+        provider_refund_id: str,
+        *,
+        expected_refund_id: UUID | None = None,
+        expected_amount_kopeks: int | None = None,
+        expected_currency: str | None = None,
+    ) -> ProviderRefundSnapshot:
+        """Эмулирует чтение статуса возврата в ЮKassa (T-29)."""
+        self.get_refund_calls.append(provider_refund_id)
+        if self.get_refund_error is not None:
+            raise self.get_refund_error
+        return ProviderRefundSnapshot(
+            provider_code='yookassa',
+            provider_refund_id=provider_refund_id,
+            provider_payment_id='yk-pay-1',
+            domain_status=self.next_get_refund_status,  # type: ignore[arg-type]
+            amount_kopeks=expected_amount_kopeks or 29_900,
+            currency=expected_currency or 'RUB',
+            rejection_reason=(
+                self.next_get_refund_rejection_reason or 'canceled_by_provider'
+                if self.next_get_refund_status == 'rejected'
+                else None
+            ),
+            metadata_refund_id=(
+                str(expected_refund_id) if expected_refund_id else None
+            ),
+            provider_details={
+                'id': provider_refund_id,
+                'status': self.next_get_refund_status,
+            },
+        )
+
+    async def find_refund_by_metadata(
+        self,
+        provider_payment_id: str,
+        *,
+        refund_id: UUID,
+        expected_amount_kopeks: int | None = None,
+        expected_currency: str | None = None,
+    ) -> ProviderRefundSnapshot | None:
+        """Эмулирует розыск возврата по metadata в списке ЮKassa (T-29, инв. 14)."""
+        if self.find_refund_error is not None:
+            raise self.find_refund_error
+        prov_ref_id = self.metadata_refunds.get(refund_id)
+        if prov_ref_id is None:
+            return None
+        return ProviderRefundSnapshot(
+            provider_code='yookassa',
+            provider_refund_id=prov_ref_id,
+            provider_payment_id=provider_payment_id,
+            domain_status=self.next_get_refund_status,  # type: ignore[arg-type]
+            amount_kopeks=expected_amount_kopeks or 29_900,
+            currency=expected_currency or 'RUB',
+            rejection_reason=None,
+            metadata_refund_id=str(refund_id),
+            provider_details={'id': prov_ref_id, 'payment_id': provider_payment_id},
         )
 
 

@@ -12,6 +12,7 @@ import sentry_sdk
 logger = logging.getLogger(__name__)
 
 DomainPaymentStatus = Literal['pending', 'succeeded', 'failed']
+DomainRefundStatus = Literal['processing', 'succeeded', 'rejected']
 _SAFE_PROVIDER_ID_RE = re.compile(r'^[A-Za-z0-9._-]{1,128}$')
 
 
@@ -78,6 +79,29 @@ class ProviderPaymentSnapshot:
     provider_details: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class CreateProviderRefundRequest:
+    refund_id: UUID
+    idempotency_key: UUID
+    provider_payment_id: str
+    amount_kopeks: int
+    currency: str
+    description: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRefundSnapshot:
+    provider_code: str
+    provider_refund_id: str
+    provider_payment_id: str | None
+    domain_status: DomainRefundStatus
+    amount_kopeks: int
+    currency: str
+    rejection_reason: str | None
+    metadata_refund_id: str | None
+    provider_details: dict[str, Any]
+
+
 class PaymentProviderGateway(Protocol):
     provider_code: str
 
@@ -94,6 +118,29 @@ class PaymentProviderGateway(Protocol):
         expected_amount_kopeks: int | None = None,
         expected_currency: str | None = None,
     ) -> ProviderPaymentSnapshot: ...
+
+    async def create_refund(
+        self,
+        request: CreateProviderRefundRequest,
+    ) -> ProviderRefundSnapshot: ...
+
+    async def get_refund(
+        self,
+        provider_refund_id: str,
+        *,
+        expected_refund_id: UUID | None = None,
+        expected_amount_kopeks: int | None = None,
+        expected_currency: str | None = None,
+    ) -> ProviderRefundSnapshot: ...
+
+    async def find_refund_by_metadata(
+        self,
+        provider_payment_id: str,
+        *,
+        refund_id: UUID,
+        expected_amount_kopeks: int | None = None,
+        expected_currency: str | None = None,
+    ) -> ProviderRefundSnapshot | None: ...
 
 
 def _raise_protocol_anomaly(message: str) -> None:
@@ -229,6 +276,100 @@ class YooKassaProviderAdapter:
                 f'got {snapshot.provider_payment_id!r}'
             )
         return snapshot
+
+    async def create_refund(
+        self,
+        request: CreateProviderRefundRequest,
+    ) -> ProviderRefundSnapshot:
+        safe_pay_id = validate_provider_operation_id(request.provider_payment_id)
+        payload = {
+            'payment_id': safe_pay_id,
+            'amount': {
+                'value': format_kopeks_as_decimal(request.amount_kopeks),
+                'currency': request.currency,
+            },
+            'description': request.description,
+            'metadata': {
+                'refund_id': str(request.refund_id),
+            },
+        }
+        headers = {
+            'Idempotence-Key': str(request.idempotency_key),
+        }
+        data = await self._request(
+            'POST',
+            '/refunds',
+            json_body=payload,
+            headers=headers,
+            is_creation=True,
+        )
+        return self._to_refund_snapshot(
+            data,
+            expected_refund_id=request.refund_id,
+            expected_amount_kopeks=request.amount_kopeks,
+            expected_currency=request.currency,
+        )
+
+    async def get_refund(
+        self,
+        provider_refund_id: str,
+        *,
+        expected_refund_id: UUID | None = None,
+        expected_amount_kopeks: int | None = None,
+        expected_currency: str | None = None,
+    ) -> ProviderRefundSnapshot:
+        safe_id = validate_provider_operation_id(provider_refund_id)
+        data = await self._request(
+            'GET',
+            f'/refunds/{safe_id}',
+            is_creation=False,
+        )
+        snapshot = self._to_refund_snapshot(
+            data,
+            expected_refund_id=expected_refund_id,
+            expected_amount_kopeks=expected_amount_kopeks,
+            expected_currency=expected_currency,
+        )
+        if snapshot.provider_refund_id != provider_refund_id.strip():
+            _raise_integrity_mismatch(
+                f'Provider refund id mismatch: requested {provider_refund_id!r}, '
+                f'got {snapshot.provider_refund_id!r}'
+            )
+        return snapshot
+
+    async def find_refund_by_metadata(
+        self,
+        provider_payment_id: str,
+        *,
+        refund_id: UUID,
+        expected_amount_kopeks: int | None = None,
+        expected_currency: str | None = None,
+    ) -> ProviderRefundSnapshot | None:
+        safe_pay_id = validate_provider_operation_id(provider_payment_id)
+        data = await self._request(
+            'GET',
+            f'/refunds?payment_id={safe_pay_id}',
+            is_creation=False,
+        )
+        items = data.get('items')
+        if not isinstance(items, list):
+            _raise_protocol_anomaly('Missing items list in YooKassa GET /refunds')
+        assert isinstance(items, list)
+        target_id = str(refund_id)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            meta = item.get('metadata')
+            if isinstance(meta, dict) and str(meta.get('refund_id') or '').strip() == (
+                target_id
+            ):
+                return self._to_refund_snapshot(
+                    item,
+                    expected_refund_id=refund_id,
+                    expected_amount_kopeks=expected_amount_kopeks,
+                    expected_currency=expected_currency,
+                )
+        return None
 
     async def _request(
         self,
@@ -424,5 +565,88 @@ class YooKassaProviderAdapter:
             confirmation_url=confirmation_url,
             failure_reason=failure_reason,
             metadata_payment_id=metadata_payment_id,
+            provider_details=data,
+        )
+
+    def _to_refund_snapshot(
+        self,
+        data: dict[str, Any],
+        *,
+        expected_refund_id: UUID | None,
+        expected_amount_kopeks: int | None,
+        expected_currency: str | None,
+    ) -> ProviderRefundSnapshot:
+        provider_refund_id = str(data.get('id') or '').strip()
+        raw_status = str(data.get('status') or '').strip()
+        if not provider_refund_id or not raw_status:
+            _raise_protocol_anomaly('Missing refund id or status in YooKassa response')
+
+        status_map: dict[str, DomainRefundStatus] = {
+            'pending': 'processing',
+            'succeeded': 'succeeded',
+            'canceled': 'rejected',
+        }
+        if raw_status not in status_map:
+            _raise_protocol_anomaly(
+                f'Unknown YooKassa refund status {raw_status!r} '
+                f'for {provider_refund_id}'
+            )
+        domain_status = status_map[raw_status]
+
+        amount_obj = data.get('amount')
+        if not isinstance(amount_obj, dict):
+            _raise_protocol_anomaly('Missing amount object in YooKassa refund response')
+        assert isinstance(amount_obj, dict)
+        amount_kopeks = parse_decimal_to_kopeks(str(amount_obj.get('value') or ''))
+        currency = str(amount_obj.get('currency') or '').strip()
+
+        metadata_obj = data.get('metadata')
+        metadata_refund_id: str | None = None
+        if isinstance(metadata_obj, dict) and metadata_obj.get('refund_id') is not None:
+            metadata_refund_id = str(metadata_obj['refund_id']).strip()
+
+        if (
+            expected_amount_kopeks is not None
+            and amount_kopeks != expected_amount_kopeks
+        ):
+            _raise_integrity_mismatch(
+                f'Refund amount mismatch for {provider_refund_id}: '
+                f'expected {expected_amount_kopeks}, got {amount_kopeks}'
+            )
+        if expected_currency is not None and currency != expected_currency.strip():
+            _raise_integrity_mismatch(
+                f'Refund currency mismatch for {provider_refund_id}: '
+                f'expected {expected_currency!r}, got {currency!r}'
+            )
+        if expected_refund_id is not None and metadata_refund_id != str(
+            expected_refund_id
+        ):
+            _raise_integrity_mismatch(
+                f'Metadata refund_id mismatch for {provider_refund_id}: '
+                f'expected {expected_refund_id}, got {metadata_refund_id!r}'
+            )
+
+        provider_payment_id: str | None = None
+        if data.get('payment_id') is not None:
+            provider_payment_id = str(data['payment_id']).strip() or None
+
+        rejection_reason: str | None = None
+        cancellation_obj = data.get('cancellation_details')
+        if isinstance(cancellation_obj, dict):
+            raw_reason = cancellation_obj.get('reason')
+            if isinstance(raw_reason, str) and raw_reason.strip():
+                rejection_reason = raw_reason.strip()
+        if domain_status == 'rejected' and not rejection_reason:
+            rejection_reason = 'canceled_by_provider'
+
+        return ProviderRefundSnapshot(
+            provider_code=self.provider_code,
+            provider_refund_id=provider_refund_id,
+            provider_payment_id=provider_payment_id,
+            domain_status=domain_status,
+            amount_kopeks=amount_kopeks,
+            currency=currency,
+            rejection_reason=rejection_reason,
+            metadata_refund_id=metadata_refund_id,
             provider_details=data,
         )

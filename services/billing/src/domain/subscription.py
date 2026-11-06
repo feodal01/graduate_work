@@ -214,6 +214,56 @@ def build_payment_failed_email_payload(
     }
 
 
+def build_cancel_expiration_email_payload(
+    *,
+    subscription_id: UUID,
+    user_id: UUID,
+) -> dict[str, Any]:
+    """Формирует payload отмены письма об окончании подписки (инвариант 12, US-A-04)."""
+    campaign_id = deterministic_id('subscription_expiration', subscription_id)
+    return {
+        'campaign_id': str(campaign_id),
+        'subscription_id': str(subscription_id),
+        'user_id': str(user_id),
+    }
+
+
+def build_refund_succeeded_email_payload(
+    *,
+    refund_id: UUID,
+    payment_id: UUID,
+    user_id: UUID,
+    amount_kopeks: int,
+    currency: str = 'RUB',
+    public_base_url: str = 'http://localhost',
+) -> dict[str, Any]:
+    """Формирует payload письма «Возврат выполнен» (4.4, US-A-04)."""
+    base_url = public_base_url.rstrip('/')
+    my_sub_url = f'{base_url}/billing/'
+    rubles, kopeks = divmod(amount_kopeks, 100)
+    suffix = '₽' if currency.strip().upper() == 'RUB' else currency.strip()
+    amount_display = (
+        f'{rubles} {suffix}' if kopeks == 0 else f'{rubles},{kopeks:02d} {suffix}'
+    )
+    campaign_id = deterministic_id('refund_succeeded_email', refund_id)
+    batch_id = deterministic_id('refund_succeeded_batch', refund_id)
+    return {
+        'campaign_id': str(campaign_id),
+        'batch_id': str(batch_id),
+        'user_id': str(user_id),
+        'template_id': 'billing_notification',
+        'subject': 'Возврат средств по подписке «Премиум» выполнен',
+        'text': (
+            f'Возврат средств на сумму {amount_display} по подписке «Премиум» '
+            f'выполнен. Доступ к новинкам закрыт. '
+            f'Подробности на странице: {my_sub_url}'
+        ),
+        'available_at': None,
+        'refund_id': str(refund_id),
+        'payment_id': str(payment_id),
+    }
+
+
 MySubscriptionStatusKey = Literal[
     'pending_payment',
     'activating',

@@ -3,16 +3,21 @@ from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from api.errors import BillingDomainError
 from core.config import settings
-from dependencies import get_purchase_repository, require_internal_service
+from dependencies import (
+    get_payment_reconciler,
+    get_purchase_repository,
+    require_internal_service,
+)
 from repositories.purchase import (
     InternalPaymentFilter,
     InternalSubscriptionFilter,
     PurchaseRepository,
 )
+from services.reconciler import PaymentReconciler
 
 router = APIRouter(
     tags=['internal-billing'],
@@ -123,6 +128,21 @@ class InternalPaymentCardResponse(BaseModel):
     refunds: list[InternalRefundItemResponse]
     operation_events: list[InternalOperationEventItemResponse]
     outbox_tasks: list[InternalOutboxTaskItemResponse]
+
+
+class CreateRefundRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    admin_user_id: UUID
+    reason: str
+
+    @field_validator('reason')
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError('reason must not be empty')
+        return cleaned
 
 
 def _normalize_bound(
@@ -385,4 +405,50 @@ async def get_internal_payment_card(
             )
             for t in card.outbox_tasks
         ],
+    )
+
+
+@router.post(
+    '/payments/{payment_id}/refunds',
+    response_model=InternalRefundItemResponse,
+    responses={
+        401: {'description': 'Invalid or missing service API key'},
+        404: {'description': 'Payment not found'},
+        409: {'description': 'Refund is not allowed by domain rules'},
+        422: {'description': 'Empty reason or invalid payload'},
+        503: {'description': 'Database is unavailable'},
+    },
+)
+async def post_internal_payment_refund(
+    payment_id: UUID,
+    payload: CreateRefundRequest,
+    reconciler: Annotated[PaymentReconciler, Depends(get_payment_reconciler)],
+) -> InternalRefundItemResponse:
+    outcome = await reconciler.create_or_reconcile_refund(
+        payment_id,
+        admin_user_id=payload.admin_user_id,
+        reason=payload.reason,
+    )
+    r_status: Literal['processing', 'succeeded', 'rejected'] = (
+        'succeeded'
+        if outcome.status == 'succeeded'
+        else 'processing'
+        if outcome.status == 'processing'
+        else 'rejected'
+    )
+    return InternalRefundItemResponse(
+        id=outcome.refund_id,
+        payment_id=outcome.payment_id,
+        subscription_id=outcome.subscription_id,
+        provider_code=outcome.provider_code,
+        provider_refund_id=outcome.provider_refund_id,
+        amount_kopeks=outcome.amount_kopeks,
+        currency=outcome.currency,
+        status=r_status,
+        reason=outcome.reason,
+        rejection_reason=outcome.rejection_reason,
+        admin_user_id=outcome.admin_user_id,
+        created_at=outcome.created_at,
+        updated_at=outcome.updated_at,
+        can_reconcile=(r_status == 'processing'),
     )

@@ -100,8 +100,9 @@ class BillingIntegrationCheck:
         self._check_auth_user_lookup_t25()
         self._check_internal_billing_lists_t26()
         self._check_admin_billing_lists_t27()
+        self._check_refund_lifecycle_t29()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06..T-28 live Docker checks passed.')
+        print('All Billing T-06..T-29 live Docker checks passed.')
 
     def _http(
         self,
@@ -2581,6 +2582,226 @@ class BillingIntegrationCheck:
                 f"DELETE FROM payments WHERE id = '{pid}';"
             )
             assert self._psql(cleanup_sql).returncode == 0
+
+    def _check_refund_lifecycle_t29(self) -> None:
+        """T-29 (BIL-FR-10, BIL-API-09, US-A-04): refund revokes access & email."""
+        login = f'RefT29_{uuid4().hex[:8]}'
+        password = 'Saffron-Citadel-RefT29-2026!'
+        signup_code = (
+            'import asyncio, httpx\n'
+            'from core.config import settings\n'
+            'async def s():\n'
+            '    base = str(settings.auth_client.service_url).rstrip("/")\n'
+            '    async with httpx.AsyncClient() as c:\n'
+            '        r = await c.post(\n'
+            '            f"{base}/api/v1/auth/signup",\n'
+            '            json={\n'
+            f'                "login": "{login}",\n'
+            f'                "password": "{password}",\n'
+            '                "tz": "Europe/Moscow",\n'
+            '            },\n'
+            '            headers={"X-Request-Id": "t29-signup"},\n'
+            '        )\n'
+            '        uid = r.json()["id"]\n'
+            '        lr = await c.post(\n'
+            '            f"{base}/api/v1/auth/login",\n'
+            f'            json={{"login": "{login}", "password": "{password}"}},\n'
+            '            headers={"X-Request-Id": "t29-login"},\n'
+            '        )\n'
+            '        print(f"uid={uid}\\ntok={lr.json()[\'access_token\']}")\n'
+            'asyncio.run(s())\n'
+        )
+        out = self._compose(
+            'exec', '-T', 'billing-api', 'python', '-c', signup_code
+        ).strip()
+        uid = next(
+            line.split('=', 1)[1]
+            for line in out.splitlines()
+            if line.startswith('uid=')
+        )
+        tok = next(
+            line.split('=', 1)[1]
+            for line in out.splitlines()
+            if line.startswith('tok=')
+        )
+
+        assert (
+            self._ntf_psql(
+                f'INSERT INTO profiles '
+                f'(user_id, user_version, tz, likes, new_films, marketing) '
+                f"VALUES ('{uid}', 1, 'Europe/Moscow', false, false, false) "
+                f'ON CONFLICT (user_id) DO NOTHING;'
+            ).returncode
+            == 0
+        )
+
+        code = (
+            'import asyncio, httpx\n'
+            'from uuid import UUID, uuid4\n'
+            'from core.config import ServiceSettings, settings\n'
+            'from db.sql.postgres import PostgresDatabase\n'
+            'from repositories.purchase import SQLAlchemyPurchaseRepository\n'
+            'from clients.auth import HttpAuthGateway\n'
+            'from clients.notifications import HttpNotificationsGateway\n'
+            'from clients.payment_provider import (\n'
+            '    ProviderPaymentSnapshot,\n'
+            '    ProviderRefundSnapshot,\n'
+            ')\n'
+            'from services.outbox_dispatcher import OutboxDispatcher\n'
+            'from services.reconciler import PaymentReconciler\n'
+            'class _StubProv:\n'
+            '    provider_code = "yookassa"\n'
+            '    async def create_payment(self, req):\n'
+            '        raise NotImplementedError\n'
+            '    async def get_payment(self, pid, **kw):\n'
+            '        return ProviderPaymentSnapshot(\n'
+            '            provider_code="yookassa",\n'
+            '            provider_payment_id=pid,\n'
+            '            domain_status="succeeded",\n'
+            '            amount_kopeks=29900,\n'
+            '            currency="RUB",\n'
+            '            confirmation_url=None,\n'
+            '            failure_reason=None,\n'
+            '            metadata_payment_id=str(kw.get("expected_payment_id")),\n'
+            '            provider_details={"id": pid, "status": "succeeded"},\n'
+            '        )\n'
+            '    async def create_refund(self, req):\n'
+            '        return ProviderRefundSnapshot(\n'
+            '            provider_code="yookassa",\n'
+            '            provider_refund_id=f"yk_ref_{req.refund_id.hex[:8]}",\n'
+            '            provider_payment_id=req.provider_payment_id,\n'
+            '            domain_status="processing",\n'
+            '            amount_kopeks=req.amount_kopeks,\n'
+            '            currency=req.currency,\n'
+            '            rejection_reason=None,\n'
+            '            metadata_refund_id=str(req.refund_id),\n'
+            '            provider_details={"status": "pending"},\n'
+            '        )\n'
+            '    async def get_refund(self, rid, **kw):\n'
+            '        return ProviderRefundSnapshot(\n'
+            '            provider_code="yookassa",\n'
+            '            provider_refund_id=rid,\n'
+            '            provider_payment_id="yk_pay",\n'
+            '            domain_status="succeeded",\n'
+            '            amount_kopeks=29900,\n'
+            '            currency="RUB",\n'
+            '            rejection_reason=None,\n'
+            '            metadata_refund_id=str(kw.get("expected_refund_id")),\n'
+            '            provider_details={"id": rid, "status": "succeeded"},\n'
+            '        )\n'
+            '    async def find_refund_by_metadata(self, pid, **kw):\n'
+            '        return None\n'
+            'async def run_t29():\n'
+            '    pg = settings.postgres\n'
+            '    db = PostgresDatabase(\n'
+            '        pg.dsn,\n'
+            '        connect_timeout_seconds=pg.connect_timeout_seconds,\n'
+            '        pool_timeout_seconds=pg.pool_timeout_seconds,\n'
+            '        command_timeout_seconds=pg.command_timeout_seconds,\n'
+            '        statement_timeout_ms=pg.statement_timeout_ms,\n'
+            '    )\n'
+            '    key = ServiceSettings().api_key.get_secret_value()\n'
+            '    ntf_cfg = settings.notifications_client\n'
+            '    ntf_key = ntf_cfg.campaign_api_key.get_secret_value()\n'
+            '    async with httpx.AsyncClient() as hc:\n'
+            '        auth_gw = HttpAuthGateway(\n'
+            '            http_client=hc,\n'
+            '            base_url=str(settings.auth_client.service_url),\n'
+            '            service_api_key=key,\n'
+            '        )\n'
+            '        ntf_gw = HttpNotificationsGateway(\n'
+            '            http_client=hc,\n'
+            '            base_url=str(settings.notifications_client.campaign_url),\n'
+            '            api_key=ntf_key,\n'
+            '        )\n'
+            '        repo = SQLAlchemyPurchaseRepository(db.sessionmaker)\n'
+            '        disp = OutboxDispatcher(\n'
+            '            repository=repo,\n'
+            '            auth_gateway=auth_gw,\n'
+            '            notifications_gateway=ntf_gw,\n'
+            '        )\n'
+            '        prov = _StubProv()\n'
+            '        rec = PaymentReconciler(\n'
+            '            repository=repo,\n'
+            '            payment_provider=prov,\n'
+            '            public_base_url="http://localhost",\n'
+            '            outbox_dispatcher=disp,\n'
+            '        )\n'
+            f'        uid = UUID("{uid}")\n'
+            '        pay, _ = await repo.get_or_create_pending_payment(uid)\n'
+            '        await repo.save_provider_payment_created(\n'
+            '            pay.id,\n'
+            '            provider_payment_id=f"yk_t29_{pay.id.hex[:8]}",\n'
+            '            confirmation_url="https://yookassa.test/confirm",\n'
+            '            provider_details={"id": "yk_t29"},\n'
+            '        )\n'
+            '        await rec.reconcile_payment(\n'
+            '            pay.id, source="webhook", respect_throttle=False\n'
+            '        )\n'
+            '        auth_url = str(settings.auth_client.service_url).rstrip("/")\n'
+            '        chk_1 = await hc.post(\n'
+            '            f"{auth_url}/api/v1/auth/permissions/check",\n'
+            '            headers={\n'
+            f'                "Authorization": "Bearer {tok}",\n'
+            '                "X-Service-Api-Key": key,\n'
+            '                "X-Request-Id": "t29-chk-1",\n'
+            '            },\n'
+            '            json={\n'
+            '                "resource": "film",\n'
+            '                "action": "read",\n'
+            '                "attributes": {"creation_date": "9999-01-01"},\n'
+            '            },\n'
+            '        )\n'
+            '        assert (\n'
+            '            chk_1.status_code == 200 and chk_1.json()["allowed"] is True\n'
+            '        )\n'
+            '        ref_out = await rec.create_or_reconcile_refund(\n'
+            '            pay.id,\n'
+            '            admin_user_id=uuid4(),\n'
+            '            reason="Возврат по обращению в поддержку",\n'
+            '        )\n'
+            '        assert ref_out.status == "succeeded"\n'
+            '        chk_2 = await hc.post(\n'
+            '            f"{auth_url}/api/v1/auth/permissions/check",\n'
+            '            headers={\n'
+            f'                "Authorization": "Bearer {tok}",\n'
+            '                "X-Service-Api-Key": key,\n'
+            '                "X-Request-Id": "t29-chk-2",\n'
+            '            },\n'
+            '            json={\n'
+            '                "resource": "film",\n'
+            '                "action": "read",\n'
+            '                "attributes": {"creation_date": "9999-01-01"},\n'
+            '            },\n'
+            '        )\n'
+            '        assert chk_2.status_code == 200\n'
+            '        assert chk_2.json()["allowed"] is False\n'
+            '        print(f"pid={pay.id}\\nrid={ref_out.refund_id}")\n'
+            '    await db.close()\n'
+            'asyncio.run(run_t29())\n'
+        )
+        out_t29 = self._compose(
+            'exec', '-T', 'billing-api', 'python', '-c', code
+        ).strip()
+        pid = next(
+            line.split('=', 1)[1]
+            for line in out_t29.splitlines()
+            if line.startswith('pid=')
+        )
+        rid = next(
+            line.split('=', 1)[1]
+            for line in out_t29.splitlines()
+            if line.startswith('rid=')
+        )
+
+        cleanup_sql = (
+            f"DELETE FROM admin_actions WHERE target_id = '{rid}'; "
+            f"DELETE FROM outbox_tasks WHERE payment_id = '{pid}'; "
+            f"DELETE FROM refunds WHERE id = '{rid}'; "
+            f"DELETE FROM subscriptions WHERE payment_id = '{pid}'; "
+            f"DELETE FROM payments WHERE id = '{pid}';"
+        )
+        assert self._psql(cleanup_sql).returncode == 0
 
     def _check_degradation_and_worker_graceful_shutdown(self) -> None:
         """BIL-API-15, GW-NFR-R-01, BIL-NFR-R-09: DB outage yields 503; worker stops."""

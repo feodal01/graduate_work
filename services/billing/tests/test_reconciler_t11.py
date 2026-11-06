@@ -18,13 +18,14 @@ from domain.subscription import (
     format_msk_datetime,
 )
 from services.reconciler import PaymentReconciler, ReconcileOutcome
-from tests.fakes import FakePaymentRow, InMemoryPurchaseRepository
+from tests.fakes import FakePaymentRow, FakeProviderGateway, InMemoryPurchaseRepository
 
 
-class StubProviderGateway:
+class StubProviderGateway(FakeProviderGateway):
     provider_code = 'yookassa'
 
     def __init__(self) -> None:
+        super().__init__()
         self.get_calls: list[str] = []
         self.snapshot: ProviderPaymentSnapshot | None = None
         self.error: Exception | None = None
