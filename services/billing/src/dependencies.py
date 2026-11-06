@@ -4,7 +4,12 @@ from uuid import UUID
 
 from fastapi import Depends, Request
 
-from api.errors import BillingDomainError, UIErrorScreenException, UILoginRedirectError
+from api.errors import (
+    BillingDomainError,
+    InvalidServiceCredentialsError,
+    UIErrorScreenException,
+    UILoginRedirectError,
+)
 from clients.auth import (
     AuthGateway,
     AuthInvalidCredentialsError,
@@ -16,7 +21,7 @@ from core.config import settings
 from core.observability import get_current_request_id
 from db.health import HealthCheck
 from db.sql.postgres import PostgresDatabase
-from repositories.purchase import SQLAlchemyPurchaseRepository
+from repositories.purchase import PurchaseRepository, SQLAlchemyPurchaseRepository
 from security.service_credentials import ServiceCredentials
 from services.outbox_dispatcher import OutboxDispatcher
 from services.purchase import PurchaseService
@@ -40,6 +45,22 @@ async def get_database_health(request: Request) -> HealthCheck:
 
 async def get_service_credentials(request: Request) -> ServiceCredentials:
     return cast(ServiceCredentials, request.app.state.service_credentials)
+
+
+async def get_purchase_repository(request: Request) -> PurchaseRepository:
+    database = cast(PostgresDatabase, request.app.state.database)
+    return SQLAlchemyPurchaseRepository(database.sessionmaker)
+
+
+async def require_internal_service(
+    request: Request,
+    credentials: ServiceCredentials = Depends(get_service_credentials),
+) -> None:
+    provided = request.headers.get('X-Service-Api-Key') or request.headers.get(
+        'X-Service-Key'
+    )
+    if not credentials.verify(provided):
+        raise InvalidServiceCredentialsError()
 
 
 async def get_auth_gateway(request: Request) -> AuthGateway:

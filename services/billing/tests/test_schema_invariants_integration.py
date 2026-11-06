@@ -1095,3 +1095,115 @@ async def test_t23_get_user_billing_overview_in_real_postgres(
     assert ov_refunded.latest_subscription_has_succeeded_refund is True
     assert ov_refunded.latest_subscription_has_processing_refund is False
     assert ov_refunded.payments[0].refund_status == 'succeeded'
+
+
+async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """T-26 (BIL-API-06, BIL-API-07): списки подписок и платежей в PostgreSQL."""
+    from repositories.purchase import (
+        InternalPaymentFilter,
+        InternalSubscriptionFilter,
+        SQLAlchemyPurchaseRepository,
+    )
+
+    session_factory = migrated_billing_db
+    repo = SQLAlchemyPurchaseRepository(session_factory)
+    now_utc = datetime.now(UTC)
+
+    user_active = uuid4()
+    user_refunded = uuid4()
+    user_stuck = uuid4()
+
+    # 1. Активная подписка
+    pay_active, _ = await repo.get_or_create_pending_payment(user_active)
+    await repo.save_provider_payment_created(
+        pay_active.id,
+        provider_payment_id='yk_t26_pg_active',
+        confirmation_url='https://yookassa.test/confirm/1',
+        provider_details={'id': 'yk_t26_pg_active'},
+    )
+    await repo.finalize_payment_succeeded(pay_active.id, source='webhook')
+
+    # 2. Возвращённая подписка
+    pay_ref, _ = await repo.get_or_create_pending_payment(user_refunded)
+    await repo.finalize_payment_succeeded(pay_ref.id, source='webhook')
+    async with session_factory() as session:
+        sub_ref = await session.scalar(
+            select(Subscription).where(Subscription.payment_id == pay_ref.id)
+        )
+        assert sub_ref is not None
+        ref_id = uuid4()
+        session.add(
+            Refund(
+                id=ref_id,
+                payment_id=pay_ref.id,
+                subscription_id=sub_ref.id,
+                provider_code=DEFAULT_PROVIDER_CODE,
+                amount_kopeks=DEFAULT_TARIFF_PRICE_KOPEKS,
+                status='succeeded',
+                reason='T-26 PG test refund',
+                admin_user_id=uuid4(),
+                idempotency_key=ref_id,
+            )
+        )
+        # 3. Зависший pending-платёж (старше 10 минут)
+        stuck_pay_id = uuid4()
+        session.add(
+            Payment(
+                id=stuck_pay_id,
+                user_id=user_stuck,
+                tariff_id=DEFAULT_TARIFF_ID,
+                provider_code=DEFAULT_PROVIDER_CODE,
+                amount_kopeks=DEFAULT_TARIFF_PRICE_KOPEKS,
+                status='pending',
+                idempotency_key=stuck_pay_id,
+                provider_payment_id='yk_t26_pg_stuck',
+                created_at=now_utc - timedelta(minutes=25),
+                updated_at=now_utc - timedelta(minutes=25),
+            )
+        )
+        await session.commit()
+
+    # Проверяем фильтрацию подписок по user_id и вычисленному статусу
+    sub_total_act, sub_items_act = await repo.list_internal_subscriptions(
+        InternalSubscriptionFilter(user_id=user_active, status='active'),
+        now_utc=now_utc,
+    )
+    assert sub_total_act == 1
+    assert sub_items_act[0].payment_id == pay_active.id
+    assert sub_items_act[0].status == 'active'
+
+    sub_total_ref, sub_items_ref = await repo.list_internal_subscriptions(
+        InternalSubscriptionFilter(user_id=user_refunded, status='refunded'),
+        now_utc=now_utc,
+    )
+    assert sub_total_ref == 1
+    assert sub_items_ref[0].payment_id == pay_ref.id
+    assert sub_items_ref[0].status == 'refunded'
+
+    # Проверяем фильтрацию платежей (по provider_payment_id, has_refund и stuck=True)
+    pay_total_prov, pay_items_prov = await repo.list_internal_payments(
+        InternalPaymentFilter(provider_payment_id='yk_t26_pg_active'),
+        now_utc=now_utc,
+    )
+    assert pay_total_prov == 1
+    assert pay_items_prov[0].id == pay_active.id
+    assert pay_items_prov[0].has_refund is False
+
+    pay_total_ref, pay_items_ref = await repo.list_internal_payments(
+        InternalPaymentFilter(user_id=user_refunded, has_refund=True),
+        now_utc=now_utc,
+    )
+    assert pay_total_ref == 1
+    assert pay_items_ref[0].id == pay_ref.id
+    assert pay_items_ref[0].refund_status == 'succeeded'
+
+    pay_total_stuck, pay_items_stuck = await repo.list_internal_payments(
+        InternalPaymentFilter(user_id=user_stuck, stuck=True),
+        stuck_threshold_seconds=600,
+        now_utc=now_utc,
+    )
+    assert pay_total_stuck == 1
+    assert pay_items_stuck[0].id == stuck_pay_id
+    assert pay_items_stuck[0].is_stuck is True

@@ -98,8 +98,9 @@ class BillingIntegrationCheck:
         self._check_my_subscription_screen_and_summary_t23()
         self._check_campaign_cancel_and_preemptive_cancel_t24()
         self._check_auth_user_lookup_t25()
+        self._check_internal_billing_lists_t26()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06..T-25 live Docker checks passed.')
+        print('All Billing T-06..T-26 live Docker checks passed.')
 
     def _http(
         self,
@@ -2204,6 +2205,94 @@ class BillingIntegrationCheck:
             'asyncio.run(check_t25())\n'
         )
         self._compose('exec', '-T', 'billing-api', 'python', '-c', code)
+
+    def _check_internal_billing_lists_t26(self) -> None:
+        """T-26 (BIL-API-06, BIL-API-07, BIL-NFR-SEC-03): internal lists API."""
+        # 1. External gateway must block /api/v1/internal/billing/* -> 404
+        for ext_path in (
+            '/api/v1/internal/billing/subscriptions',
+            '/api/v1/internal/billing/payments',
+        ):
+            ext_res = self._http('GET', ext_path)
+            if ext_res.status != 404:
+                raise AssertionError(
+                    f'Expected 404 on external {ext_path}, got {ext_res}'
+                )
+
+        uid = str(uuid4())
+        pid = str(uuid4())
+        sid = str(uuid4())
+        ins_sql = (
+            f'INSERT INTO payments (id, user_id, tariff_id, provider_code, '
+            f'amount_kopeks, currency, status, provider_payment_id, idempotency_key) '
+            f"SELECT '{pid}', '{uid}', id, 'yookassa', price_kopeks, currency, "
+            f"'succeeded', 'yk_t26_live_01', '{pid}' "
+            f"FROM tariffs WHERE code = 'premium'; "
+            f'INSERT INTO subscriptions '
+            f'(id, user_id, tariff_id, payment_id, starts_at, ends_at) '
+            f"SELECT '{sid}', '{uid}', id, '{pid}', "
+            f"now() - interval '1 day', now() + interval '29 days' "
+            f"FROM tariffs WHERE code = 'premium';"
+        )
+        assert self._psql(ins_sql).returncode == 0
+
+        try:
+            code = (
+                'import asyncio, httpx\n'
+                'from core.config import ServiceSettings\n'
+                'async def check_t26():\n'
+                '    key = ServiceSettings().api_key.get_secret_value()\n'
+                '    base = "http://127.0.0.1:8000/api/v1/internal/billing"\n'
+                '    async with httpx.AsyncClient() as hc:\n'
+                '        # Unhappy: missing key -> 401\n'
+                '        r401 = await hc.get(\n'
+                '            f"{base}/subscriptions",\n'
+                '            headers={"X-Request-Id": "t26-401"},\n'
+                '        )\n'
+                '        assert r401.status_code == 401, r401.text\n'
+                '        # Unhappy: invalid status -> 422\n'
+                '        r422 = await hc.get(\n'
+                '            f"{base}/subscriptions",\n'
+                '            params={"status": "bad"},\n'
+                '            headers={\n'
+                '                "X-Service-Api-Key": key,\n'
+                '                "X-Request-Id": "t26-422",\n'
+                '            },\n'
+                '        )\n'
+                '        assert r422.status_code == 422, r422.text\n'
+                '        # Happy: subscriptions filtered by user_id and status=active\n'
+                '        r_sub = await hc.get(\n'
+                '            f"{base}/subscriptions",\n'
+                f'            params={{"user_id": "{uid}", "status": "active"}},\n'
+                '            headers={\n'
+                '                "X-Service-Api-Key": key,\n'
+                '                "X-Request-Id": "t26-sub",\n'
+                '            },\n'
+                '        )\n'
+                '        assert r_sub.status_code == 200, r_sub.text\n'
+                '        assert r_sub.json()["total"] == 1\n'
+                f'        assert r_sub.json()["items"][0]["id"] == "{sid}"\n'
+                '        # Happy: payments filtered by provider_payment_id\n'
+                '        r_pay = await hc.get(\n'
+                '            f"{base}/payments",\n'
+                '            params={"provider_payment_id": "yk_t26_live_01"},\n'
+                '            headers={\n'
+                '                "X-Service-Api-Key": key,\n'
+                '                "X-Request-Id": "t26-pay",\n'
+                '            },\n'
+                '        )\n'
+                '        assert r_pay.status_code == 200, r_pay.text\n'
+                '        assert r_pay.json()["total"] == 1\n'
+                f'        assert r_pay.json()["items"][0]["id"] == "{pid}"\n'
+                'asyncio.run(check_t26())\n'
+            )
+            self._compose('exec', '-T', 'billing-api', 'python', '-c', code)
+        finally:
+            cleanup_sql = (
+                f"DELETE FROM subscriptions WHERE id = '{sid}'; "
+                f"DELETE FROM payments WHERE id = '{pid}';"
+            )
+            assert self._psql(cleanup_sql).returncode == 0
 
     def _check_degradation_and_worker_graceful_shutdown(self) -> None:
         """BIL-API-15, GW-NFR-R-01, BIL-NFR-R-09: DB outage yields 503; worker stops."""

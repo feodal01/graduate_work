@@ -18,6 +18,7 @@ from domain.subscription import (
     build_payment_failed_email_payload,
     build_payment_succeeded_email_payload,
     build_subscription_expiration_email_payload,
+    compute_subscription_state,
 )
 from models import (
     DEFAULT_PROVIDER_CODE,
@@ -90,6 +91,65 @@ class UserBillingOverviewData:
     payments: list[UserPaymentHistoryItemData]
 
 
+@dataclass(frozen=True, slots=True)
+class InternalSubscriptionFilter:
+    user_id: UUID | None = None
+    status: Literal['active', 'expired', 'refunded'] | None = None
+    created_from: datetime | None = None
+    created_to: datetime | None = None
+    limit: int = 50
+    offset: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class InternalSubscriptionItemData:
+    id: UUID
+    user_id: UUID
+    payment_id: UUID
+    tariff_code: str
+    tariff_name: str
+    starts_at: datetime
+    ends_at: datetime
+    status: Literal['active', 'expired', 'refunded']
+    amount_kopeks: int
+    currency: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class InternalPaymentFilter:
+    status: Literal['pending', 'succeeded', 'failed'] | None = None
+    has_refund: bool | None = None
+    stuck: bool = False
+    user_id: UUID | None = None
+    payment_id: UUID | None = None
+    provider_payment_id: str | None = None
+    created_from: datetime | None = None
+    created_to: datetime | None = None
+    limit: int = 50
+    offset: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class InternalPaymentItemData:
+    id: UUID
+    user_id: UUID
+    tariff_code: str
+    tariff_name: str
+    provider_code: str
+    provider_payment_id: str | None
+    amount_kopeks: int
+    currency: str
+    status: Literal['pending', 'succeeded', 'failed']
+    failure_reason: str | None
+    has_refund: bool
+    refund_status: Literal['processing', 'succeeded', 'rejected'] | None
+    active_refund_id: UUID | None
+    is_stuck: bool
+    created_at: datetime
+    updated_at: datetime
+
+
 class OutboxTaskRecordProtocol(Protocol):
     id: UUID
     dedup_key: str
@@ -145,6 +205,21 @@ class PurchaseRepository(Protocol):
         self,
         user_id: UUID,
     ) -> UserBillingOverviewData: ...
+
+    async def list_internal_subscriptions(
+        self,
+        filters: InternalSubscriptionFilter,
+        *,
+        now_utc: datetime | None = None,
+    ) -> tuple[int, list[InternalSubscriptionItemData]]: ...
+
+    async def list_internal_payments(
+        self,
+        filters: InternalPaymentFilter,
+        *,
+        stuck_threshold_seconds: int = 600,
+        now_utc: datetime | None = None,
+    ) -> tuple[int, list[InternalPaymentItemData]]: ...
 
     async def get_payment_by_provider_id(
         self,
@@ -557,6 +632,277 @@ class SQLAlchemyPurchaseRepository:
                     tariff_price_kopeks=tariff_price_kopeks,
                     payments=history_items,
                 )
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def list_internal_subscriptions(
+        self,
+        filters: InternalSubscriptionFilter,
+        *,
+        now_utc: datetime | None = None,
+    ) -> tuple[int, list[InternalSubscriptionItemData]]:
+        now = now_utc or datetime.now(UTC)
+        succeeded_refund_exists = exists(
+            select(1).where(
+                Refund.subscription_id == Subscription.id,
+                Refund.status == 'succeeded',
+            )
+        )
+        conditions: list[Any] = []
+        if filters.user_id is not None:
+            conditions.append(Subscription.user_id == filters.user_id)
+        if filters.created_from is not None:
+            conditions.append(Subscription.created_at >= filters.created_from)
+        if filters.created_to is not None:
+            conditions.append(Subscription.created_at <= filters.created_to)
+        if filters.status == 'refunded':
+            conditions.append(succeeded_refund_exists)
+        elif filters.status == 'active':
+            conditions.append(~succeeded_refund_exists)
+            conditions.append(Subscription.ends_at > now)
+        elif filters.status == 'expired':
+            conditions.append(~succeeded_refund_exists)
+            conditions.append(Subscription.ends_at <= now)
+
+        try:
+            async with self._session_factory() as session:
+                count_stmt = select(func.count(Subscription.id))
+                if conditions:
+                    count_stmt = count_stmt.where(*conditions)
+                total = int(await session.scalar(count_stmt) or 0)
+
+                stmt = (
+                    select(
+                        Subscription.id,
+                        Subscription.user_id,
+                        Subscription.payment_id,
+                        Tariff.code,
+                        Tariff.title,
+                        Subscription.starts_at,
+                        Subscription.ends_at,
+                        Payment.amount_kopeks,
+                        Payment.currency,
+                        Subscription.created_at,
+                        succeeded_refund_exists.label('has_succeeded_refund'),
+                    )
+                    .join(Payment, Payment.id == Subscription.payment_id)
+                    .join(Tariff, Tariff.id == Subscription.tariff_id)
+                )
+                if conditions:
+                    stmt = stmt.where(*conditions)
+                stmt = (
+                    stmt.order_by(
+                        Subscription.created_at.desc(),
+                        Subscription.id.desc(),
+                    )
+                    .limit(filters.limit)
+                    .offset(filters.offset)
+                )
+                rows = (await session.execute(stmt)).all()
+                items: list[InternalSubscriptionItemData] = []
+                for (
+                    sub_id,
+                    uid,
+                    pay_id,
+                    t_code,
+                    t_title,
+                    starts_at,
+                    ends_at,
+                    amount_kopeks,
+                    currency,
+                    created_at,
+                    has_succeeded_refund,
+                ) in rows:
+                    state_enum = compute_subscription_state(
+                        ends_at=ends_at,
+                        has_succeeded_refund=bool(has_succeeded_refund),
+                        now_utc=now,
+                    )
+                    computed_status: Literal['active', 'expired', 'refunded'] = (
+                        'refunded'
+                        if state_enum == 'refunded'
+                        else 'active'
+                        if state_enum == 'active'
+                        else 'expired'
+                    )
+                    items.append(
+                        InternalSubscriptionItemData(
+                            id=sub_id,
+                            user_id=uid,
+                            payment_id=pay_id,
+                            tariff_code=t_code,
+                            tariff_name=t_title,
+                            starts_at=starts_at,
+                            ends_at=ends_at,
+                            status=computed_status,
+                            amount_kopeks=amount_kopeks,
+                            currency=currency.strip(),
+                            created_at=created_at,
+                        )
+                    )
+                return total, items
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def list_internal_payments(
+        self,
+        filters: InternalPaymentFilter,
+        *,
+        stuck_threshold_seconds: int = 600,
+        now_utc: datetime | None = None,
+    ) -> tuple[int, list[InternalPaymentItemData]]:
+        now = now_utc or datetime.now(UTC)
+        stuck_cutoff = now - timedelta(seconds=stuck_threshold_seconds)
+        any_refund_exists = exists(select(1).where(Refund.payment_id == Payment.id))
+        stuck_refund_exists = exists(
+            select(1).where(
+                Refund.payment_id == Payment.id,
+                Refund.status == 'processing',
+                Refund.created_at <= stuck_cutoff,
+            )
+        )
+        stuck_condition = or_(
+            and_(Payment.status == 'pending', Payment.created_at <= stuck_cutoff),
+            stuck_refund_exists,
+        )
+
+        conditions: list[Any] = []
+        if filters.status is not None:
+            conditions.append(Payment.status == filters.status)
+        if filters.has_refund is True:
+            conditions.append(any_refund_exists)
+        elif filters.has_refund is False:
+            conditions.append(~any_refund_exists)
+        if filters.stuck:
+            conditions.append(stuck_condition)
+        if filters.user_id is not None:
+            conditions.append(Payment.user_id == filters.user_id)
+        if filters.payment_id is not None:
+            conditions.append(Payment.id == filters.payment_id)
+        if filters.provider_payment_id is not None:
+            conditions.append(
+                Payment.provider_payment_id == filters.provider_payment_id
+            )
+        if filters.created_from is not None:
+            conditions.append(Payment.created_at >= filters.created_from)
+        if filters.created_to is not None:
+            conditions.append(Payment.created_at <= filters.created_to)
+
+        try:
+            async with self._session_factory() as session:
+                count_stmt = select(func.count(Payment.id))
+                if conditions:
+                    count_stmt = count_stmt.where(*conditions)
+                total = int(await session.scalar(count_stmt) or 0)
+
+                stmt = select(
+                    Payment.id,
+                    Payment.user_id,
+                    Tariff.code,
+                    Tariff.title,
+                    Payment.provider_code,
+                    Payment.provider_payment_id,
+                    Payment.amount_kopeks,
+                    Payment.currency,
+                    Payment.status,
+                    Payment.failure_reason,
+                    Payment.created_at,
+                    Payment.updated_at,
+                ).join(Tariff, Tariff.id == Payment.tariff_id)
+                if conditions:
+                    stmt = stmt.where(*conditions)
+                stmt = (
+                    stmt.order_by(Payment.created_at.desc(), Payment.id.desc())
+                    .limit(filters.limit)
+                    .offset(filters.offset)
+                )
+                rows = (await session.execute(stmt)).all()
+                payment_ids = [row[0] for row in rows]
+                refunds_by_payment: dict[UUID, list[Refund]] = {}
+                if payment_ids:
+                    refund_rows = list(
+                        await session.scalars(
+                            select(Refund)
+                            .where(Refund.payment_id.in_(payment_ids))
+                            .order_by(Refund.created_at.desc(), Refund.id.desc())
+                        )
+                    )
+                    for ref in refund_rows:
+                        refunds_by_payment.setdefault(ref.payment_id, []).append(ref)
+
+                items: list[InternalPaymentItemData] = []
+                for (
+                    pid,
+                    uid,
+                    t_code,
+                    t_title,
+                    prov_code,
+                    prov_pid,
+                    amount_kopeks,
+                    currency,
+                    p_status,
+                    failure_reason,
+                    created_at,
+                    updated_at,
+                ) in rows:
+                    p_refunds = refunds_by_payment.get(pid, [])
+                    has_ref = len(p_refunds) > 0
+                    active_or_latest = next(
+                        (
+                            r
+                            for r in p_refunds
+                            if r.status in ('processing', 'succeeded')
+                        ),
+                        p_refunds[0] if p_refunds else None,
+                    )
+                    ref_status: (
+                        Literal['processing', 'succeeded', 'rejected'] | None
+                    ) = None
+                    active_ref_id: UUID | None = None
+                    if active_or_latest is not None:
+                        if active_or_latest.status == 'succeeded':
+                            ref_status = 'succeeded'
+                            active_ref_id = active_or_latest.id
+                        elif active_or_latest.status == 'processing':
+                            ref_status = 'processing'
+                            active_ref_id = active_or_latest.id
+                        else:
+                            ref_status = 'rejected'
+
+                    is_payment_stuck = (
+                        p_status == 'pending' and created_at <= stuck_cutoff
+                    ) or any(
+                        r.status == 'processing' and r.created_at <= stuck_cutoff
+                        for r in p_refunds
+                    )
+                    normalized_status: Literal['pending', 'succeeded', 'failed'] = (
+                        'succeeded'
+                        if p_status == 'succeeded'
+                        else 'failed'
+                        if p_status == 'failed'
+                        else 'pending'
+                    )
+                    items.append(
+                        InternalPaymentItemData(
+                            id=pid,
+                            user_id=uid,
+                            tariff_code=t_code,
+                            tariff_name=t_title,
+                            provider_code=prov_code,
+                            provider_payment_id=prov_pid,
+                            amount_kopeks=amount_kopeks,
+                            currency=currency.strip(),
+                            status=normalized_status,
+                            failure_reason=failure_reason,
+                            has_refund=has_ref,
+                            refund_status=ref_status,
+                            active_refund_id=active_ref_id,
+                            is_stuck=is_payment_stuck,
+                            created_at=created_at,
+                            updated_at=updated_at,
+                        )
+                    )
+                return total, items
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 

@@ -21,9 +21,14 @@ from domain.subscription import (
     build_payment_failed_email_payload,
     build_payment_succeeded_email_payload,
     build_subscription_expiration_email_payload,
+    compute_subscription_state,
 )
 from repositories.purchase import (
     DeliveryOutcome,
+    InternalPaymentFilter,
+    InternalPaymentItemData,
+    InternalSubscriptionFilter,
+    InternalSubscriptionItemData,
     LocalPaymentResultData,
     OutboxDeliverFn,
     UserBillingOverviewData,
@@ -662,6 +667,173 @@ class InMemoryPurchaseRepository:
             max_attempts=max_attempts,
             should_stop=should_stop,
         )
+
+    async def list_internal_subscriptions(
+        self,
+        filters: InternalSubscriptionFilter,
+        *,
+        now_utc: datetime | None = None,
+    ) -> tuple[int, list[InternalSubscriptionItemData]]:
+        """Возвращает отфильтрованный список подписок для админки (T-26)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        now = now_utc or datetime.now(UTC)
+        matched: list[InternalSubscriptionItemData] = []
+        subs = sorted(
+            self.subscriptions.values(),
+            key=lambda s: (s.created_at, s.id),
+            reverse=True,
+        )
+        for sub in subs:
+            if filters.user_id is not None and sub.user_id != filters.user_id:
+                continue
+            if (
+                filters.created_from is not None
+                and sub.created_at < filters.created_from
+            ):
+                continue
+            if filters.created_to is not None and sub.created_at > filters.created_to:
+                continue
+            has_succeeded_refund = any(
+                r.subscription_id == sub.id and r.status == 'succeeded'
+                for r in self.refunds.values()
+            )
+            state_enum = compute_subscription_state(
+                ends_at=sub.ends_at,
+                has_succeeded_refund=has_succeeded_refund,
+                now_utc=now,
+            )
+            computed_status: Literal['active', 'expired', 'refunded'] = (
+                'refunded'
+                if state_enum == 'refunded'
+                else 'active'
+                if state_enum == 'active'
+                else 'expired'
+            )
+            if filters.status is not None and computed_status != filters.status:
+                continue
+            pay = self.payments.get(sub.payment_id)
+            amount_kopeks = pay.amount_kopeks if pay is not None else 29900
+            currency = pay.currency.strip() if pay is not None else 'RUB'
+            matched.append(
+                InternalSubscriptionItemData(
+                    id=sub.id,
+                    user_id=sub.user_id,
+                    payment_id=sub.payment_id,
+                    tariff_code='premium',
+                    tariff_name='Подписка «Премиум»',
+                    starts_at=sub.starts_at,
+                    ends_at=sub.ends_at,
+                    status=computed_status,
+                    amount_kopeks=amount_kopeks,
+                    currency=currency,
+                    created_at=sub.created_at,
+                )
+            )
+        total = len(matched)
+        return total, matched[filters.offset : filters.offset + filters.limit]
+
+    async def list_internal_payments(
+        self,
+        filters: InternalPaymentFilter,
+        *,
+        stuck_threshold_seconds: int = 600,
+        now_utc: datetime | None = None,
+    ) -> tuple[int, list[InternalPaymentItemData]]:
+        """Возвращает отфильтрованный список платежей для админки (T-26)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        now = now_utc or datetime.now(UTC)
+        stuck_cutoff = now - timedelta(seconds=stuck_threshold_seconds)
+        matched: list[InternalPaymentItemData] = []
+        payments = sorted(
+            self.payments.values(),
+            key=lambda p: (p.created_at, p.id),
+            reverse=True,
+        )
+        for pay in payments:
+            p_refunds = sorted(
+                [r for r in self.refunds.values() if r.payment_id == pay.id],
+                key=lambda r: (r.created_at, r.id),
+                reverse=True,
+            )
+            has_ref = len(p_refunds) > 0
+            is_stuck = (pay.status == 'pending' and pay.created_at <= stuck_cutoff) or (
+                any(
+                    r.status == 'processing' and r.created_at <= stuck_cutoff
+                    for r in p_refunds
+                )
+            )
+            if filters.status is not None and pay.status != filters.status:
+                continue
+            if filters.has_refund is True and not has_ref:
+                continue
+            if filters.has_refund is False and has_ref:
+                continue
+            if filters.stuck and not is_stuck:
+                continue
+            if filters.user_id is not None and pay.user_id != filters.user_id:
+                continue
+            if filters.payment_id is not None and pay.id != filters.payment_id:
+                continue
+            if (
+                filters.provider_payment_id is not None
+                and pay.provider_payment_id != filters.provider_payment_id
+            ):
+                continue
+            if (
+                filters.created_from is not None
+                and pay.created_at < filters.created_from
+            ):
+                continue
+            if filters.created_to is not None and pay.created_at > filters.created_to:
+                continue
+
+            active_or_latest = next(
+                (r for r in p_refunds if r.status in ('processing', 'succeeded')),
+                p_refunds[0] if p_refunds else None,
+            )
+            ref_status: Literal['processing', 'succeeded', 'rejected'] | None = None
+            active_ref_id: UUID | None = None
+            if active_or_latest is not None:
+                if active_or_latest.status == 'succeeded':
+                    ref_status = 'succeeded'
+                    active_ref_id = active_or_latest.id
+                elif active_or_latest.status == 'processing':
+                    ref_status = 'processing'
+                    active_ref_id = active_or_latest.id
+                else:
+                    ref_status = 'rejected'
+
+            normalized_status: Literal['pending', 'succeeded', 'failed'] = (
+                'succeeded'
+                if pay.status == 'succeeded'
+                else 'failed'
+                if pay.status == 'failed'
+                else 'pending'
+            )
+            matched.append(
+                InternalPaymentItemData(
+                    id=pay.id,
+                    user_id=pay.user_id,
+                    tariff_code='premium',
+                    tariff_name='Подписка «Премиум»',
+                    provider_code=pay.provider_code,
+                    provider_payment_id=pay.provider_payment_id,
+                    amount_kopeks=pay.amount_kopeks,
+                    currency=pay.currency.strip(),
+                    status=normalized_status,
+                    failure_reason=pay.failure_reason,
+                    has_refund=has_ref,
+                    refund_status=ref_status,
+                    active_refund_id=active_ref_id,
+                    is_stuck=is_stuck,
+                    created_at=pay.created_at,
+                    updated_at=pay.updated_at,
+                )
+            )
+        total = len(matched)
+        return total, matched[filters.offset : filters.offset + filters.limit]
 
 
 class FakeProviderGateway:

@@ -10,7 +10,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from api import ui
 from api.errors import register_exception_handlers
 from api.request_id import require_request_id
-from api.v1 import health, payments, webhooks
+from api.v1 import health, internal, payments, webhooks
 from clients.auth import HttpAuthGateway
 from clients.notifications import HttpNotificationsGateway
 from clients.payment_provider import YooKassaProviderAdapter
@@ -134,6 +134,7 @@ def create_app(
     application.include_router(health.router, prefix='/api/v1/health')
     application.include_router(payments.router, prefix='/api/v1/billing')
     application.include_router(webhooks.router, prefix='/api/v1/billing')
+    application.include_router(internal.router, prefix='/api/v1/internal/billing')
     application.include_router(ui.router, prefix='/billing')
     return application
 
