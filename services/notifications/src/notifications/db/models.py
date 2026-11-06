@@ -301,7 +301,8 @@ class Delivery(Base):
         ),
         CheckConstraint(
             "terminal_reason IN ('profile_deleted','subscription_disabled','no_email',"
-            "'contact_unavailable','invalid_timezone','smtp_permanent','attempts_exhausted','smtp_uncertain')",
+            "'contact_unavailable','invalid_timezone','smtp_permanent','attempts_exhausted',"
+            "'smtp_uncertain','cancelled_by_sender')",
             name="terminal_reason",
         ),
         CheckConstraint(
@@ -350,6 +351,14 @@ class Campaign(Base):
             "(intake_status = 'closed' AND closed_at IS NOT NULL AND expected_batches IS NOT NULL)",
             name="closure_complete",
         ),
+    )
+
+
+class CancelledCampaign(Base):
+    __tablename__ = "cancelled_campaigns"
+    campaign_id: Mapped[UUID] = mapped_column(primary_key=True)
+    cancelled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
     )
 
 

@@ -194,6 +194,11 @@ class CampaignClosed(BaseModel):
     intake_status: Literal["closed"] = "closed"
 
 
+class CampaignCancelled(BaseModel):
+    campaign_id: UUID
+    status: Literal["cancelled"] = "cancelled"
+
+
 class CampaignStatus(BaseModel):
     campaign_id: UUID
     created_by_user_id: UUID | None

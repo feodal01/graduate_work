@@ -339,3 +339,22 @@ def test_content_retention_downgrade_refuses_erased_text(campaign_connection, da
         "WHERE table_name='campaign_recipients' AND column_name IN ('subject','text') "
         "ORDER BY column_name"
     ).fetchall() == [("subject", "YES"), ("text", "YES")]
+
+
+def test_cancelled_campaigns_table_and_cancelled_by_sender_constraint(
+    campaign_connection, database_url
+):
+    """T-24 (14-er-notifications-db-target, NTF-FR-02): схема cancelled_campaigns и CHECK."""
+    conn = campaign_connection
+    cid = uuid4()
+    conn.execute("INSERT INTO cancelled_campaigns(campaign_id) VALUES (%s)", (cid,))
+    conn.execute(
+        "UPDATE deliveries SET status='cancelled', terminal_reason='cancelled_by_sender', "
+        "terminal_at=now()"
+    )
+    conn.commit()
+    with pytest.raises(AssertionError, match="Restore a pre-009 backup"):
+        migrate(database_url, "downgrade", "008_campaign_content_retention")
+    assert conn.execute(
+        "SELECT count(*) FROM cancelled_campaigns WHERE campaign_id=%s", (cid,)
+    ).fetchone() == (1,)

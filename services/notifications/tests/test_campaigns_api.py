@@ -686,3 +686,210 @@ async def test_billing_notification_ignores_marketing_optout_and_daytime_window(
             == sch_outbox.available_at
             == datetime(2099, 1, 1, 23, 15, tzinfo=UTC)
         )
+
+
+async def test_cancel_existing_scheduled_campaign_and_idempotent_replay(campaign_api):
+    """T-24 (NTF-FR-02, NTF-API-02, NTF-NFR-R-01): отмена после планирования батча."""
+    from notifications.db.models import CancelledCampaign
+
+    api, db = campaign_api
+    user_pending, user_sent, campaign = uuid4(), uuid4(), uuid4()
+    await profiles(db, user_pending, user_sent, marketing=False)
+
+    body = batch(
+        item(user_pending)
+        | {
+            "template_id": "billing_notification",
+            "subject": "Срок подписки «Премиум» закончился",
+            "text": "Срок действия подписки истёк",
+            "available_at": "2099-01-01T12:00:00Z",
+        },
+        item(user_sent)
+        | {
+            "template_id": "billing_notification",
+            "subject": "Подписка оплачена",
+            "text": "Уже отправленное письмо не должно меняться при cancel",
+            "available_at": None,
+        },
+    )
+    accept_res = await api.post(f"{URL}/{campaign}/batches", json=body)
+    assert accept_res.status_code == 202
+
+    # Помечаем вторую доставку как уже отправленную (sent), чтобы убедиться,
+    # что cancel не трогает уже ушедшие в SMTP письма
+    async with db.transaction() as session:
+        sent_rec = await session.get(CampaignRecipient, (campaign, user_sent))
+        assert sent_rec is not None and sent_rec.delivery_id is not None
+        sent_del = await session.get(Delivery, sent_rec.delivery_id)
+        assert sent_del is not None
+        sent_del.status = "sent"
+        sent_del.sent_at = datetime.now(UTC)
+        sent_del.terminal_at = sent_del.sent_at
+
+    # 1. Первый вызов cancel -> 200 OK
+    cancel_1 = await api.post(f"{URL}/{campaign}/cancel")
+    assert cancel_1.status_code == 200, cancel_1.text
+    assert cancel_1.json() == {"campaign_id": str(campaign), "status": "cancelled"}
+
+    # 2. Повторный вызов cancel -> 200 OK (идемпотентность NTF-NFR-R-01)
+    cancel_2 = await api.post(f"{URL}/{campaign}/cancel")
+    assert cancel_2.status_code == 200
+    assert cancel_2.json() == {"campaign_id": str(campaign), "status": "cancelled"}
+
+    async with db.transaction() as session:
+        marker = await session.get(CancelledCampaign, campaign)
+        assert marker is not None and marker.cancelled_at is not None
+
+        pend_rec = await session.get(CampaignRecipient, (campaign, user_pending))
+        assert pend_rec is not None and pend_rec.delivery_id is not None
+        pend_del = await session.get(Delivery, pend_rec.delivery_id)
+        assert pend_del is not None
+        assert (pend_del.status, pend_del.terminal_reason) == (
+            "cancelled",
+            "cancelled_by_sender",
+        )
+        assert pend_del.terminal_at is not None
+        assert pend_del.lease_token is None and pend_del.lease_until is None
+
+        # Неопубликованная строка в outbox помечена published_at, чтобы publisher её не брал
+        outbox_row = await session.scalar(
+            select(Outbox).where(Outbox.delivery_id == pend_del.delivery_id)
+        )
+        assert outbox_row is not None and outbox_row.published_at is not None
+
+        # Уже отправленное письмо осталось sent
+        sent_del_after = await session.get(Delivery, sent_rec.delivery_id)
+        assert sent_del_after is not None and sent_del_after.status == "sent"
+
+    # 3. Идемпотентный повтор ТОГО ЖЕ батча после cancel возвращает 202
+    replay_same = await api.post(f"{URL}/{campaign}/batches", json=body)
+    assert replay_same.status_code == 202
+    assert replay_same.json()["batch_id"] == body["batch_id"]
+
+    # 4. Статус кампании отражает skipped_reasons={'cancelled_by_sender': 1} и sent=1
+    status_res = await api.get(f"{URL}/{campaign}")
+    assert status_res.status_code == 200
+    status_json = status_res.json()
+    assert status_json["sent"] == 1
+    assert status_json["skipped"] == 1
+    assert status_json["pending"] == 0
+    assert status_json["skipped_reasons"] == {"cancelled_by_sender": 1}
+
+
+async def test_preemptive_cancel_before_batch_intake_prevents_sending(campaign_api):
+    """T-24 (инвариант 12, NTF-FR-02): cancel пришёл РАНЬШЕ планирования батча."""
+    from notifications.db.models import CancelledCampaign
+
+    api, db = campaign_api
+    user, campaign = uuid4(), uuid4()
+    await profiles(db, user, marketing=False)
+
+    # 1. Вызываем cancel ДО создания кампании -> 200 OK, запись в cancelled_campaigns
+    cancel_res = await api.post(f"{URL}/{campaign}/cancel")
+    assert cancel_res.status_code == 200
+    assert cancel_res.json() == {"campaign_id": str(campaign), "status": "cancelled"}
+
+    async with db.transaction() as session:
+        assert await session.get(CancelledCampaign, campaign) is not None
+        assert await session.get(Campaign, campaign) is None
+
+    # 2. Теперь приходит запоздавший батч планирования письма об окончании
+    body = batch(
+        item(user)
+        | {
+            "template_id": "billing_notification",
+            "subject": "Срок подписки «Премиум» закончился",
+            "text": "Срок действия вашей подписки истёк",
+            "available_at": "2099-01-01T12:00:00Z",
+        }
+    )
+    intake_res = await api.post(f"{URL}/{campaign}/batches", json=body)
+    assert intake_res.status_code == 202, intake_res.text
+    assert intake_res.json()["item_count"] == 1
+
+    # Повтор того же батча идемпотентно возвращает 202, а с другим содержимым -> 409
+    replay_res = await api.post(f"{URL}/{campaign}/batches", json=body)
+    assert replay_res.status_code == 202
+
+    conflict_body = dict(
+        body, items=[item(user) | {"template_id": "billing_notification", "subject": "Другая тема"}]
+    )
+    conflict_res = await api.post(f"{URL}/{campaign}/batches", json=conflict_body)
+    assert conflict_res.status_code == 409
+    assert conflict_res.json()["error_code"] == "batch_content_conflict"
+
+    # Доставка создана сразу в статусе cancelled (cancelled_by_sender), в outbox ничего нет
+    async with db.transaction() as session:
+        rec = await session.get(CampaignRecipient, (campaign, user))
+        assert rec is not None and rec.delivery_id is not None
+        delivery = await session.get(Delivery, rec.delivery_id)
+        assert delivery is not None
+        assert (delivery.status, delivery.terminal_reason) == (
+            "cancelled",
+            "cancelled_by_sender",
+        )
+        assert delivery.terminal_at is not None
+        outbox_count = await session.scalar(
+            select(func.count())
+            .select_from(Outbox)
+            .where(Outbox.delivery_id == delivery.delivery_id)
+        )
+        assert outbox_count == 0
+
+
+async def test_cancel_campaign_unhappy_paths_auth_uuid_and_public_boundary(
+    campaign_api, database_url
+):
+    """T-24 (NTF-NFR-SEC-01, NTF-NFR-IF-01, NTF-API-02): unhappy paths для cancel."""
+    from notifications.campaigns.app import create_campaign_app
+    from notifications.main import create_app
+
+    api, _ = campaign_api
+    cid = uuid4()
+
+    # 1. Невалидный UUID в пути -> 422 validation_error
+    bad_uuid = await api.post(f"{URL}/not-a-valid-uuid/cancel")
+    assert bad_uuid.status_code == 422
+    assert bad_uuid.json()["error_code"] == "validation_error"
+
+    # 2. Отсутствующий или неверный X-API-Key -> 401 unauthorized
+    app = create_campaign_app(
+        Settings(
+            process="campaign-api",
+            database_url=database_url,
+            campaign_api_key=SecretStr(API_KEY),
+        )
+    )
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://campaigns",
+        ) as unauth_client:
+            no_key = await unauth_client.post(f"{URL}/{cid}/cancel")
+            assert no_key.status_code == 401
+            assert no_key.json()["error_code"] == "unauthorized"
+
+            wrong_key = await unauth_client.post(
+                f"{URL}/{cid}/cancel",
+                headers={"X-API-Key": "wrong-key"},
+            )
+            assert wrong_key.status_code == 401
+            assert wrong_key.json()["error_code"] == "unauthorized"
+
+    # 3. Публичный API процесс не экспонирует маршрут /cancel -> 404
+    public_app = create_app(
+        Settings(
+            process="api",
+            database_url=database_url,
+            jwt_secret=SecretStr("secret"),
+            jwt_algorithm="HS256",
+            auth_introspection_url="https://auth.test/introspect",
+            auth_introspection_api_key=SecretStr("test-service-key"),
+            auth_introspection_timeout_seconds=1,
+        )
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=public_app), base_url="http://public"
+    ) as public_client:
+        pub_res = await public_client.post(f"{URL}/{cid}/cancel", headers={"X-API-Key": API_KEY})
+        assert pub_res.status_code == 404

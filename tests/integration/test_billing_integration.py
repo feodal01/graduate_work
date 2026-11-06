@@ -96,8 +96,9 @@ class BillingIntegrationCheck:
         self._check_outbox_worker_t19()
         self._check_notifications_and_expiration_scheduling_t20_t21_t22()
         self._check_my_subscription_screen_and_summary_t23()
+        self._check_campaign_cancel_and_preemptive_cancel_t24()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06..T-23 live Docker checks passed.')
+        print('All Billing T-06..T-24 (FEAT-01 & FEAT-02) live Docker checks passed.')
 
     def _http(
         self,
@@ -1996,6 +1997,113 @@ class BillingIntegrationCheck:
             f"DELETE FROM payments WHERE id = '{pid}';"
         )
         assert self._psql(cleanup_sql).returncode == 0
+
+    def _check_campaign_cancel_and_preemptive_cancel_t24(self) -> None:
+        """T-24 (NTF-FR-02, NTF-API-02, инв. 12): cancel existing & pre-emptive."""
+        uid = str(uuid4())
+        ins_res = self._ntf_psql(
+            f'INSERT INTO profiles '
+            f'(user_id, user_version, tz, likes, new_films, marketing) '
+            f"VALUES ('{uid}', 1, 'Europe/Moscow', false, false, false) "
+            f'ON CONFLICT (user_id) DO NOTHING;'
+        )
+        assert ins_res.returncode == 0, ins_res.stderr
+
+        code = (
+            'import asyncio, httpx\n'
+            'from uuid import UUID, uuid4\n'
+            'from clients.notifications import (\n'
+            '    HttpNotificationsGateway,\n'
+            '    NotificationsPermanentError,\n'
+            ')\n'
+            'from core.config import settings\n'
+            'async def check_t24():\n'
+            '    cfg = settings.notifications_client\n'
+            '    url = str(cfg.campaign_url).rstrip("/")\n'
+            '    key = cfg.campaign_api_key.get_secret_value()\n'
+            f'    uid = UUID("{uid}")\n'
+            '    c_after = uuid4()\n'
+            '    b_after = uuid4()\n'
+            '    c_before = uuid4()\n'
+            '    b_before = uuid4()\n'
+            '    async with httpx.AsyncClient() as hc:\n'
+            '        gw = HttpNotificationsGateway(\n'
+            '            http_client=hc, base_url=url, api_key=key\n'
+            '        )\n'
+            '        # 1. Schedule batch then cancel (normal order)\n'
+            '        await gw.send_campaign_batch(\n'
+            '            campaign_id=c_after,\n'
+            '            batch_id=b_after,\n'
+            '            user_id=uid,\n'
+            '            template_id="billing_notification",\n'
+            '            subject="Срок подписки «Премиум» закончился",\n'
+            '            text="Текст письма",\n'
+            '            available_at="2099-01-01T12:00:00Z",\n'
+            '            request_id="t24-send-after",\n'
+            '        )\n'
+            '        await gw.cancel_campaign(c_after, request_id="t24-cancel-1")\n'
+            '        await gw.cancel_campaign(c_after, request_id="t24-cancel-2")\n'
+            '        # 2. Pre-emptive cancel BEFORE batch arrives (invariant 12)\n'
+            '        await gw.cancel_campaign(c_before, request_id="t24-cancel-pre")\n'
+            '        await gw.send_campaign_batch(\n'
+            '            campaign_id=c_before,\n'
+            '            batch_id=b_before,\n'
+            '            user_id=uid,\n'
+            '            template_id="billing_notification",\n'
+            '            subject="Срок подписки «Премиум» закончился",\n'
+            '            text="Текст письма",\n'
+            '            available_at="2099-01-01T12:00:00Z",\n'
+            '            request_id="t24-send-before",\n'
+            '        )\n'
+            '        # 3. Unhappy path: invalid API key -> 401\n'
+            '        bad_gw = HttpNotificationsGateway(\n'
+            '            http_client=hc, base_url=url, api_key="wrong-key"\n'
+            '        )\n'
+            '        try:\n'
+            '            await bad_gw.cancel_campaign(c_after, request_id="t24-401")\n'
+            '            raise AssertionError("Expected 401")\n'
+            '        except NotificationsPermanentError as exc:\n'
+            '            assert exc.status_code == 401\n'
+            '    print(f"c_after={c_after}\\nc_before={c_before}")\n'
+            'asyncio.run(check_t24())\n'
+        )
+        out = self._compose('exec', '-T', 'billing-api', 'python', '-c', code).strip()
+        c_after = next(
+            line.split('=', 1)[1]
+            for line in out.splitlines()
+            if line.startswith('c_after=')
+        )
+        c_before = next(
+            line.split('=', 1)[1]
+            for line in out.splitlines()
+            if line.startswith('c_before=')
+        )
+
+        # Verify both campaigns have deliveries in status='cancelled',
+        # terminal_reason='cancelled_by_sender', and 0 unpublished outbox rows
+        ntf_verify = self._ntf_psql(
+            f'SELECT count(*) FROM campaign_recipients r '
+            f'JOIN deliveries d ON d.delivery_id = r.delivery_id '
+            f"WHERE r.campaign_id IN ('{c_after}', '{c_before}') "
+            f"AND d.status = 'cancelled' "
+            f"AND d.terminal_reason = 'cancelled_by_sender';"
+        ).stdout.strip()
+        if ntf_verify != '2':
+            raise AssertionError(
+                f'Expected 2 cancelled_by_sender deliveries, got {ntf_verify}'
+            )
+
+        outbox_pending = self._ntf_psql(
+            f'SELECT count(*) FROM outbox o '
+            f'JOIN campaign_recipients r ON r.delivery_id = o.delivery_id '
+            f"WHERE r.campaign_id IN ('{c_after}', '{c_before}') "
+            f'AND o.published_at IS NULL;'
+        ).stdout.strip()
+        if outbox_pending != '0':
+            raise AssertionError(
+                f'Expected 0 unpublished outbox rows for cancelled campaigns, '
+                f'got {outbox_pending}'
+            )
 
     def _check_degradation_and_worker_graceful_shutdown(self) -> None:
         """BIL-API-15, GW-NFR-R-01, BIL-NFR-R-09: DB outage yields 503; worker stops."""

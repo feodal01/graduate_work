@@ -591,3 +591,106 @@ async def test_billing_notification_sent_to_smtp_at_night_without_marketing(
         assert messages[0]["Subject"] == "Подписка «Премиум» оплачена"
     finally:
         await db.close()
+
+
+async def test_cancelled_billing_notification_is_skipped_by_worker_without_smtp(
+    database_url, endpoints, delivery_limiter, monkeypatch
+):
+    """T-24 (NTF-FR-02, NTF-API-02): отменённая доставка не отправляется воркером в SMTP."""
+    from notifications.campaigns.service import cancel_campaign
+
+    db = Database(database_url)
+    settings = Settings(
+        process="worker",
+        database_url=database_url,
+        rabbitmq_url=endpoints["RABBITMQ_URL"],
+        smtp_host=endpoints["SMTP_HOST"],
+        smtp_port=int(endpoints["SMTP_PORT"]),
+        smtp_from="sender@example.org",
+        smtp_starttls=False,
+        fallback_locale="ru",
+        fallback_tz="UTC",
+    )
+    worker = DeliveryWorker(
+        db,
+        settings,
+        send_class="transactional",
+        retry_seconds=1,
+        max_attempts=2,
+        limiter=delivery_limiter,
+        max_concurrency=2,
+        unavailable_retry_seconds=7,
+    )
+    now_utc = datetime(2026, 11, 6, 12, 0, tzinfo=UTC)
+    await clock(worker, monkeypatch, now_utc)
+    cid, bid, uid, did = uuid4(), uuid4(), uuid4(), uuid4()
+    async with db.transaction() as s:
+        s.add(
+            contact_profile(
+                user_id=uid,
+                user_version=1,
+                email=f"{uid}@example.org",
+                first_name="Анна",
+                last_name="Смирнова",
+                tz="Europe/Moscow",
+                likes=False,
+                new_films=False,
+                marketing=False,
+            )
+        )
+        s.add(Campaign(campaign_id=cid, created_by_user_id=uid, created_at=now_utc))
+        await s.flush()
+        s.add(
+            CampaignBatch(
+                campaign_id=cid,
+                batch_id=bid,
+                request_hash="c" * 64,
+                item_count=1,
+                accepted_at=now_utc,
+            )
+        )
+        s.add(
+            Delivery(
+                delivery_id=did,
+                logical_key=f"campaign:{cid}:{uid}",
+                user_id=uid,
+                kind="external",
+                external_send_class="transactional",
+                required_subscription=None,
+                next_attempt_at=now_utc,
+            )
+        )
+        await s.flush()
+        s.add(
+            CampaignRecipient(
+                campaign_id=cid,
+                batch_id=bid,
+                user_id=uid,
+                delivery_id=did,
+                template_id="billing_notification",
+                channel="email",
+                subject="Срок подписки «Премиум» закончился",
+                text="Срок действия вашей подписки истёк.",
+                source_available_at=now_utc,
+                effective_available_at=now_utc,
+            )
+        )
+        s.add(Outbox(delivery_id=did, available_at=now_utc))
+
+    try:
+        # Отменяем кампанию до запуска воркера
+        async with db.transaction() as s:
+            await cancel_campaign(s, cid)
+
+        await worker.send_delivery(did)
+        async with db.transaction() as s:
+            delivery = await s.get(Delivery, did)
+            assert delivery is not None
+            assert (delivery.status, delivery.terminal_reason, delivery.attempt_count) == (
+                "cancelled",
+                "cancelled_by_sender",
+                0,
+            )
+        assert await mail_messages(endpoints, uid) == []
+    finally:
+        await db.close()

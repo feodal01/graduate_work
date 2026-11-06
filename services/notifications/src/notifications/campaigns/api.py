@@ -14,6 +14,7 @@ from notifications.campaigns.schemas import (
     MAX_BODY_BYTES,
     BatchAccepted,
     CampaignBatchRequest,
+    CampaignCancelled,
     CampaignClosed,
     CampaignStatus,
     CloseCampaignRequest,
@@ -22,6 +23,7 @@ from notifications.campaigns.service import (
     CampaignError,
     accept_batch,
     campaign_status,
+    cancel_campaign,
     close_campaign,
 )
 from notifications.db.session import Database
@@ -100,6 +102,11 @@ async def post_close(
     session: SessionDep,
 ) -> CampaignClosed:
     return await close_campaign(session, campaign_id, body.expected_batches)
+
+
+@router.post("/{campaign_id}/cancel")
+async def post_cancel(campaign_id: UUID, session: SessionDep) -> CampaignCancelled:
+    return await cancel_campaign(session, campaign_id)
 
 
 @router.get("/{campaign_id}")

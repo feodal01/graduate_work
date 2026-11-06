@@ -4,13 +4,14 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from notifications.campaigns.schemas import (
     BatchAccepted,
     CampaignBatchRequest,
+    CampaignCancelled,
     CampaignClosed,
     CampaignStatus,
     canonical_request_hash,
@@ -22,6 +23,7 @@ from notifications.db.models import (
     Campaign,
     CampaignBatch,
     CampaignRecipient,
+    CancelledCampaign,
     Delivery,
     Outbox,
     Profile,
@@ -116,6 +118,7 @@ async def accept_batch(
     missing = [user_id for user_id in user_ids if user_id not in profiles]
     if missing:
         raise CampaignError("profile_not_ready", user_ids=missing)
+    is_cancelled = (await session.get(CancelledCampaign, campaign_id)) is not None
     accepted_at = datetime.now(UTC)
     session.add(
         CampaignBatch(
@@ -147,19 +150,36 @@ async def accept_batch(
                     index, "available_at", "Timestamp exceeds the scheduling range"
                 ) from None
             delivery_id = uuid4()
-            session.add(
-                Delivery(
-                    delivery_id=delivery_id,
-                    logical_key=f"campaign:{campaign_id}:{item.user_id}",
-                    user_id=item.user_id,
-                    kind="external",
-                    external_send_class=spec.send_class,
-                    required_subscription=spec.required_subscription,
-                    next_attempt_at=due,
+            if is_cancelled:
+                session.add(
+                    Delivery(
+                        delivery_id=delivery_id,
+                        logical_key=f"campaign:{campaign_id}:{item.user_id}",
+                        user_id=item.user_id,
+                        kind="external",
+                        external_send_class=spec.send_class,
+                        required_subscription=spec.required_subscription,
+                        status="cancelled",
+                        terminal_reason="cancelled_by_sender",
+                        terminal_at=accepted_at,
+                        next_attempt_at=due,
+                    )
                 )
-            )
-            await session.flush()
-            session.add(Outbox(delivery_id=delivery_id, available_at=due))
+                await session.flush()
+            else:
+                session.add(
+                    Delivery(
+                        delivery_id=delivery_id,
+                        logical_key=f"campaign:{campaign_id}:{item.user_id}",
+                        user_id=item.user_id,
+                        kind="external",
+                        external_send_class=spec.send_class,
+                        required_subscription=spec.required_subscription,
+                        next_attempt_at=due,
+                    )
+                )
+                await session.flush()
+                session.add(Outbox(delivery_id=delivery_id, available_at=due))
         session.add(
             CampaignRecipient(
                 campaign_id=campaign_id,
@@ -175,6 +195,16 @@ async def accept_batch(
                 skip_reason=reason,
             )
         )
+    if is_cancelled and campaign.intake_status != "closed":
+        count = await session.scalar(
+            select(func.count())
+            .select_from(CampaignBatch)
+            .where(CampaignBatch.campaign_id == campaign_id)
+        )
+        if count and count >= 1:
+            campaign.intake_status = "closed"
+            campaign.expected_batches = count
+            campaign.closed_at = accepted_at
     await session.flush()
     return BatchAccepted(
         campaign_id=campaign_id, batch_id=body.batch_id, item_count=len(body.items)
@@ -200,6 +230,72 @@ async def close_campaign(
         campaign.closed_at = datetime.now(UTC)
         await session.flush()
     return CampaignClosed(campaign_id=campaign_id)
+
+
+async def cancel_campaign(session: AsyncSession, campaign_id: UUID) -> CampaignCancelled:
+    now_utc = datetime.now(UTC)
+    await session.execute(
+        insert(CancelledCampaign)
+        .values(campaign_id=campaign_id, cancelled_at=now_utc)
+        .on_conflict_do_nothing()
+    )
+    campaign = await session.scalar(
+        select(Campaign).where(Campaign.campaign_id == campaign_id).with_for_update()
+    )
+    if campaign is not None:
+        delivery_ids = list(
+            await session.scalars(
+                select(CampaignRecipient.delivery_id).where(
+                    CampaignRecipient.campaign_id == campaign_id,
+                    CampaignRecipient.delivery_id.is_not(None),
+                )
+            )
+        )
+        if delivery_ids:
+            deliveries = list(
+                await session.scalars(
+                    select(Delivery)
+                    .where(
+                        Delivery.delivery_id.in_(delivery_ids),
+                        Delivery.status.in_(("pending", "prepared", "retry")),
+                    )
+                    .order_by(Delivery.delivery_id)
+                    .with_for_update()
+                )
+            )
+            cancelled_delivery_ids: list[UUID] = []
+            for delivery in deliveries:
+                delivery.status = "cancelled"
+                delivery.terminal_reason = "cancelled_by_sender"
+                delivery.terminal_at = now_utc
+                delivery.lease_token = None
+                delivery.lease_until = None
+                cancelled_delivery_ids.append(delivery.delivery_id)
+            if cancelled_delivery_ids:
+                await session.execute(
+                    update(Outbox)
+                    .where(
+                        Outbox.delivery_id.in_(cancelled_delivery_ids),
+                        Outbox.published_at.is_(None),
+                    )
+                    .values(
+                        published_at=now_utc,
+                        lease_token=None,
+                        lease_until=None,
+                    )
+                )
+        if campaign.intake_status != "closed":
+            batch_count = await session.scalar(
+                select(func.count())
+                .select_from(CampaignBatch)
+                .where(CampaignBatch.campaign_id == campaign_id)
+            )
+            if batch_count and batch_count >= 1:
+                campaign.intake_status = "closed"
+                campaign.expected_batches = batch_count
+                campaign.closed_at = now_utc
+        await session.flush()
+    return CampaignCancelled(campaign_id=campaign_id)
 
 
 # All counters and reasons share one PostgreSQL statement snapshot. Batch counts
