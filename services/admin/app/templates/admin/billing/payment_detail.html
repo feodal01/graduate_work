@@ -3,9 +3,230 @@
 {% block title %}Карточка платежа {{ payment_id }}{% endblock %}
 
 {% block content %}
-<h1>Карточка платежа {{ payment_id }}</h1>
+<h1>Карточка платежа {{ payment_id }} (только чтение)</h1>
 <p>
-  <a href="{% url 'admin:billing_payments' %}">К списку платежей</a> |
-  <a href="{% url 'admin:billing_subscriptions' %}">К списку подписок</a>
+  <a href="{% url 'admin:billing_payments' %}">← К списку платежей</a> |
+  <a href="{% url 'admin:billing_subscriptions' %}">К списку подписок</a> |
+  <a href="{% url 'admin:index' %}">На главную</a>
 </p>
+
+{% if auth_warning %}
+<ul class="messagelist">
+  <li class="warning">{{ auth_warning }}</li>
+</ul>
+{% endif %}
+
+{% if card.can_refund or card.can_reconcile_payment %}
+<div class="module" style="padding: 12px; margin-bottom: 16px;">
+  <strong>Доступные действия:</strong>
+  {% if card.can_refund %}
+    <a class="button" href="/admin/billing/payments/{{ payment_id }}/refund/">Вернуть</a>
+  {% endif %}
+  {% if card.can_reconcile_payment %}
+    <form method="post" action="/admin/billing/operations/payment/{{ payment_id }}/reconcile/" style="display:inline;">
+      {% csrf_token %}
+      <button type="submit" class="button">Проверить в ЮKassa</button>
+    </form>
+  {% endif %}
+</div>
+{% endif %}
+
+<h2>1. Основные данные платежа</h2>
+<table>
+  <tbody>
+    <tr>
+      <th scope="row">Внутренний UUID платежа</th>
+      <td><code>{{ card.id }}</code></td>
+    </tr>
+    <tr>
+      <th scope="row">Номер платежа в ЮKassa</th>
+      <td><code>{{ provider_payment_id }}</code></td>
+    </tr>
+    <tr>
+      <th scope="row">Пользователь (логин и UUID)</th>
+      <td>
+        {% if user_login %}<strong>{{ user_login }}</strong> — {% endif %}
+        <code>{{ card.user_id }}</code>
+      </td>
+    </tr>
+    <tr>
+      <th scope="row">Часовой пояс пользователя</th>
+      <td>{{ user_tz }}</td>
+    </tr>
+    <tr>
+      <th scope="row">Тариф</th>
+      <td>{{ card.tariff_name }} (<code>{{ card.tariff_code }}</code>)</td>
+    </tr>
+    <tr>
+      <th scope="row">Сумма и валюта</th>
+      <td><strong>{{ amount_display }}</strong> ({{ card.currency }})</td>
+    </tr>
+    <tr>
+      <th scope="row">Статус платежа</th>
+      <td><strong>{{ status_label }}</strong> (<code>{{ card.status }}</code>)</td>
+    </tr>
+    <tr>
+      <th scope="row">Причина отказа провайдера</th>
+      <td>{{ failure_reason }}</td>
+    </tr>
+    <tr>
+      <th scope="row">Создан (UTC / пояс пользователя)</th>
+      <td>{{ created_utc_display }} | {{ created_local_display }}</td>
+    </tr>
+    <tr>
+      <th scope="row">Обновлён (UTC / пояс пользователя)</th>
+      <td>{{ updated_utc_display }} | {{ updated_local_display }}</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>2. Связанная подписка</h2>
+{% if subscription %}
+<table>
+  <thead>
+    <tr>
+      <th>ID подписки</th>
+      <th>Тариф</th>
+      <th>Период действия (UTC)</th>
+      <th>Период действия (пояс пользователя)</th>
+      <th>Вычисленный статус</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>{{ subscription.id }}</code></td>
+      <td>{{ subscription.tariff_name }}</td>
+      <td>{{ subscription.starts_utc_display }} — {{ subscription.ends_utc_display }}</td>
+      <td>{{ subscription.starts_local_display }} — {{ subscription.ends_local_display }}</td>
+      <td><strong>{{ subscription.status_label }}</strong> (<code>{{ subscription.status_code }}</code>)</td>
+    </tr>
+  </tbody>
+</table>
+{% else %}
+<p>По данному платежу подписка не создана.</p>
+{% endif %}
+
+<h2>3. Попытки возврата</h2>
+<table>
+  <thead>
+    <tr>
+      <th>ID возврата</th>
+      <th>Номер в ЮKassa</th>
+      <th>Статус</th>
+      <th>Сумма</th>
+      <th>Кто оформил (администратор)</th>
+      <th>Причина возврата</th>
+      <th>Причина отказа ЮKassa</th>
+      <th>Время (UTC / пояс пользователя)</th>
+      <th>Действия</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for ref in refunds %}
+    <tr>
+      <td><code>{{ ref.id }}</code></td>
+      <td><code>{{ ref.provider_refund_id }}</code></td>
+      <td>{{ ref.status_label }} (<code>{{ ref.status_code }}</code>)</td>
+      <td>{{ ref.amount_display }}</td>
+      <td>
+        {% if ref.admin_login %}<strong>{{ ref.admin_login }}</strong><br>{% endif %}
+        <code>{{ ref.admin_user_id }}</code>
+      </td>
+      <td>{{ ref.reason }}</td>
+      <td>{{ ref.rejection_reason }}</td>
+      <td>{{ ref.created_utc_display }}<br>{{ ref.created_local_display }}</td>
+      <td>
+        {% if ref.can_reconcile %}
+          <form method="post" action="/admin/billing/operations/refund/{{ ref.id }}/reconcile/" style="display:inline;">
+            {% csrf_token %}
+            <button type="submit" class="button">Проверить в ЮKassa</button>
+          </form>
+        {% else %}
+          —
+        {% endif %}
+      </td>
+    </tr>
+  {% empty %}
+    <tr>
+      <td colspan="9">Попыток возврата нет.</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>4. История переходов статусов (operation_events)</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Время (UTC)</th>
+      <th>Время (пояс пользователя)</th>
+      <th>Операция</th>
+      <th>Старый статус → Новый статус</th>
+      <th>Источник</th>
+      <th>Детали</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for ev in events %}
+    <tr>
+      <td>{{ ev.created_utc_display }}</td>
+      <td>{{ ev.created_local_display }}</td>
+      <td>{{ ev.operation_type_label }} (<code>{{ ev.operation_id }}</code>)</td>
+      <td><code>{{ ev.from_status }}</code> → <strong><code>{{ ev.to_status }}</code></strong></td>
+      <td><code>{{ ev.source }}</code></td>
+      <td><code>{{ ev.details_display }}</code></td>
+    </tr>
+  {% empty %}
+    <tr>
+      <td colspan="6">Записей переходов нет.</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>5. Доставка в Auth и Notifications (outbox_tasks)</h2>
+<table>
+  <thead>
+    <tr>
+      <th>ID задачи</th>
+      <th>Сервис</th>
+      <th>Тип задачи</th>
+      <th>Версия доступа</th>
+      <th>Статус</th>
+      <th>Попыток</th>
+      <th>Последняя ошибка</th>
+      <th>Время (UTC / пояс пользователя)</th>
+      <th>Действия</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for task in outbox_tasks %}
+    <tr>
+      <td><code>{{ task.id }}</code></td>
+      <td><code>{{ task.target_service }}</code></td>
+      <td><code>{{ task.task_type }}</code></td>
+      <td>{{ task.access_version }}</td>
+      <td>{{ task.status_label }} (<code>{{ task.status_code }}</code>)</td>
+      <td>{{ task.attempts }}</td>
+      <td>{{ task.last_error }}</td>
+      <td>{{ task.created_utc_display }}<br>{{ task.created_local_display }}</td>
+      <td>
+        {% if task.can_retry_or_close %}
+          <form method="post" action="/admin/billing/outbox-tasks/{{ task.id }}/retry/" style="display:inline;">
+            {% csrf_token %}
+            <button type="submit" class="button">Повторить</button>
+          </form>
+          <a class="button" href="/admin/billing/outbox-tasks/{{ task.id }}/close/">Закрыть с причиной</a>
+        {% else %}
+          —
+        {% endif %}
+      </td>
+    </tr>
+  {% empty %}
+    <tr>
+      <td colspan="9">Задач доставки нет.</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
 {% endblock %}

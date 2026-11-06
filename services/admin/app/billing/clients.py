@@ -18,6 +18,10 @@ class BillingUnavailableError(Exception):
     """Сервис Billing временно недоступен (ADM-NFR-R-02)."""
 
 
+class BillingNotFoundError(Exception):
+    """Запрошенная операция в Billing не найдена (404)."""
+
+
 class BillingContractError(BillingUnavailableError):
     """Ответ Billing не соответствует внутреннему контракту."""
 
@@ -78,6 +82,72 @@ class BillingPaymentItem:
 class BillingPaymentsPage:
     total: int
     items: tuple[BillingPaymentItem, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BillingRefundItem:
+    id: UUID
+    payment_id: UUID
+    subscription_id: UUID
+    provider_code: str
+    provider_refund_id: str | None
+    amount_kopeks: int
+    currency: str
+    status: str
+    reason: str
+    rejection_reason: str | None
+    admin_user_id: UUID
+    created_at: datetime
+    updated_at: datetime
+    can_reconcile: bool
+
+
+@dataclass(frozen=True, slots=True)
+class BillingOperationEventItem:
+    id: UUID
+    operation_type: str
+    operation_id: UUID
+    from_status: str | None
+    to_status: str
+    source: str
+    details: dict[str, Any] | None
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class BillingOutboxTaskItem:
+    id: UUID
+    target_service: str
+    task_type: str
+    access_version: int | None
+    status: str
+    attempts: int
+    last_error: str | None
+    created_at: datetime
+    updated_at: datetime
+    can_retry_or_close: bool
+
+
+@dataclass(frozen=True, slots=True)
+class BillingPaymentCardData:
+    id: UUID
+    user_id: UUID
+    tariff_code: str
+    tariff_name: str
+    provider_code: str
+    provider_payment_id: str | None
+    amount_kopeks: int
+    currency: str
+    status: str
+    failure_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+    can_refund: bool
+    can_reconcile_payment: bool
+    subscription: BillingSubscriptionItem | None
+    refunds: tuple[BillingRefundItem, ...]
+    operation_events: tuple[BillingOperationEventItem, ...]
+    outbox_tasks: tuple[BillingOutboxTaskItem, ...]
 
 
 def _parse_iso_datetime(value: Any) -> datetime:
@@ -324,12 +394,143 @@ class BillingAdminClient:
         except (KeyError, TypeError, ValueError) as exc:
             raise BillingContractError('Invalid payments payload') from exc
 
+    def get_payment_card(
+        self,
+        payment_id: UUID,
+        *,
+        request_id: str,
+    ) -> BillingPaymentCardData:
+        body = self._get_json(
+            f'/payments/{payment_id}',
+            params={},
+            request_id=request_id,
+            allow_not_found=True,
+        )
+        try:
+            raw_sub = body.get('subscription')
+            sub_item: BillingSubscriptionItem | None = None
+            if isinstance(raw_sub, dict):
+                sub_item = BillingSubscriptionItem(
+                    id=_parse_uuid(raw_sub['id']),
+                    user_id=_parse_uuid(raw_sub['user_id']),
+                    payment_id=_parse_uuid(raw_sub['payment_id']),
+                    tariff_code=str(raw_sub['tariff_code']),
+                    tariff_name=str(raw_sub['tariff_name']),
+                    starts_at=_parse_iso_datetime(raw_sub['starts_at']),
+                    ends_at=_parse_iso_datetime(raw_sub['ends_at']),
+                    status=str(raw_sub['status']),
+                    amount_kopeks=int(raw_sub['amount_kopeks']),
+                    currency=str(raw_sub['currency']),
+                    created_at=_parse_iso_datetime(raw_sub['created_at']),
+                )
+
+            raw_refunds = body.get('refunds', [])
+            if not isinstance(raw_refunds, list):
+                raise TypeError('refunds must be a list')
+            refund_items = tuple(
+                BillingRefundItem(
+                    id=_parse_uuid(r['id']),
+                    payment_id=_parse_uuid(r['payment_id']),
+                    subscription_id=_parse_uuid(r['subscription_id']),
+                    provider_code=str(r['provider_code']),
+                    provider_refund_id=(
+                        str(r['provider_refund_id'])
+                        if r.get('provider_refund_id') is not None
+                        else None
+                    ),
+                    amount_kopeks=int(r['amount_kopeks']),
+                    currency=str(r['currency']),
+                    status=str(r['status']),
+                    reason=str(r['reason']),
+                    rejection_reason=(
+                        str(r['rejection_reason'])
+                        if r.get('rejection_reason') is not None
+                        else None
+                    ),
+                    admin_user_id=_parse_uuid(r['admin_user_id']),
+                    created_at=_parse_iso_datetime(r['created_at']),
+                    updated_at=_parse_iso_datetime(r['updated_at']),
+                    can_reconcile=bool(r.get('can_reconcile', False)),
+                )
+                for r in raw_refunds
+            )
+
+            raw_events = body.get('operation_events', [])
+            if not isinstance(raw_events, list):
+                raise TypeError('operation_events must be a list')
+            event_items = tuple(
+                BillingOperationEventItem(
+                    id=_parse_uuid(ev['id']),
+                    operation_type=str(ev['operation_type']),
+                    operation_id=_parse_uuid(ev['operation_id']),
+                    from_status=(
+                        str(ev['from_status']) if ev.get('from_status') is not None else None
+                    ),
+                    to_status=str(ev['to_status']),
+                    source=str(ev['source']),
+                    details=(dict(ev['details']) if isinstance(ev.get('details'), dict) else None),
+                    created_at=_parse_iso_datetime(ev['created_at']),
+                )
+                for ev in raw_events
+            )
+
+            raw_tasks = body.get('outbox_tasks', [])
+            if not isinstance(raw_tasks, list):
+                raise TypeError('outbox_tasks must be a list')
+            task_items = tuple(
+                BillingOutboxTaskItem(
+                    id=_parse_uuid(t['id']),
+                    target_service=str(t['target_service']),
+                    task_type=str(t['task_type']),
+                    access_version=(
+                        int(t['access_version']) if t.get('access_version') is not None else None
+                    ),
+                    status=str(t['status']),
+                    attempts=int(t['attempts']),
+                    last_error=(str(t['last_error']) if t.get('last_error') is not None else None),
+                    created_at=_parse_iso_datetime(t['created_at']),
+                    updated_at=_parse_iso_datetime(t['updated_at']),
+                    can_retry_or_close=bool(t.get('can_retry_or_close', False)),
+                )
+                for t in raw_tasks
+            )
+
+            return BillingPaymentCardData(
+                id=_parse_uuid(body['id']),
+                user_id=_parse_uuid(body['user_id']),
+                tariff_code=str(body['tariff_code']),
+                tariff_name=str(body['tariff_name']),
+                provider_code=str(body['provider_code']),
+                provider_payment_id=(
+                    str(body['provider_payment_id'])
+                    if body.get('provider_payment_id') is not None
+                    else None
+                ),
+                amount_kopeks=int(body['amount_kopeks']),
+                currency=str(body['currency']),
+                status=str(body['status']),
+                failure_reason=(
+                    str(body['failure_reason']) if body.get('failure_reason') is not None else None
+                ),
+                created_at=_parse_iso_datetime(body['created_at']),
+                updated_at=_parse_iso_datetime(body['updated_at']),
+                can_refund=bool(body.get('can_refund', False)),
+                can_reconcile_payment=bool(body.get('can_reconcile_payment', False)),
+                subscription=sub_item,
+                refunds=refund_items,
+                operation_events=event_items,
+                outbox_tasks=task_items,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BillingContractError('Invalid payment card payload') from exc
+
     def _get_json(
         self,
         path: str,
         *,
         params: dict[str, Any],
         request_id: str,
+        allow_not_found: bool = False,
     ) -> dict[str, Any]:
         try:
             response = self._http_client.request(
@@ -344,6 +545,8 @@ class BillingAdminClient:
         except httpx.HTTPError as exc:
             raise BillingUnavailableError('Billing service request failed') from exc
 
+        if allow_not_found and response.status_code == 404:
+            raise BillingNotFoundError('Resource not found in Billing')
         if response.status_code != 200:
             raise BillingUnavailableError(f'Billing service returned status {response.status_code}')
         try:

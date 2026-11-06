@@ -150,6 +150,72 @@ class InternalPaymentItemData:
     updated_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class InternalRefundItemData:
+    id: UUID
+    payment_id: UUID
+    subscription_id: UUID
+    provider_code: str
+    provider_refund_id: str | None
+    amount_kopeks: int
+    currency: str
+    status: Literal['processing', 'succeeded', 'rejected']
+    reason: str
+    rejection_reason: str | None
+    admin_user_id: UUID
+    created_at: datetime
+    updated_at: datetime
+    can_reconcile: bool
+
+
+@dataclass(frozen=True, slots=True)
+class InternalOperationEventItemData:
+    id: UUID
+    operation_type: Literal['payment', 'refund']
+    operation_id: UUID
+    from_status: str | None
+    to_status: str
+    source: str
+    details: dict[str, Any] | None
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class InternalOutboxTaskItemData:
+    id: UUID
+    target_service: Literal['auth', 'notifications']
+    task_type: str
+    access_version: int | None
+    status: Literal['pending', 'completed', 'requires_intervention', 'closed']
+    attempts: int
+    last_error: str | None
+    created_at: datetime
+    updated_at: datetime
+    can_retry_or_close: bool
+
+
+@dataclass(frozen=True, slots=True)
+class InternalPaymentCardData:
+    id: UUID
+    user_id: UUID
+    tariff_code: str
+    tariff_name: str
+    provider_code: str
+    provider_payment_id: str | None
+    amount_kopeks: int
+    currency: str
+    status: Literal['pending', 'succeeded', 'failed']
+    failure_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+    can_refund: bool
+    can_reconcile_payment: bool
+    subscription: InternalSubscriptionItemData | None
+    refunds: list[InternalRefundItemData]
+    operation_events: list[InternalOperationEventItemData]
+    outbox_tasks: list[InternalOutboxTaskItemData]
+
+
 class OutboxTaskRecordProtocol(Protocol):
     id: UUID
     dedup_key: str
@@ -220,6 +286,13 @@ class PurchaseRepository(Protocol):
         stuck_threshold_seconds: int = 600,
         now_utc: datetime | None = None,
     ) -> tuple[int, list[InternalPaymentItemData]]: ...
+
+    async def get_internal_payment_card(
+        self,
+        payment_id: UUID,
+        *,
+        now_utc: datetime | None = None,
+    ) -> InternalPaymentCardData | None: ...
 
     async def get_payment_by_provider_id(
         self,
@@ -903,6 +976,212 @@ class SQLAlchemyPurchaseRepository:
                         )
                     )
                 return total, items
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def get_internal_payment_card(
+        self,
+        payment_id: UUID,
+        *,
+        now_utc: datetime | None = None,
+    ) -> InternalPaymentCardData | None:
+        now = now_utc or datetime.now(UTC)
+        try:
+            async with self._session_factory() as session:
+                pay_row = (
+                    await session.execute(
+                        select(Payment, Tariff.code, Tariff.title)
+                        .join(Tariff, Tariff.id == Payment.tariff_id)
+                        .where(Payment.id == payment_id)
+                    )
+                ).one_or_none()
+                if pay_row is None:
+                    return None
+                payment, t_code, t_title = pay_row
+
+                sub_row = await session.scalar(
+                    select(Subscription).where(Subscription.payment_id == payment_id)
+                )
+                refund_rows = list(
+                    await session.scalars(
+                        select(Refund)
+                        .where(Refund.payment_id == payment_id)
+                        .order_by(Refund.created_at.desc(), Refund.id.desc())
+                    )
+                )
+                has_succeeded_refund = any(r.status == 'succeeded' for r in refund_rows)
+                has_active_or_succeeded_refund = any(
+                    r.status in ('processing', 'succeeded') for r in refund_rows
+                )
+
+                sub_data: InternalSubscriptionItemData | None = None
+                if sub_row is not None:
+                    state_enum = compute_subscription_state(
+                        ends_at=sub_row.ends_at,
+                        has_succeeded_refund=has_succeeded_refund,
+                        now_utc=now,
+                    )
+                    sub_status: Literal['active', 'expired', 'refunded'] = (
+                        'refunded'
+                        if state_enum == 'refunded'
+                        else 'active'
+                        if state_enum == 'active'
+                        else 'expired'
+                    )
+                    sub_data = InternalSubscriptionItemData(
+                        id=sub_row.id,
+                        user_id=sub_row.user_id,
+                        payment_id=sub_row.payment_id,
+                        tariff_code=t_code,
+                        tariff_name=t_title,
+                        starts_at=sub_row.starts_at,
+                        ends_at=sub_row.ends_at,
+                        status=sub_status,
+                        amount_kopeks=payment.amount_kopeks,
+                        currency=payment.currency.strip(),
+                        created_at=sub_row.created_at,
+                    )
+
+                refund_ids = [r.id for r in refund_rows]
+                event_cond: Any = and_(
+                    OperationEvent.operation_type == 'payment',
+                    OperationEvent.operation_id == payment_id,
+                )
+                if refund_ids:
+                    event_cond = or_(
+                        event_cond,
+                        and_(
+                            OperationEvent.operation_type == 'refund',
+                            OperationEvent.operation_id.in_(refund_ids),
+                        ),
+                    )
+                event_rows = list(
+                    await session.scalars(
+                        select(OperationEvent)
+                        .where(event_cond)
+                        .order_by(
+                            OperationEvent.created_at.asc(),
+                            OperationEvent.id.asc(),
+                        )
+                    )
+                )
+                task_rows = list(
+                    await session.scalars(
+                        select(OutboxTask)
+                        .where(OutboxTask.payment_id == payment_id)
+                        .order_by(OutboxTask.created_at.asc(), OutboxTask.id.asc())
+                    )
+                )
+
+                can_refund = (
+                    payment.status == 'succeeded'
+                    and sub_data is not None
+                    and sub_data.status == 'active'
+                    and not has_active_or_succeeded_refund
+                )
+                normalized_p_status: Literal['pending', 'succeeded', 'failed'] = (
+                    'succeeded'
+                    if payment.status == 'succeeded'
+                    else 'failed'
+                    if payment.status == 'failed'
+                    else 'pending'
+                )
+                refund_items: list[InternalRefundItemData] = []
+                for r in refund_rows:
+                    r_status: Literal['processing', 'succeeded', 'rejected'] = (
+                        'succeeded'
+                        if r.status == 'succeeded'
+                        else 'processing'
+                        if r.status == 'processing'
+                        else 'rejected'
+                    )
+                    refund_items.append(
+                        InternalRefundItemData(
+                            id=r.id,
+                            payment_id=r.payment_id,
+                            subscription_id=r.subscription_id,
+                            provider_code=r.provider_code,
+                            provider_refund_id=r.provider_refund_id,
+                            amount_kopeks=r.amount_kopeks,
+                            currency=r.currency.strip(),
+                            status=r_status,
+                            reason=r.reason,
+                            rejection_reason=r.rejection_reason,
+                            admin_user_id=r.admin_user_id,
+                            created_at=r.created_at,
+                            updated_at=r.updated_at,
+                            can_reconcile=(r_status == 'processing'),
+                        )
+                    )
+
+                event_items: list[InternalOperationEventItemData] = [
+                    InternalOperationEventItemData(
+                        id=ev.id,
+                        operation_type=(
+                            'refund' if ev.operation_type == 'refund' else 'payment'
+                        ),
+                        operation_id=ev.operation_id,
+                        from_status=ev.from_status,
+                        to_status=ev.to_status,
+                        source=ev.source,
+                        details=ev.details,
+                        created_at=ev.created_at,
+                    )
+                    for ev in event_rows
+                ]
+
+                task_items: list[InternalOutboxTaskItemData] = []
+                for t in task_rows:
+                    t_status: Literal[
+                        'pending', 'completed', 'requires_intervention', 'closed'
+                    ] = (
+                        'completed'
+                        if t.status == 'completed'
+                        else 'requires_intervention'
+                        if t.status == 'requires_intervention'
+                        else 'closed'
+                        if t.status == 'closed'
+                        else 'pending'
+                    )
+                    task_items.append(
+                        InternalOutboxTaskItemData(
+                            id=t.id,
+                            target_service=(
+                                'notifications'
+                                if t.target_service == 'notifications'
+                                else 'auth'
+                            ),
+                            task_type=t.task_type,
+                            access_version=t.access_version,
+                            status=t_status,
+                            attempts=t.attempts,
+                            last_error=t.last_error,
+                            created_at=t.created_at,
+                            updated_at=t.updated_at,
+                            can_retry_or_close=(t_status == 'requires_intervention'),
+                        )
+                    )
+
+                return InternalPaymentCardData(
+                    id=payment.id,
+                    user_id=payment.user_id,
+                    tariff_code=t_code,
+                    tariff_name=t_title,
+                    provider_code=payment.provider_code,
+                    provider_payment_id=payment.provider_payment_id,
+                    amount_kopeks=payment.amount_kopeks,
+                    currency=payment.currency.strip(),
+                    status=normalized_p_status,
+                    failure_reason=payment.failure_reason,
+                    created_at=payment.created_at,
+                    updated_at=payment.updated_at,
+                    can_refund=can_refund,
+                    can_reconcile_payment=(normalized_p_status == 'pending'),
+                    subscription=sub_data,
+                    refunds=refund_items,
+                    operation_events=event_items,
+                    outbox_tasks=task_items,
+                )
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 

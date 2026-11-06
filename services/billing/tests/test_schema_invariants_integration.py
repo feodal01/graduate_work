@@ -1207,3 +1207,23 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
     assert pay_total_stuck == 1
     assert pay_items_stuck[0].id == stuck_pay_id
     assert pay_items_stuck[0].is_stuck is True
+
+    # T-28 (BIL-API-08): полная карточка платежа в PostgreSQL
+    card_act = await repo.get_internal_payment_card(pay_active.id, now_utc=now_utc)
+    assert card_act is not None
+    assert card_act.id == pay_active.id
+    assert card_act.can_refund is True
+    assert card_act.subscription is not None
+    assert card_act.subscription.status == 'active'
+    assert len(card_act.operation_events) >= 2
+    assert len(card_act.outbox_tasks) == 3
+
+    card_ref = await repo.get_internal_payment_card(pay_ref.id, now_utc=now_utc)
+    assert card_ref is not None
+    assert card_ref.can_refund is False
+    assert card_ref.subscription is not None
+    assert card_ref.subscription.status == 'refunded'
+    assert len(card_ref.refunds) == 1
+    assert card_ref.refunds[0].status == 'succeeded'
+
+    assert await repo.get_internal_payment_card(uuid4(), now_utc=now_utc) is None

@@ -5,13 +5,18 @@ from datetime import date, datetime, timezone
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from django.http import HttpRequest, HttpResponse
+from django.http import Http404, HttpRequest, HttpResponse
 from django.shortcuts import render
 from users.request_id import get_request_id
 
 from billing.clients import (
     AuthLookupUnavailableError,
+    BillingNotFoundError,
+    BillingOperationEventItem,
+    BillingOutboxTaskItem,
+    BillingPaymentCardData,
     BillingPaymentItem,
+    BillingRefundItem,
     BillingSubscriptionItem,
     BillingUnavailableError,
     UserLookupProfile,
@@ -35,6 +40,13 @@ REFUND_STATUS_LABELS: dict[str, str] = {
     'processing': 'Возврат в обработке',
     'succeeded': 'Возвращён',
     'rejected': 'Возврат отклонён',
+}
+
+OUTBOX_STATUS_LABELS: dict[str, str] = {
+    'pending': 'В очереди',
+    'completed': 'Доставлено',
+    'requires_intervention': 'Требует вмешательства',
+    'closed': 'Закрыто администратором',
 }
 
 DEFAULT_PAGE_LIMIT = 50
@@ -72,6 +84,50 @@ class PaymentRowView:
     is_stuck: bool
     created_utc_display: str
     created_local_display: str
+
+
+@dataclass(frozen=True, slots=True)
+class RefundCardRowView:
+    id: UUID
+    provider_refund_id: str
+    status_code: str
+    status_label: str
+    amount_display: str
+    admin_user_id: UUID
+    admin_login: str | None
+    reason: str
+    rejection_reason: str
+    created_utc_display: str
+    created_local_display: str
+    can_reconcile: bool
+
+
+@dataclass(frozen=True, slots=True)
+class OperationEventCardRowView:
+    id: UUID
+    operation_type_label: str
+    operation_id: UUID
+    from_status: str
+    to_status: str
+    source: str
+    details_display: str
+    created_utc_display: str
+    created_local_display: str
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxTaskCardRowView:
+    id: UUID
+    target_service: str
+    task_type: str
+    access_version: str
+    status_code: str
+    status_label: str
+    attempts: int
+    last_error: str
+    created_utc_display: str
+    created_local_display: str
+    can_retry_or_close: bool
 
 
 def format_amount_rub(amount_kopeks: int, currency: str = 'RUB') -> str:
@@ -532,10 +588,124 @@ def payments_list(request: HttpRequest) -> HttpResponse:
 
 
 def payment_detail(request: HttpRequest, payment_id: UUID) -> HttpResponse:
+    request_id = get_request_id(request)
+    try:
+        card: BillingPaymentCardData = get_billing_client().get_payment_card(
+            payment_id,
+            request_id=request_id,
+        )
+    except BillingNotFoundError as exc:
+        raise Http404('Платёж не найден') from exc
+    except BillingUnavailableError:
+        return render(
+            request,
+            'admin/billing/unavailable.html',
+            status=503,
+        )
+
+    ids_to_lookup = [card.user_id, *(r.admin_user_id for r in card.refunds)]
+    profiles, enrich_degraded = _enrich_profiles(
+        ids_to_lookup,
+        request_id=request_id,
+    )
+    auth_warning = (
+        'Сервис Auth временно недоступен: показаны UUID пользователей и даты в UTC.'
+        if enrich_degraded
+        else None
+    )
+    user_profile = profiles.get(card.user_id)
+    user_tz = user_profile.tz if user_profile is not None else None
+
+    sub_view = (
+        _build_subscription_row(card.subscription, user_profile)
+        if card.subscription is not None
+        else None
+    )
+    refund_views = tuple(
+        _build_refund_card_row(r, profiles.get(r.admin_user_id), user_tz) for r in card.refunds
+    )
+    event_views = tuple(_build_event_card_row(ev, user_tz) for ev in card.operation_events)
+    task_views = tuple(_build_task_card_row(t, user_tz) for t in card.outbox_tasks)
+
     return render(
         request,
         'admin/billing/payment_detail.html',
-        {'payment_id': payment_id},
+        {
+            'payment_id': card.id,
+            'card': card,
+            'user_login': user_profile.login if user_profile is not None else None,
+            'user_tz': user_tz or 'UTC (пояс недоступен)',
+            'amount_display': format_amount_rub(card.amount_kopeks, card.currency),
+            'status_label': PAYMENT_STATUS_LABELS.get(card.status, card.status),
+            'provider_payment_id': card.provider_payment_id or '—',
+            'failure_reason': card.failure_reason or '—',
+            'created_utc_display': format_utc_datetime(card.created_at),
+            'created_local_display': format_user_tz_datetime(card.created_at, user_tz),
+            'updated_utc_display': format_utc_datetime(card.updated_at),
+            'updated_local_display': format_user_tz_datetime(card.updated_at, user_tz),
+            'subscription': sub_view,
+            'refunds': refund_views,
+            'events': event_views,
+            'outbox_tasks': task_views,
+            'auth_warning': auth_warning,
+        },
+    )
+
+
+def _build_refund_card_row(
+    item: BillingRefundItem,
+    admin_profile: UserLookupProfile | None,
+    user_tz: str | None,
+) -> RefundCardRowView:
+    return RefundCardRowView(
+        id=item.id,
+        provider_refund_id=item.provider_refund_id or '—',
+        status_code=item.status,
+        status_label=REFUND_STATUS_LABELS.get(item.status, item.status),
+        amount_display=format_amount_rub(item.amount_kopeks, item.currency),
+        admin_user_id=item.admin_user_id,
+        admin_login=admin_profile.login if admin_profile is not None else None,
+        reason=item.reason,
+        rejection_reason=item.rejection_reason or '—',
+        created_utc_display=format_utc_datetime(item.created_at),
+        created_local_display=format_user_tz_datetime(item.created_at, user_tz),
+        can_reconcile=item.can_reconcile,
+    )
+
+
+def _build_event_card_row(
+    item: BillingOperationEventItem,
+    user_tz: str | None,
+) -> OperationEventCardRowView:
+    return OperationEventCardRowView(
+        id=item.id,
+        operation_type_label=('Возврат' if item.operation_type == 'refund' else 'Платёж'),
+        operation_id=item.operation_id,
+        from_status=item.from_status or '—',
+        to_status=item.to_status,
+        source=item.source,
+        details_display=str(item.details) if item.details else '—',
+        created_utc_display=format_utc_datetime(item.created_at),
+        created_local_display=format_user_tz_datetime(item.created_at, user_tz),
+    )
+
+
+def _build_task_card_row(
+    item: BillingOutboxTaskItem,
+    user_tz: str | None,
+) -> OutboxTaskCardRowView:
+    return OutboxTaskCardRowView(
+        id=item.id,
+        target_service=item.target_service,
+        task_type=item.task_type,
+        access_version=(str(item.access_version) if item.access_version is not None else '—'),
+        status_code=item.status,
+        status_label=OUTBOX_STATUS_LABELS.get(item.status, item.status),
+        attempts=item.attempts,
+        last_error=item.last_error or '—',
+        created_utc_display=format_utc_datetime(item.created_at),
+        created_local_display=format_user_tz_datetime(item.created_at, user_tz),
+        can_retry_or_close=item.can_retry_or_close,
     )
 
 

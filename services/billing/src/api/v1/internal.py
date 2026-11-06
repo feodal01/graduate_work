@@ -63,6 +63,68 @@ class InternalPaymentsListResponse(BaseModel):
     items: list[InternalPaymentItemResponse]
 
 
+class InternalRefundItemResponse(BaseModel):
+    id: UUID
+    payment_id: UUID
+    subscription_id: UUID
+    provider_code: str
+    provider_refund_id: str | None
+    amount_kopeks: int
+    currency: str
+    status: Literal['processing', 'succeeded', 'rejected']
+    reason: str
+    rejection_reason: str | None
+    admin_user_id: UUID
+    created_at: datetime
+    updated_at: datetime
+    can_reconcile: bool
+
+
+class InternalOperationEventItemResponse(BaseModel):
+    id: UUID
+    operation_type: Literal['payment', 'refund']
+    operation_id: UUID
+    from_status: str | None
+    to_status: str
+    source: str
+    details: dict[str, object] | None
+    created_at: datetime
+
+
+class InternalOutboxTaskItemResponse(BaseModel):
+    id: UUID
+    target_service: Literal['auth', 'notifications']
+    task_type: str
+    access_version: int | None
+    status: Literal['pending', 'completed', 'requires_intervention', 'closed']
+    attempts: int
+    last_error: str | None
+    created_at: datetime
+    updated_at: datetime
+    can_retry_or_close: bool
+
+
+class InternalPaymentCardResponse(BaseModel):
+    id: UUID
+    user_id: UUID
+    tariff_code: str
+    tariff_name: str
+    provider_code: str
+    provider_payment_id: str | None
+    amount_kopeks: int
+    currency: str
+    status: Literal['pending', 'succeeded', 'failed']
+    failure_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+    can_refund: bool
+    can_reconcile_payment: bool
+    subscription: InternalSubscriptionItemResponse | None
+    refunds: list[InternalRefundItemResponse]
+    operation_events: list[InternalOperationEventItemResponse]
+    outbox_tasks: list[InternalOutboxTaskItemResponse]
+
+
 def _normalize_bound(
     dt_value: datetime | None,
     date_value: date | None,
@@ -218,5 +280,109 @@ async def get_internal_payments(
                 updated_at=r.updated_at,
             )
             for r in rows
+        ],
+    )
+
+
+@router.get(
+    '/payments/{payment_id}',
+    response_model=InternalPaymentCardResponse,
+    responses={
+        401: {'description': 'Invalid or missing service API key'},
+        404: {'description': 'Payment not found'},
+        422: {'description': 'Invalid payment UUID'},
+        503: {'description': 'Database is unavailable'},
+    },
+)
+async def get_internal_payment_card(
+    payment_id: UUID,
+    repo: Annotated[PurchaseRepository, Depends(get_purchase_repository)],
+) -> InternalPaymentCardResponse:
+    card = await repo.get_internal_payment_card(payment_id)
+    if card is None:
+        raise BillingDomainError(
+            'Payment not found',
+            error_code='payment_not_found',
+            status_code=404,
+        )
+    sub_resp = (
+        InternalSubscriptionItemResponse(
+            id=card.subscription.id,
+            user_id=card.subscription.user_id,
+            payment_id=card.subscription.payment_id,
+            tariff_code=card.subscription.tariff_code,
+            tariff_name=card.subscription.tariff_name,
+            starts_at=card.subscription.starts_at,
+            ends_at=card.subscription.ends_at,
+            status=card.subscription.status,
+            amount_kopeks=card.subscription.amount_kopeks,
+            currency=card.subscription.currency,
+            created_at=card.subscription.created_at,
+        )
+        if card.subscription is not None
+        else None
+    )
+    return InternalPaymentCardResponse(
+        id=card.id,
+        user_id=card.user_id,
+        tariff_code=card.tariff_code,
+        tariff_name=card.tariff_name,
+        provider_code=card.provider_code,
+        provider_payment_id=card.provider_payment_id,
+        amount_kopeks=card.amount_kopeks,
+        currency=card.currency,
+        status=card.status,
+        failure_reason=card.failure_reason,
+        created_at=card.created_at,
+        updated_at=card.updated_at,
+        can_refund=card.can_refund,
+        can_reconcile_payment=card.can_reconcile_payment,
+        subscription=sub_resp,
+        refunds=[
+            InternalRefundItemResponse(
+                id=r.id,
+                payment_id=r.payment_id,
+                subscription_id=r.subscription_id,
+                provider_code=r.provider_code,
+                provider_refund_id=r.provider_refund_id,
+                amount_kopeks=r.amount_kopeks,
+                currency=r.currency,
+                status=r.status,
+                reason=r.reason,
+                rejection_reason=r.rejection_reason,
+                admin_user_id=r.admin_user_id,
+                created_at=r.created_at,
+                updated_at=r.updated_at,
+                can_reconcile=r.can_reconcile,
+            )
+            for r in card.refunds
+        ],
+        operation_events=[
+            InternalOperationEventItemResponse(
+                id=ev.id,
+                operation_type=ev.operation_type,
+                operation_id=ev.operation_id,
+                from_status=ev.from_status,
+                to_status=ev.to_status,
+                source=ev.source,
+                details=ev.details,
+                created_at=ev.created_at,
+            )
+            for ev in card.operation_events
+        ],
+        outbox_tasks=[
+            InternalOutboxTaskItemResponse(
+                id=t.id,
+                target_service=t.target_service,
+                task_type=t.task_type,
+                access_version=t.access_version,
+                status=t.status,
+                attempts=t.attempts,
+                last_error=t.last_error,
+                created_at=t.created_at,
+                updated_at=t.updated_at,
+                can_retry_or_close=t.can_retry_or_close,
+            )
+            for t in card.outbox_tasks
         ],
     )

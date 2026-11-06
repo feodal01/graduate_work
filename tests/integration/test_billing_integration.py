@@ -101,7 +101,7 @@ class BillingIntegrationCheck:
         self._check_internal_billing_lists_t26()
         self._check_admin_billing_lists_t27()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06..T-27 live Docker checks passed.')
+        print('All Billing T-06..T-28 live Docker checks passed.')
 
     def _http(
         self,
@@ -2477,7 +2477,7 @@ class BillingIntegrationCheck:
                     f'Expected empty subscriptions list, got {empty_res.text()}'
                 )
 
-            # 5. Payments list search by provider_payment_id
+            # 5. Payments list search by provider_payment_id & payment card (T-28)
             pay_res = self._admin_http(
                 'GET',
                 f'/admin/billing/payments/?q={prov_id}',
@@ -2491,6 +2491,33 @@ class BillingIntegrationCheck:
                 or login not in pay_body
             ):
                 raise AssertionError(f'Unexpected admin payments page: {pay_body}')
+
+            card_res = self._admin_http(
+                'GET',
+                f'/admin/billing/payments/{pid}/',
+                admin_cookie=admin_cookie,
+            )
+            card_body = card_res.text()
+            if (
+                card_res.status != 200
+                or pid not in card_body
+                or sid not in card_body
+                or login not in card_body
+                or '05.11.2026 10:00 UTC' not in card_body
+                or '05.11.2026 15:00 (Asia/Yekaterinburg)' not in card_body
+                or 'Вернуть' not in card_body
+            ):
+                raise AssertionError(f'Unexpected admin payment card page: {card_body}')
+
+            not_found_card = self._admin_http(
+                'GET',
+                f'/admin/billing/payments/{uuid4()}/',
+                admin_cookie=admin_cookie,
+            )
+            if not_found_card.status != 404:
+                raise AssertionError(
+                    f'Expected 404 on unknown payment card, got {not_found_card}'
+                )
 
             # 6. Auth unavailable -> admin lists still return 200 OK with UUID & UTC
             #    and login search shows warning (ADM-NFR-R-01)
