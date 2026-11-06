@@ -646,6 +646,66 @@ class BillingAdminClient:
         except (KeyError, TypeError, ValueError) as exc:
             raise BillingContractError('Invalid refund payload') from exc
 
+    def retry_outbox_task(
+        self,
+        task_id: UUID,
+        *,
+        admin_user_id: UUID,
+        request_id: str,
+        reason: str | None = None,
+    ) -> BillingOutboxTaskItem:
+        json_body: dict[str, Any] = {'admin_user_id': str(admin_user_id)}
+        if reason:
+            json_body['reason'] = reason
+        body = self._post_json(
+            f'/outbox-tasks/{task_id}/retry',
+            json_body=json_body,
+            request_id=request_id,
+        )
+        return self._parse_outbox_task_dict(body)
+
+    def close_outbox_task(
+        self,
+        task_id: UUID,
+        *,
+        admin_user_id: UUID,
+        reason: str,
+        request_id: str,
+    ) -> BillingOutboxTaskItem:
+        body = self._post_json(
+            f'/outbox-tasks/{task_id}/close',
+            json_body={
+                'admin_user_id': str(admin_user_id),
+                'reason': reason,
+            },
+            request_id=request_id,
+        )
+        return self._parse_outbox_task_dict(body)
+
+    @staticmethod
+    def _parse_outbox_task_dict(t: dict[str, Any]) -> BillingOutboxTaskItem:
+        try:
+            return BillingOutboxTaskItem(
+                id=_parse_uuid(t['id']),
+                target_service=str(t['target_service']),
+                task_type=str(t['task_type']),
+                access_version=(
+                    int(t['access_version']) if t.get('access_version') is not None else None
+                ),
+                status=str(t['status']),
+                attempts=int(t['attempts']),
+                last_error=(str(t['last_error']) if t.get('last_error') is not None else None),
+                created_at=_parse_iso_datetime(t['created_at']),
+                updated_at=_parse_iso_datetime(t['updated_at']),
+                can_retry_or_close=bool(t.get('can_retry_or_close', False)),
+                payment_id=(
+                    _parse_uuid(t['payment_id']) if t.get('payment_id') is not None else None
+                ),
+                user_id=_parse_uuid(t['user_id']) if t.get('user_id') is not None else None,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BillingContractError('Invalid outbox task payload') from exc
+
     def _post_json(
         self,
         path: str,

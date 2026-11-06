@@ -1117,6 +1117,134 @@ class InMemoryPurchaseRepository:
         total = len(items)
         return total, items[filters.offset : filters.offset + filters.limit]
 
+    @staticmethod
+    def _to_fake_outbox_item(t: FakeOutboxTaskRow) -> InternalOutboxTaskItemData:
+        t_status: Literal['pending', 'completed', 'requires_intervention', 'closed'] = (
+            'completed'
+            if t.status == 'completed'
+            else 'requires_intervention'
+            if t.status == 'requires_intervention'
+            else 'closed'
+            if t.status == 'closed'
+            else 'pending'
+        )
+        return InternalOutboxTaskItemData(
+            id=t.id,
+            target_service=(
+                'notifications' if t.target_service == 'notifications' else 'auth'
+            ),
+            task_type=t.task_type,
+            access_version=t.access_version,
+            status=t_status,
+            attempts=t.attempts,
+            last_error=t.last_error,
+            created_at=t.created_at,
+            updated_at=t.updated_at,
+            can_retry_or_close=(t_status == 'requires_intervention'),
+            payment_id=t.payment_id,
+            user_id=t.user_id,
+        )
+
+    async def get_internal_outbox_task(
+        self,
+        task_id: UUID,
+    ) -> InternalOutboxTaskItemData | None:
+        """Возвращает задачу outbox по ID (T-32)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        found = next((t for t in self.outbox_tasks.values() if t.id == task_id), None)
+        if found is None:
+            return None
+        return self._to_fake_outbox_item(found)
+
+    async def retry_outbox_task_by_admin(
+        self,
+        task_id: UUID,
+        *,
+        admin_user_id: UUID,
+        reason: str,
+        now_utc: datetime | None = None,
+    ) -> InternalOutboxTaskItemData:
+        """Сбрасывает счётчик попыток и ставит задачу на повтор (T-32, BIL-API-12)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        found = next((t for t in self.outbox_tasks.values() if t.id == task_id), None)
+        if found is None:
+            raise BillingDomainError(
+                'Outbox task not found',
+                error_code='outbox_task_not_found',
+                status_code=404,
+            )
+        if found.status in ('completed', 'closed'):
+            raise BillingDomainError(
+                'Задача уже завершена или закрыта',
+                error_code='outbox_task_not_retryable',
+                status_code=409,
+            )
+        now = now_utc or datetime.now(UTC)
+        cleaned_reason = (
+            reason.strip()
+            if reason.strip()
+            else 'Ручной повтор отправки администратором'
+        )
+        found.status = 'pending'
+        found.attempts = 0
+        found.next_retry_at = now
+        found.updated_at = now
+        self.admin_actions.append(
+            FakeAdminActionRow(
+                id=uuid4(),
+                admin_user_id=admin_user_id,
+                action_type='outbox_retried',
+                target_type='outbox_task',
+                target_id=found.id,
+                reason=cleaned_reason,
+                created_at=now,
+            )
+        )
+        return self._to_fake_outbox_item(found)
+
+    async def close_outbox_task_by_admin(
+        self,
+        task_id: UUID,
+        *,
+        admin_user_id: UUID,
+        reason: str,
+        now_utc: datetime | None = None,
+    ) -> InternalOutboxTaskItemData:
+        """Закрывает задачу requires_intervention с причиной (T-32, BIL-API-13)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        found = next((t for t in self.outbox_tasks.values() if t.id == task_id), None)
+        if found is None:
+            raise BillingDomainError(
+                'Outbox task not found',
+                error_code='outbox_task_not_found',
+                status_code=404,
+            )
+        if found.status != 'requires_intervention':
+            raise BillingDomainError(
+                'Закрытие доступно только для задачи в состоянии requires_intervention',
+                error_code='outbox_task_not_requires_intervention',
+                status_code=409,
+            )
+        now = now_utc or datetime.now(UTC)
+        cleaned_reason = reason.strip()
+        found.status = 'closed'
+        found.updated_at = now
+        self.admin_actions.append(
+            FakeAdminActionRow(
+                id=uuid4(),
+                admin_user_id=admin_user_id,
+                action_type='outbox_closed',
+                target_type='outbox_task',
+                target_id=found.id,
+                reason=cleaned_reason,
+                created_at=now,
+            )
+        )
+        return self._to_fake_outbox_item(found)
+
     async def get_refund(self, refund_id: UUID) -> FakeRefundRow | None:
         """Возвращает возврат по ID (T-29)."""
         if self.db_unavailable:

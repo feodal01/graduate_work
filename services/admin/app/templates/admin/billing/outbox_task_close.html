@@ -1,0 +1,36 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}Закрытие сбойной задачи {{ task_id }}{% endblock %}
+
+{% block content %}
+<h1>Закрытие сбойной задачи доставки {{ task_id }}</h1>
+<p>
+  <a href="{% url 'admin:billing_payments' %}?tab=undelivered">← К списку проблемных задач</a> |
+  <a href="{% url 'admin:billing_payments' %}">К списку платежей</a>
+</p>
+
+{% if form_error %}
+<ul class="messagelist">
+  <li class="error">{{ form_error }}</li>
+</ul>
+{% endif %}
+
+<div class="module" style="padding: 12px; margin: 16px 0; border-left: 4px solid #ba2121;">
+  <strong>Внимание:</strong>
+  <ul>
+    <li>Закрытие переводит задачу доставки в статус <code>closed</code> и прекращает её повторные отправки.</li>
+    <li>Сам финансовый факт оплаты или возврата в Биллинге при этом <strong>не изменяется</strong>.</li>
+    <li>Решение и указанная причина сохраняются в неизменяемом журнале действий администраторов.</li>
+  </ul>
+</div>
+
+<form method="post" action="{% url 'admin:billing_outbox_task_close' task_id %}">
+  {% csrf_token %}
+  <div style="margin-bottom: 12px;">
+    <label for="id_reason"><strong>Причина закрытия задачи (обязательно):</strong></label><br>
+    <textarea id="id_reason" name="reason" rows="3" cols="60" placeholder="Укажите причину закрытия сбойной задачи">{{ reason }}</textarea>
+  </div>
+  <button type="submit" class="button" style="background-color: #ba2121; color: #fff;">Закрыть задачу с причиной</button>
+  <a class="button" href="{% url 'admin:billing_payments' %}?tab=undelivered">Отмена</a>
+</form>
+{% endblock %}

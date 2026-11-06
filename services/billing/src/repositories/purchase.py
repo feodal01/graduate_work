@@ -338,6 +338,29 @@ class PurchaseRepository(Protocol):
         now_utc: datetime | None = None,
     ) -> tuple[int, list[InternalOutboxTaskItemData]]: ...
 
+    async def get_internal_outbox_task(
+        self,
+        task_id: UUID,
+    ) -> InternalOutboxTaskItemData | None: ...
+
+    async def retry_outbox_task_by_admin(
+        self,
+        task_id: UUID,
+        *,
+        admin_user_id: UUID,
+        reason: str,
+        now_utc: datetime | None = None,
+    ) -> InternalOutboxTaskItemData: ...
+
+    async def close_outbox_task_by_admin(
+        self,
+        task_id: UUID,
+        *,
+        admin_user_id: UUID,
+        reason: str,
+        now_utc: datetime | None = None,
+    ) -> InternalOutboxTaskItemData: ...
+
     async def get_payment_by_provider_id(
         self,
         provider_code: str,
@@ -1390,6 +1413,136 @@ class SQLAlchemyPurchaseRepository:
                         )
                     )
                 return total, items
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    @staticmethod
+    def _to_internal_outbox_item(t: OutboxTask) -> InternalOutboxTaskItemData:
+        t_status: Literal['pending', 'completed', 'requires_intervention', 'closed'] = (
+            'completed'
+            if t.status == 'completed'
+            else 'requires_intervention'
+            if t.status == 'requires_intervention'
+            else 'closed'
+            if t.status == 'closed'
+            else 'pending'
+        )
+        return InternalOutboxTaskItemData(
+            id=t.id,
+            target_service=(
+                'notifications' if t.target_service == 'notifications' else 'auth'
+            ),
+            task_type=t.task_type,
+            access_version=t.access_version,
+            status=t_status,
+            attempts=t.attempts,
+            last_error=t.last_error,
+            created_at=t.created_at,
+            updated_at=t.updated_at,
+            can_retry_or_close=(t_status == 'requires_intervention'),
+            payment_id=t.payment_id,
+            user_id=t.user_id,
+        )
+
+    async def get_internal_outbox_task(
+        self,
+        task_id: UUID,
+    ) -> InternalOutboxTaskItemData | None:
+        try:
+            async with self._session_factory() as session:
+                task = await session.get(OutboxTask, task_id)
+                if task is None:
+                    return None
+                return self._to_internal_outbox_item(task)
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def retry_outbox_task_by_admin(
+        self,
+        task_id: UUID,
+        *,
+        admin_user_id: UUID,
+        reason: str,
+        now_utc: datetime | None = None,
+    ) -> InternalOutboxTaskItemData:
+        now = now_utc or datetime.now(UTC)
+        cleaned_reason = (
+            reason.strip()
+            if reason.strip()
+            else 'Ручной повтор отправки администратором'
+        )
+        try:
+            async with self._session_factory() as session:
+                task = await session.get(OutboxTask, task_id, with_for_update=True)
+                if task is None:
+                    raise BillingDomainError(
+                        'Outbox task not found',
+                        error_code='outbox_task_not_found',
+                        status_code=404,
+                    )
+                if task.status in ('completed', 'closed'):
+                    raise BillingDomainError(
+                        'Задача уже завершена или закрыта',
+                        error_code='outbox_task_not_retryable',
+                        status_code=409,
+                    )
+                task.status = 'pending'
+                task.attempts = 0
+                task.next_retry_at = now
+                task.updated_at = now
+                session.add(
+                    AdminAction(
+                        admin_user_id=admin_user_id,
+                        action_type='outbox_retried',
+                        target_type='outbox_task',
+                        target_id=task.id,
+                        reason=cleaned_reason,
+                    )
+                )
+                await session.commit()
+                return self._to_internal_outbox_item(task)
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def close_outbox_task_by_admin(
+        self,
+        task_id: UUID,
+        *,
+        admin_user_id: UUID,
+        reason: str,
+        now_utc: datetime | None = None,
+    ) -> InternalOutboxTaskItemData:
+        now = now_utc or datetime.now(UTC)
+        cleaned_reason = reason.strip()
+        try:
+            async with self._session_factory() as session:
+                task = await session.get(OutboxTask, task_id, with_for_update=True)
+                if task is None:
+                    raise BillingDomainError(
+                        'Outbox task not found',
+                        error_code='outbox_task_not_found',
+                        status_code=404,
+                    )
+                if task.status != 'requires_intervention':
+                    raise BillingDomainError(
+                        'Закрытие доступно только для задачи в состоянии '
+                        'requires_intervention',
+                        error_code='outbox_task_not_requires_intervention',
+                        status_code=409,
+                    )
+                task.status = 'closed'
+                task.updated_at = now
+                session.add(
+                    AdminAction(
+                        admin_user_id=admin_user_id,
+                        action_type='outbox_closed',
+                        target_type='outbox_task',
+                        target_id=task.id,
+                        reason=cleaned_reason,
+                    )
+                )
+                await session.commit()
+                return self._to_internal_outbox_item(task)
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 

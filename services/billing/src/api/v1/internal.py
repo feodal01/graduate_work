@@ -8,16 +8,19 @@ from pydantic import BaseModel, ConfigDict, field_validator
 from api.errors import BillingDomainError
 from core.config import settings
 from dependencies import (
+    get_outbox_dispatcher,
     get_payment_reconciler,
     get_purchase_repository,
     require_internal_service,
 )
 from repositories.purchase import (
     InternalOutboxFilter,
+    InternalOutboxTaskItemData,
     InternalPaymentFilter,
     InternalSubscriptionFilter,
     PurchaseRepository,
 )
+from services.outbox_dispatcher import OutboxDispatcher
 from services.reconciler import PaymentReconciler
 
 router = APIRouter(
@@ -139,6 +142,28 @@ class InternalPaymentCardResponse(BaseModel):
 
 
 class CreateRefundRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    admin_user_id: UUID
+    reason: str
+
+    @field_validator('reason')
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError('reason must not be empty')
+        return cleaned
+
+
+class RetryOutboxTaskRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    admin_user_id: UUID
+    reason: str | None = None
+
+
+class CloseOutboxTaskRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     admin_user_id: UUID
@@ -523,3 +548,73 @@ async def post_internal_payment_refund(
         updated_at=outcome.updated_at,
         can_reconcile=(r_status == 'processing'),
     )
+
+
+def _to_outbox_task_response(
+    t: InternalOutboxTaskItemData,
+) -> InternalOutboxTaskItemResponse:
+    return InternalOutboxTaskItemResponse(
+        id=t.id,
+        target_service=t.target_service,
+        task_type=t.task_type,
+        access_version=t.access_version,
+        status=t.status,
+        attempts=t.attempts,
+        last_error=t.last_error,
+        created_at=t.created_at,
+        updated_at=t.updated_at,
+        can_retry_or_close=t.can_retry_or_close,
+        payment_id=t.payment_id,
+        user_id=t.user_id,
+    )
+
+
+@router.post(
+    '/outbox-tasks/{task_id}/retry',
+    response_model=InternalOutboxTaskItemResponse,
+    responses={
+        401: {'description': 'Invalid or missing service API key'},
+        404: {'description': 'Outbox task not found'},
+        409: {'description': 'Outbox task is already completed or closed'},
+        422: {'description': 'Invalid request payload'},
+        503: {'description': 'Database is unavailable'},
+    },
+)
+async def post_internal_outbox_task_retry(
+    task_id: UUID,
+    payload: RetryOutboxTaskRequest,
+    repo: Annotated[PurchaseRepository, Depends(get_purchase_repository)],
+    dispatcher: Annotated[OutboxDispatcher, Depends(get_outbox_dispatcher)],
+) -> InternalOutboxTaskItemResponse:
+    updated = await repo.retry_outbox_task_by_admin(
+        task_id,
+        admin_user_id=payload.admin_user_id,
+        reason=payload.reason or '',
+    )
+    await dispatcher.try_deliver_task(task_id)
+    after_delivery = await repo.get_internal_outbox_task(task_id)
+    return _to_outbox_task_response(after_delivery or updated)
+
+
+@router.post(
+    '/outbox-tasks/{task_id}/close',
+    response_model=InternalOutboxTaskItemResponse,
+    responses={
+        401: {'description': 'Invalid or missing service API key'},
+        404: {'description': 'Outbox task not found'},
+        409: {'description': 'Outbox task is not in requires_intervention'},
+        422: {'description': 'Empty reason or invalid payload'},
+        503: {'description': 'Database is unavailable'},
+    },
+)
+async def post_internal_outbox_task_close(
+    task_id: UUID,
+    payload: CloseOutboxTaskRequest,
+    repo: Annotated[PurchaseRepository, Depends(get_purchase_repository)],
+) -> InternalOutboxTaskItemResponse:
+    closed = await repo.close_outbox_task_by_admin(
+        task_id,
+        admin_user_id=payload.admin_user_id,
+        reason=payload.reason,
+    )
+    return _to_outbox_task_response(closed)

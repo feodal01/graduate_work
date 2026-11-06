@@ -81,14 +81,12 @@ async def get_payment_provider(request: Request) -> PaymentProviderGateway:
 
 
 async def get_outbox_dispatcher(
-    request: Request,
+    repo: PurchaseRepository = Depends(get_purchase_repository),
     auth_gateway: AuthGateway = Depends(get_auth_gateway),
     notifications_gateway: NotificationsGateway | None = Depends(
         get_notifications_gateway
     ),
 ) -> OutboxDispatcher:
-    database = cast(PostgresDatabase, request.app.state.database)
-    repo = SQLAlchemyPurchaseRepository(database.sessionmaker)
     return OutboxDispatcher(
         repository=repo,
         auth_gateway=auth_gateway,
@@ -98,12 +96,10 @@ async def get_outbox_dispatcher(
 
 
 async def get_payment_reconciler(
-    request: Request,
+    repo: PurchaseRepository = Depends(get_purchase_repository),
     payment_provider: PaymentProviderGateway = Depends(get_payment_provider),
     outbox_dispatcher: OutboxDispatcher = Depends(get_outbox_dispatcher),
 ) -> PaymentReconciler:
-    database = cast(PostgresDatabase, request.app.state.database)
-    repo = SQLAlchemyPurchaseRepository(database.sessionmaker)
     return PaymentReconciler(
         repository=repo,
         payment_provider=payment_provider,

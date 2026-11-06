@@ -102,7 +102,7 @@ class BillingIntegrationCheck:
         self._check_admin_billing_lists_t27()
         self._check_refund_lifecycle_t29()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06..T-31 live Docker checks passed.')
+        print('All Billing T-06..T-32 live Docker checks passed.')
 
     def _http(
         self,
@@ -2600,9 +2600,61 @@ class BillingIntegrationCheck:
                     raise AssertionError(
                         f'Unexpected undelivered outbox tab: {undeliv_body}'
                     )
+
+                # 5d. T-32 (ADM-FR-07, BIL-API-12..13): close outbox task in admin
+                empty_close_data = urllib.parse.urlencode(
+                    {'csrfmiddlewaretoken': csrf_tok, 'reason': '   '}
+                ).encode('utf-8')
+                empty_close_res = self._admin_http(
+                    'POST',
+                    f'/admin/billing/outbox-tasks/{tid_t31}/close/',
+                    admin_cookie=admin_cookie,
+                    data=empty_close_data,
+                    headers={
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Referer': (
+                            f'{self.base_url}/admin/billing/outbox-tasks/'
+                            f'{tid_t31}/close/'
+                        ),
+                    },
+                    follow_redirects=False,
+                )
+                if (
+                    empty_close_res.status != 400
+                    or 'Укажите причину закрытия' not in empty_close_res.text()
+                ):
+                    raise AssertionError(
+                        f'Expected 400 on empty close reason, got {empty_close_res}'
+                    )
+
+                valid_close_data = urllib.parse.urlencode(
+                    {
+                        'csrfmiddlewaretoken': csrf_tok,
+                        'reason': 'Закрыто администратором в T-32 интеграционном тесте',
+                    }
+                ).encode('utf-8')
+                valid_close_res = self._admin_http(
+                    'POST',
+                    f'/admin/billing/outbox-tasks/{tid_t31}/close/',
+                    admin_cookie=admin_cookie,
+                    data=valid_close_data,
+                    headers={
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Referer': (
+                            f'{self.base_url}/admin/billing/outbox-tasks/'
+                            f'{tid_t31}/close/'
+                        ),
+                    },
+                    follow_redirects=False,
+                )
+                if valid_close_res.status not in (302, 303):
+                    raise AssertionError(
+                        f'Expected 302 on valid close POST, got {valid_close_res}'
+                    )
             finally:
                 assert (
                     self._psql(
+                        f"DELETE FROM admin_actions WHERE target_id = '{tid_t31}'; "
                         f"DELETE FROM outbox_tasks WHERE id = '{tid_t31}';"
                     ).returncode
                     == 0

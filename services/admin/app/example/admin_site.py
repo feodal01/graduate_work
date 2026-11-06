@@ -86,6 +86,16 @@ class IntegratedAdminSite(admin.AdminSite):
                 self.admin_view(billing_views.payment_refund_confirm),
                 name='billing_payment_refund',
             ),
+            path(
+                'billing/outbox-tasks/<uuid:task_id>/retry/',
+                self.admin_view(billing_views.outbox_task_retry),
+                name='billing_outbox_task_retry',
+            ),
+            path(
+                'billing/outbox-tasks/<uuid:task_id>/close/',
+                self.admin_view(billing_views.outbox_task_close),
+                name='billing_outbox_task_close',
+            ),
         ]
         return custom_urls + super().get_urls()
 

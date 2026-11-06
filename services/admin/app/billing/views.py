@@ -826,6 +826,102 @@ def payment_refund_confirm(request: HttpRequest, payment_id: UUID) -> HttpRespon
     )
 
 
+def outbox_task_retry(request: HttpRequest, task_id: UUID) -> HttpResponse:
+    if request.method != 'POST':
+        return redirect(f'{reverse_payments_url()}?tab=undelivered')
+
+    request_id = get_request_id(request)
+    admin_uuid = _get_admin_user_uuid(request)
+    try:
+        task = get_billing_client().retry_outbox_task(
+            task_id,
+            admin_user_id=admin_uuid,
+            request_id=request_id,
+        )
+    except BillingNotFoundError as exc:
+        raise Http404('Задача доставки не найдена') from exc
+    except BillingConflictError as exc:
+        messages.warning(request, exc.detail)
+        return redirect(f'{reverse_payments_url()}?tab=undelivered')
+    except BillingUnavailableError:
+        return render(
+            request,
+            'admin/billing/unavailable.html',
+            status=503,
+        )
+
+    if task.status == 'completed':
+        messages.success(request, f'Задача доставки {task.id} успешно выполнена.')
+    else:
+        messages.info(
+            request,
+            f'Задача доставки {task.id} поставлена на повторную отправку (статус: {task.status}).',
+        )
+    if task.payment_id is not None:
+        return redirect('admin:billing_payment_detail', payment_id=task.payment_id)
+    return redirect(f'{reverse_payments_url()}?tab=undelivered')
+
+
+def outbox_task_close(request: HttpRequest, task_id: UUID) -> HttpResponse:
+    request_id = get_request_id(request)
+    reason_value = ''
+    form_error: str | None = None
+    status_code = 200
+
+    if request.method == 'POST':
+        reason_value = (request.POST.get('reason') or '').strip()
+        if not reason_value:
+            form_error = 'Укажите причину закрытия'
+            status_code = 400
+        else:
+            admin_uuid = _get_admin_user_uuid(request)
+            try:
+                task = get_billing_client().close_outbox_task(
+                    task_id,
+                    admin_user_id=admin_uuid,
+                    reason=reason_value,
+                    request_id=request_id,
+                )
+                messages.success(
+                    request,
+                    f'Задача доставки {task.id} закрыта с указанием причины.',
+                )
+                if task.payment_id is not None:
+                    return redirect(
+                        'admin:billing_payment_detail',
+                        payment_id=task.payment_id,
+                    )
+                return redirect(f'{reverse_payments_url()}?tab=undelivered')
+            except BillingNotFoundError as exc:
+                raise Http404('Задача доставки не найдена') from exc
+            except BillingConflictError as exc:
+                form_error = exc.detail
+                status_code = 409
+            except BillingUnavailableError:
+                return render(
+                    request,
+                    'admin/billing/unavailable.html',
+                    status=503,
+                )
+
+    return render(
+        request,
+        'admin/billing/outbox_task_close.html',
+        {
+            'task_id': task_id,
+            'reason': reason_value,
+            'form_error': form_error,
+        },
+        status=status_code,
+    )
+
+
+def reverse_payments_url() -> str:
+    from django.urls import reverse
+
+    return reverse('admin:billing_payments')
+
+
 def _build_refund_card_row(
     item: BillingRefundItem,
     admin_profile: UserLookupProfile | None,

@@ -212,11 +212,11 @@
       <td>{{ task.created_utc_display }}<br>{{ task.created_local_display }}</td>
       <td>
         {% if task.can_retry_or_close %}
-          <form method="post" action="/admin/billing/outbox-tasks/{{ task.id }}/retry/" style="display:inline;">
+          <form method="post" action="{% url 'admin:billing_outbox_task_retry' task.id %}" style="display:inline;">
             {% csrf_token %}
             <button type="submit" class="button">Повторить</button>
           </form>
-          <a class="button" href="/admin/billing/outbox-tasks/{{ task.id }}/close/">Закрыть с причиной</a>
+          <a class="button" href="{% url 'admin:billing_outbox_task_close' task.id %}">Закрыть с причиной</a>
         {% else %}
           —
         {% endif %}

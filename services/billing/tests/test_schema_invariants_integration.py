@@ -1398,3 +1398,37 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
     )
     assert ob_total == 2
     assert [t.id for t in ob_items] == [intervene_task_id, old_pending_task_id]
+
+    # 6. T-32 (BIL-API-12, BIL-API-13): retry и close задач outbox в PostgreSQL
+    retried_item = await repo.retry_outbox_task_by_admin(
+        intervene_task_id,
+        admin_user_id=admin_id,
+        reason='Повторная отправка',
+        now_utc=now_utc,
+    )
+    assert retried_item.status == 'pending'
+    assert retried_item.attempts == 0
+
+    # Возвращаем в requires_intervention и закрываем с причиной
+    async with session_factory() as session:
+        t_row = await session.get(OutboxTask, intervene_task_id)
+        assert t_row is not None
+        t_row.status = 'requires_intervention'
+        await session.commit()
+
+    closed_item = await repo.close_outbox_task_by_admin(
+        intervene_task_id,
+        admin_user_id=admin_id,
+        reason='Закрыто в PG тесте T-32',
+        now_utc=now_utc,
+    )
+    assert closed_item.status == 'closed'
+
+    with pytest.raises(BillingDomainError) as close_409:
+        await repo.close_outbox_task_by_admin(
+            old_pending_task_id,
+            admin_user_id=admin_id,
+            reason='Pending не закрывается напрямую',
+            now_utc=now_utc,
+        )
+    assert close_409.value.status_code == 409
