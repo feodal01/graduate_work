@@ -96,6 +96,11 @@ class IntegratedAdminSite(admin.AdminSite):
                 self.admin_view(billing_views.outbox_task_close),
                 name='billing_outbox_task_close',
             ),
+            path(
+                'billing/admin-actions/',
+                self.admin_view(billing_views.admin_actions_list),
+                name='billing_admin_actions',
+            ),
         ]
         return custom_urls + super().get_urls()
 

@@ -14,6 +14,7 @@ from dependencies import (
     require_internal_service,
 )
 from repositories.purchase import (
+    InternalAdminActionFilter,
     InternalOutboxFilter,
     InternalOutboxTaskItemData,
     InternalPaymentFilter,
@@ -118,6 +119,23 @@ class InternalOutboxTaskItemResponse(BaseModel):
 class InternalOutboxTasksListResponse(BaseModel):
     total: int
     items: list[InternalOutboxTaskItemResponse]
+
+
+class InternalAdminActionItemResponse(BaseModel):
+    id: UUID
+    admin_user_id: UUID
+    action_type: Literal['refund_requested', 'outbox_retried', 'outbox_closed']
+    target_type: Literal['refund', 'outbox_task']
+    target_id: UUID
+    payment_id: UUID | None = None
+    target_status: str | None = None
+    reason: str
+    created_at: datetime
+
+
+class InternalAdminActionsListResponse(BaseModel):
+    total: int
+    items: list[InternalAdminActionItemResponse]
 
 
 class InternalPaymentCardResponse(BaseModel):
@@ -618,3 +636,57 @@ async def post_internal_outbox_task_close(
         reason=payload.reason,
     )
     return _to_outbox_task_response(closed)
+
+
+@router.get(
+    '/admin-actions',
+    response_model=InternalAdminActionsListResponse,
+    responses={
+        401: {'description': 'Invalid or missing service API key'},
+        422: {'description': 'Invalid filter parameters'},
+        503: {'description': 'Database is unavailable'},
+    },
+)
+async def get_internal_admin_actions(
+    repo: Annotated[PurchaseRepository, Depends(get_purchase_repository)],
+    admin_user_id: UUID | None = None,
+    action_type: Literal['refund_requested', 'outbox_retried', 'outbox_closed']
+    | None = None,
+    created_from: datetime | None = None,
+    created_to: datetime | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> InternalAdminActionsListResponse:
+    lower = _normalize_bound(created_from, date_from, is_upper=False)
+    upper = _normalize_bound(created_to, date_to, is_upper=True)
+    _validate_date_range(lower, upper)
+
+    total, rows = await repo.list_internal_admin_actions(
+        InternalAdminActionFilter(
+            admin_user_id=admin_user_id,
+            action_type=action_type,
+            created_from=lower,
+            created_to=upper,
+            limit=limit,
+            offset=offset,
+        )
+    )
+    return InternalAdminActionsListResponse(
+        total=total,
+        items=[
+            InternalAdminActionItemResponse(
+                id=r.id,
+                admin_user_id=r.admin_user_id,
+                action_type=r.action_type,
+                target_type=r.target_type,
+                target_id=r.target_id,
+                payment_id=r.payment_id,
+                target_status=r.target_status,
+                reason=r.reason,
+                created_at=r.created_at,
+            )
+            for r in rows
+        ],
+    )

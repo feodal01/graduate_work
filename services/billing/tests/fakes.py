@@ -29,6 +29,8 @@ from domain.subscription import (
 )
 from repositories.purchase import (
     DeliveryOutcome,
+    InternalAdminActionFilter,
+    InternalAdminActionItemData,
     InternalOperationEventItemData,
     InternalOutboxFilter,
     InternalOutboxTaskItemData,
@@ -1244,6 +1246,76 @@ class InMemoryPurchaseRepository:
             )
         )
         return self._to_fake_outbox_item(found)
+
+    async def list_internal_admin_actions(
+        self,
+        filters: InternalAdminActionFilter,
+    ) -> tuple[int, list[InternalAdminActionItemData]]:
+        """Возвращает журнал действий администраторов (T-33, BIL-API-14)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        matched: list[FakeAdminActionRow] = []
+        for act in self.admin_actions:
+            if (
+                filters.admin_user_id is not None
+                and act.admin_user_id != filters.admin_user_id
+            ):
+                continue
+            if (
+                filters.action_type is not None
+                and act.action_type != filters.action_type
+            ):
+                continue
+            if (
+                filters.created_from is not None
+                and act.created_at < filters.created_from
+            ):
+                continue
+            if filters.created_to is not None and act.created_at > filters.created_to:
+                continue
+            matched.append(act)
+
+        matched.sort(key=lambda r: (r.created_at, r.id), reverse=True)
+        tasks_by_id = {t.id: t for t in self.outbox_tasks.values()}
+        items: list[InternalAdminActionItemData] = []
+        for row in matched:
+            act_type: Literal['refund_requested', 'outbox_retried', 'outbox_closed'] = (
+                'outbox_retried'
+                if row.action_type == 'outbox_retried'
+                else 'outbox_closed'
+                if row.action_type == 'outbox_closed'
+                else 'refund_requested'
+            )
+            tgt_type: Literal['refund', 'outbox_task'] = (
+                'outbox_task' if row.target_type == 'outbox_task' else 'refund'
+            )
+            pay_id: UUID | None = None
+            tgt_status: str | None = None
+            if tgt_type == 'refund':
+                ref = self.refunds.get(row.target_id)
+                if ref is not None:
+                    pay_id = ref.payment_id
+                    tgt_status = ref.status
+            else:
+                tsk = tasks_by_id.get(row.target_id)
+                if tsk is not None:
+                    pay_id = tsk.payment_id
+                    tgt_status = tsk.status
+            items.append(
+                InternalAdminActionItemData(
+                    id=row.id,
+                    admin_user_id=row.admin_user_id,
+                    action_type=act_type,
+                    target_type=tgt_type,
+                    target_id=row.target_id,
+                    payment_id=pay_id,
+                    target_status=tgt_status,
+                    reason=row.reason,
+                    created_at=row.created_at,
+                )
+            )
+        total = len(items)
+        return total, items[filters.offset : filters.offset + filters.limit]
 
     async def get_refund(self, refund_id: UUID) -> FakeRefundRow | None:
         """Возвращает возврат по ID (T-29)."""

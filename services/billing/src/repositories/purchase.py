@@ -231,6 +231,31 @@ class InternalOutboxFilter:
 
 
 @dataclass(frozen=True, slots=True)
+class InternalAdminActionFilter:
+    admin_user_id: UUID | None = None
+    action_type: (
+        Literal['refund_requested', 'outbox_retried', 'outbox_closed'] | None
+    ) = None
+    created_from: datetime | None = None
+    created_to: datetime | None = None
+    limit: int = 50
+    offset: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class InternalAdminActionItemData:
+    id: UUID
+    admin_user_id: UUID
+    action_type: Literal['refund_requested', 'outbox_retried', 'outbox_closed']
+    target_type: Literal['refund', 'outbox_task']
+    target_id: UUID
+    payment_id: UUID | None
+    target_status: str | None
+    reason: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class InternalPaymentCardData:
     id: UUID
     user_id: UUID
@@ -360,6 +385,11 @@ class PurchaseRepository(Protocol):
         reason: str,
         now_utc: datetime | None = None,
     ) -> InternalOutboxTaskItemData: ...
+
+    async def list_internal_admin_actions(
+        self,
+        filters: InternalAdminActionFilter,
+    ) -> tuple[int, list[InternalAdminActionItemData]]: ...
 
     async def get_payment_by_provider_id(
         self,
@@ -1543,6 +1573,101 @@ class SQLAlchemyPurchaseRepository:
                 )
                 await session.commit()
                 return self._to_internal_outbox_item(task)
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def list_internal_admin_actions(
+        self,
+        filters: InternalAdminActionFilter,
+    ) -> tuple[int, list[InternalAdminActionItemData]]:
+        conditions: list[Any] = []
+        if filters.admin_user_id is not None:
+            conditions.append(AdminAction.admin_user_id == filters.admin_user_id)
+        if filters.action_type is not None:
+            conditions.append(AdminAction.action_type == filters.action_type)
+        if filters.created_from is not None:
+            conditions.append(AdminAction.created_at >= filters.created_from)
+        if filters.created_to is not None:
+            conditions.append(AdminAction.created_at <= filters.created_to)
+
+        try:
+            async with self._session_factory() as session:
+                count_stmt = select(func.count(AdminAction.id))
+                if conditions:
+                    count_stmt = count_stmt.where(*conditions)
+                total = int(await session.scalar(count_stmt) or 0)
+
+                stmt = select(AdminAction)
+                if conditions:
+                    stmt = stmt.where(*conditions)
+                stmt = (
+                    stmt.order_by(AdminAction.created_at.desc(), AdminAction.id.desc())
+                    .limit(filters.limit)
+                    .offset(filters.offset)
+                )
+                rows = list(await session.scalars(stmt))
+
+                refund_ids = [r.target_id for r in rows if r.target_type == 'refund']
+                task_ids = [r.target_id for r in rows if r.target_type == 'outbox_task']
+                refund_info: dict[UUID, tuple[UUID, str]] = {}
+                if refund_ids:
+                    ref_rows = (
+                        await session.execute(
+                            select(Refund.id, Refund.payment_id, Refund.status).where(
+                                Refund.id.in_(refund_ids)
+                            )
+                        )
+                    ).all()
+                    for rid, pid, rst in ref_rows:
+                        refund_info[rid] = (pid, rst)
+
+                task_info: dict[UUID, tuple[UUID, str]] = {}
+                if task_ids:
+                    t_rows = (
+                        await session.execute(
+                            select(
+                                OutboxTask.id,
+                                OutboxTask.payment_id,
+                                OutboxTask.status,
+                            ).where(OutboxTask.id.in_(task_ids))
+                        )
+                    ).all()
+                    for tid, pid, tst in t_rows:
+                        task_info[tid] = (pid, tst)
+
+                items: list[InternalAdminActionItemData] = []
+                for row in rows:
+                    act_type: Literal[
+                        'refund_requested', 'outbox_retried', 'outbox_closed'
+                    ] = (
+                        'outbox_retried'
+                        if row.action_type == 'outbox_retried'
+                        else 'outbox_closed'
+                        if row.action_type == 'outbox_closed'
+                        else 'refund_requested'
+                    )
+                    tgt_type: Literal['refund', 'outbox_task'] = (
+                        'outbox_task' if row.target_type == 'outbox_task' else 'refund'
+                    )
+                    resolved = (
+                        task_info.get(row.target_id)
+                        if tgt_type == 'outbox_task'
+                        else refund_info.get(row.target_id)
+                    )
+                    items.append(
+                        InternalAdminActionItemData(
+                            id=row.id,
+                            admin_user_id=row.admin_user_id,
+                            action_type=act_type,
+                            target_type=tgt_type,
+                            target_id=row.target_id,
+                            payment_id=resolved[0] if resolved is not None else None,
+                            target_status=resolved[1] if resolved is not None else None,
+                            reason=row.reason,
+                            created_at=row.created_at,
+                        )
+                    )
+                return total, items
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 

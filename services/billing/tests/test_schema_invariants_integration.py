@@ -1432,3 +1432,17 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
             now_utc=now_utc,
         )
     assert close_409.value.status_code == 409
+
+    # 7. T-33 (BIL-API-14): журнал действий администраторов в PostgreSQL
+    from repositories.purchase import InternalAdminActionFilter
+
+    act_total, act_items = await repo.list_internal_admin_actions(
+        InternalAdminActionFilter(admin_user_id=admin_id)
+    )
+    assert act_total == 4
+    assert {a.action_type for a in act_items} == {
+        'refund_requested',
+        'outbox_retried',
+        'outbox_closed',
+    }
+    assert all(a.payment_id == payment.id for a in act_items)

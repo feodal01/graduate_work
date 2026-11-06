@@ -145,6 +145,25 @@ class BillingOutboxTasksPage:
 
 
 @dataclass(frozen=True, slots=True)
+class BillingAdminActionItem:
+    id: UUID
+    admin_user_id: UUID
+    action_type: str
+    target_type: str
+    target_id: UUID
+    payment_id: UUID | None
+    target_status: str | None
+    reason: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class BillingAdminActionsPage:
+    total: int
+    items: tuple[BillingAdminActionItem, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class BillingPaymentCardData:
     id: UUID
     user_id: UUID
@@ -705,6 +724,59 @@ class BillingAdminClient:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise BillingContractError('Invalid outbox task payload') from exc
+
+    def list_admin_actions(
+        self,
+        *,
+        request_id: str,
+        admin_user_id: UUID | None = None,
+        action_type: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> BillingAdminActionsPage:
+        params: dict[str, Any] = {'limit': limit, 'offset': offset}
+        if admin_user_id is not None:
+            params['admin_user_id'] = str(admin_user_id)
+        if action_type:
+            params['action_type'] = action_type
+        if date_from:
+            params['date_from'] = date_from
+        if date_to:
+            params['date_to'] = date_to
+
+        body = self._get_json('/admin-actions', params=params, request_id=request_id)
+        try:
+            total = int(body['total'])
+            raw_items = body['items']
+            if not isinstance(raw_items, list):
+                raise TypeError('items must be a list')
+            items = tuple(
+                BillingAdminActionItem(
+                    id=_parse_uuid(item['id']),
+                    admin_user_id=_parse_uuid(item['admin_user_id']),
+                    action_type=str(item['action_type']),
+                    target_type=str(item['target_type']),
+                    target_id=_parse_uuid(item['target_id']),
+                    payment_id=(
+                        _parse_uuid(item['payment_id'])
+                        if item.get('payment_id') is not None
+                        else None
+                    ),
+                    target_status=(
+                        str(item['target_status'])
+                        if item.get('target_status') is not None
+                        else None
+                    ),
+                    reason=str(item['reason']),
+                    created_at=_parse_iso_datetime(item['created_at']),
+                )
+                for item in raw_items
+            )
+            return BillingAdminActionsPage(total=total, items=items)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BillingContractError('Invalid admin actions payload') from exc
 
     def _post_json(
         self,

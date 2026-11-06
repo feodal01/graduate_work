@@ -1,0 +1,97 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}Журнал действий администраторов{% endblock %}
+
+{% block content %}
+<h1>Журнал действий администраторов (только чтение)</h1>
+<p>
+  <a href="{% url 'admin:billing_subscriptions' %}">Подписки</a> |
+  <a href="{% url 'admin:billing_payments' %}">Платежи и проблемные операции</a> |
+  <a href="{% url 'admin:billing_admin_actions' %}"><strong>Журнал действий администраторов</strong></a> |
+  <a href="{% url 'admin:index' %}">На главную</a>
+</p>
+
+{% if auth_warning %}
+<ul class="messagelist">
+  <li class="warning">{{ auth_warning }}</li>
+</ul>
+{% endif %}
+{% if filter_error %}
+<ul class="messagelist">
+  <li class="error">{{ filter_error }}</li>
+</ul>
+{% endif %}
+
+<form method="get" action="{% url 'admin:billing_admin_actions' %}" style="margin-bottom: 16px;">
+  <label for="id_q">Логин или UUID администратора:</label>
+  <input id="id_q" type="text" name="q" value="{{ q }}" placeholder="Логин или UUID администратора" size="36">
+  <label for="id_action_type">Тип действия:</label>
+  <select id="id_action_type" name="action_type">
+    <option value="" {% if not action_type_filter %}selected{% endif %}>Все</option>
+    <option value="refund_requested" {% if action_type_filter == 'refund_requested' %}selected{% endif %}>Оформление возврата</option>
+    <option value="outbox_retried" {% if action_type_filter == 'outbox_retried' %}selected{% endif %}>Ручной повтор задачи outbox</option>
+    <option value="outbox_closed" {% if action_type_filter == 'outbox_closed' %}selected{% endif %}>Закрытие задачи outbox с причиной</option>
+  </select>
+  <label for="id_date_from">Дата с:</label>
+  <input id="id_date_from" type="date" name="date_from" value="{{ date_from }}">
+  <label for="id_date_to">по:</label>
+  <input id="id_date_to" type="date" name="date_to" value="{{ date_to }}">
+  <button type="submit" class="button">Найти</button>
+  <a href="{% url 'admin:billing_admin_actions' %}">Сбросить</a>
+</form>
+
+<p>Найдено записей: <strong>{{ total }}</strong></p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Время (UTC)</th>
+      <th>Время (часовой пояс администратора)</th>
+      <th>Администратор (логин и UUID)</th>
+      <th>Тип действия</th>
+      <th>Целевой объект</th>
+      <th>Платёж</th>
+      <th>Указанная причина</th>
+      <th>Результат</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td>{{ row.created_utc_display }}</td>
+      <td>{{ row.created_local_display }}</td>
+      <td>
+        {% if row.admin_login %}<strong>{{ row.admin_login }}</strong><br>{% endif %}
+        <code>{{ row.admin_user_id }}</code>
+      </td>
+      <td>{{ row.action_type_label }} (<code>{{ row.action_type_code }}</code>)</td>
+      <td>{{ row.target_type_label }}: <code>{{ row.target_id }}</code></td>
+      <td>
+        {% if row.payment_id %}
+          <a href="{% url 'admin:billing_payment_detail' row.payment_id %}">Карточка платежа ({{ row.payment_id }})</a>
+        {% else %}
+          —
+        {% endif %}
+      </td>
+      <td>{{ row.reason }}</td>
+      <td>{{ row.target_result_label }}</td>
+    </tr>
+  {% empty %}
+    <tr>
+      <td colspan="8">Нет записей по выбранному фильтру.</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+{% if prev_offset is not None or next_offset is not None %}
+<p style="margin-top: 12px;">
+  {% if prev_offset is not None %}
+    <a href="{% url 'admin:billing_admin_actions' %}?q={{ q }}&amp;action_type={{ action_type_filter }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}&amp;limit={{ limit }}&amp;offset={{ prev_offset }}">← Предыдущая страница</a>
+  {% endif %}
+  {% if next_offset is not None %}
+    <a href="{% url 'admin:billing_admin_actions' %}?q={{ q }}&amp;action_type={{ action_type_filter }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}&amp;limit={{ limit }}&amp;offset={{ next_offset }}">Следующая страница →</a>
+  {% endif %}
+</p>
+{% endif %}
+{% endblock %}

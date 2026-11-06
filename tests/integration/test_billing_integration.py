@@ -102,7 +102,7 @@ class BillingIntegrationCheck:
         self._check_admin_billing_lists_t27()
         self._check_refund_lifecycle_t29()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06..T-32 live Docker checks passed.')
+        print('All Billing T-06..T-33 live Docker checks passed.')
 
     def _http(
         self,
@@ -2650,6 +2650,24 @@ class BillingIntegrationCheck:
                 if valid_close_res.status not in (302, 303):
                     raise AssertionError(
                         f'Expected 302 on valid close POST, got {valid_close_res}'
+                    )
+
+                # 5e. T-33 (ADM-FR-08, BIL-API-14): admin actions log screen in admin
+                actions_res = self._admin_http(
+                    'GET',
+                    '/admin/billing/admin-actions/?action_type=outbox_closed',
+                    admin_cookie=admin_cookie,
+                )
+                actions_body = actions_res.text()
+                if (
+                    actions_res.status != 200
+                    or tid_t31 not in actions_body
+                    or 'Закрыто администратором в T-32 интеграционном тесте'
+                    not in actions_body
+                    or f'/admin/billing/payments/{pid}/' not in actions_body
+                ):
+                    raise AssertionError(
+                        f'Unexpected admin actions page: {actions_body}'
                     )
             finally:
                 assert (

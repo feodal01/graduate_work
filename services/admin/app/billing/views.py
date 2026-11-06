@@ -13,6 +13,7 @@ from users.request_id import get_request_id
 
 from billing.clients import (
     AuthLookupUnavailableError,
+    BillingAdminActionItem,
     BillingConflictError,
     BillingNotFoundError,
     BillingOperationEventItem,
@@ -50,6 +51,12 @@ OUTBOX_STATUS_LABELS: dict[str, str] = {
     'completed': 'Доставлено',
     'requires_intervention': 'Требует вмешательства',
     'closed': 'Закрыто администратором',
+}
+
+ADMIN_ACTION_LABELS: dict[str, str] = {
+    'refund_requested': 'Оформление возврата',
+    'outbox_retried': 'Ручной повтор задачи outbox',
+    'outbox_closed': 'Закрытие задачи outbox с причиной',
 }
 
 DEFAULT_PAGE_LIMIT = 50
@@ -134,6 +141,22 @@ class OutboxTaskCardRowView:
     payment_id: UUID | None = None
     user_id: UUID | None = None
     user_login: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AdminActionRowView:
+    id: UUID
+    admin_user_id: UUID
+    admin_login: str | None
+    action_type_code: str
+    action_type_label: str
+    target_type_label: str
+    target_id: UUID
+    payment_id: UUID | None
+    target_result_label: str
+    reason: str
+    created_utc_display: str
+    created_local_display: str
 
 
 def format_amount_rub(amount_kopeks: int, currency: str = 'RUB') -> str:
@@ -920,6 +943,179 @@ def reverse_payments_url() -> str:
     from django.urls import reverse
 
     return reverse('admin:billing_payments')
+
+
+def admin_actions_list(request: HttpRequest) -> HttpResponse:
+    request_id = get_request_id(request)
+    query = (request.GET.get('q') or '').strip()
+    raw_action_type = (request.GET.get('action_type') or '').strip()
+    action_type_filter = raw_action_type if raw_action_type in ADMIN_ACTION_LABELS else None
+    raw_date_from = (request.GET.get('date_from') or '').strip()
+    raw_date_to = (request.GET.get('date_to') or '').strip()
+    limit, offset = _parse_pagination(request)
+
+    date_from, date_to, filter_error = _validate_date_filters(
+        raw_date_from,
+        raw_date_to,
+    )
+    if filter_error is not None:
+        return render(
+            request,
+            'admin/billing/admin_actions_list.html',
+            {
+                'rows': (),
+                'total': 0,
+                'q': query,
+                'action_type_filter': action_type_filter or '',
+                'date_from': raw_date_from,
+                'date_to': raw_date_to,
+                'limit': limit,
+                'offset': offset,
+                'prev_offset': None,
+                'next_offset': None,
+                'auth_warning': None,
+                'filter_error': filter_error,
+            },
+            status=400,
+        )
+
+    known_profiles: dict[UUID, UserLookupProfile] = {}
+    auth_warning: str | None = None
+    target_admin_id: UUID | None = None
+
+    if query:
+        parsed_uuid = _try_parse_uuid(query)
+        if parsed_uuid is not None:
+            target_admin_id = parsed_uuid
+        else:
+            try:
+                found = get_auth_lookup_client().find_by_login(
+                    query,
+                    request_id=request_id,
+                )
+            except AuthLookupUnavailableError:
+                auth_warning = 'Поиск по логину временно недоступен, используйте UUID'
+                return render(
+                    request,
+                    'admin/billing/admin_actions_list.html',
+                    {
+                        'rows': (),
+                        'total': 0,
+                        'q': query,
+                        'action_type_filter': action_type_filter or '',
+                        'date_from': date_from or '',
+                        'date_to': date_to or '',
+                        'limit': limit,
+                        'offset': offset,
+                        'prev_offset': None,
+                        'next_offset': None,
+                        'auth_warning': auth_warning,
+                        'filter_error': None,
+                    },
+                )
+            if found is None:
+                return render(
+                    request,
+                    'admin/billing/admin_actions_list.html',
+                    {
+                        'rows': (),
+                        'total': 0,
+                        'q': query,
+                        'action_type_filter': action_type_filter or '',
+                        'date_from': date_from or '',
+                        'date_to': date_to or '',
+                        'limit': limit,
+                        'offset': offset,
+                        'prev_offset': None,
+                        'next_offset': None,
+                        'auth_warning': None,
+                        'filter_error': None,
+                    },
+                )
+            target_admin_id = found.user_id
+            known_profiles[found.user_id] = found
+
+    try:
+        page = get_billing_client().list_admin_actions(
+            request_id=request_id,
+            admin_user_id=target_admin_id,
+            action_type=action_type_filter,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
+        )
+    except BillingUnavailableError:
+        return render(
+            request,
+            'admin/billing/unavailable.html',
+            status=503,
+        )
+
+    profiles, enrich_degraded = _enrich_profiles(
+        [item.admin_user_id for item in page.items],
+        request_id=request_id,
+        known_profiles=known_profiles,
+    )
+    if enrich_degraded and auth_warning is None:
+        auth_warning = (
+            'Сервис Auth временно недоступен: показаны UUID администраторов и даты в UTC.'
+        )
+
+    rows = tuple(
+        _build_admin_action_row(item, profiles.get(item.admin_user_id)) for item in page.items
+    )
+    prev_offset = max(0, offset - limit) if offset > 0 else None
+    next_offset = offset + limit if offset + limit < page.total else None
+    return render(
+        request,
+        'admin/billing/admin_actions_list.html',
+        {
+            'rows': rows,
+            'total': page.total,
+            'q': query,
+            'action_type_filter': action_type_filter or '',
+            'date_from': date_from or '',
+            'date_to': date_to or '',
+            'limit': limit,
+            'offset': offset,
+            'prev_offset': prev_offset,
+            'next_offset': next_offset,
+            'auth_warning': auth_warning,
+            'filter_error': None,
+        },
+    )
+
+
+def _build_admin_action_row(
+    item: BillingAdminActionItem,
+    admin_profile: UserLookupProfile | None,
+) -> AdminActionRowView:
+    tz_name = admin_profile.tz if admin_profile is not None else None
+    if item.target_type == 'refund':
+        target_type_label = 'Возврат'
+        target_result_label = REFUND_STATUS_LABELS.get(
+            item.target_status or '', item.target_status or '—'
+        )
+    else:
+        target_type_label = 'Задача доставки (outbox)'
+        target_result_label = OUTBOX_STATUS_LABELS.get(
+            item.target_status or '', item.target_status or '—'
+        )
+    return AdminActionRowView(
+        id=item.id,
+        admin_user_id=item.admin_user_id,
+        admin_login=admin_profile.login if admin_profile is not None else None,
+        action_type_code=item.action_type,
+        action_type_label=ADMIN_ACTION_LABELS.get(item.action_type, item.action_type),
+        target_type_label=target_type_label,
+        target_id=item.target_id,
+        payment_id=item.payment_id,
+        target_result_label=target_result_label,
+        reason=item.reason,
+        created_utc_display=format_utc_datetime(item.created_at),
+        created_local_display=format_user_tz_datetime(item.created_at, tz_name),
+    )
 
 
 def _build_refund_card_row(
