@@ -240,6 +240,7 @@ class Settings(BaseSettings):
 
     project_name: str = 'auth service'
     auth_notification_contacts_batch_size: int = Field(default=100, ge=1)
+    auth_user_lookup_batch_size: int = Field(default=100, ge=1)
 
     postgres: PostgresSettings
     redis: RedisSettings

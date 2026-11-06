@@ -45,6 +45,7 @@ def test_all_auth_business_operations_document_rate_limit_response() -> None:
         ('/api/v1/auth/permissions/check', 'post'),
         ('/api/v1/internal/notification-contacts', 'post'),
         ('/api/v1/internal/users/{user_id}/subscription-access', 'put'),
+        ('/api/v1/internal/users/lookup', 'post'),
         ('/api/v1/internal/introspect', 'post'),
     }
 

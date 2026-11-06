@@ -18,6 +18,7 @@ from api.v1 import (
     social_authentication,
     subscription_access,
     token_introspection,
+    user_lookup,
 )
 from clients.yandex_oauth import YandexOAuthClient
 from core.config import ServiceSettings, TokenSettings, settings
@@ -181,6 +182,7 @@ def create_app(
     application.include_router(notification_contacts.router, prefix='/api/v1/internal')
     application.include_router(subscription_access.router, prefix='/api/v1/internal')
     application.include_router(token_introspection.router, prefix='/api/v1/internal')
+    application.include_router(user_lookup.router, prefix='/api/v1/internal')
     return application
 
 

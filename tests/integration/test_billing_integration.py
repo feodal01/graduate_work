@@ -97,8 +97,9 @@ class BillingIntegrationCheck:
         self._check_notifications_and_expiration_scheduling_t20_t21_t22()
         self._check_my_subscription_screen_and_summary_t23()
         self._check_campaign_cancel_and_preemptive_cancel_t24()
+        self._check_auth_user_lookup_t25()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06..T-24 (FEAT-01 & FEAT-02) live Docker checks passed.')
+        print('All Billing T-06..T-25 live Docker checks passed.')
 
     def _http(
         self,
@@ -2104,6 +2105,105 @@ class BillingIntegrationCheck:
                 f'Expected 0 unpublished outbox rows for cancelled campaigns, '
                 f'got {outbox_pending}'
             )
+
+    def _check_auth_user_lookup_t25(self) -> None:
+        """T-25 (AUTH-FR-04, AUTH-API-02, AUTH-NFR-SEC-01): internal user lookup."""
+        login = f'LookupT25_{uuid4().hex[:8]}'
+        password = 'Saffron-Citadel-LookupT25-2026!'
+
+        # External gateway must block /api/v1/internal/users/lookup -> 404
+        ext_res = self._http(
+            'POST',
+            '/api/v1/internal/users/lookup',
+            data=json.dumps({'login': login}).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+        )
+        if ext_res.status != 404:
+            raise AssertionError(
+                f'Expected 404 on external /api/v1/internal/users/lookup, got {ext_res}'
+            )
+
+        code = (
+            'import asyncio, httpx\n'
+            'from uuid import uuid4\n'
+            'from core.config import ServiceSettings, settings\n'
+            'async def check_t25():\n'
+            '    base = str(settings.auth_client.service_url).rstrip("/")\n'
+            '    key = ServiceSettings().api_key.get_secret_value()\n'
+            '    url = f"{base}/api/v1/internal/users/lookup"\n'
+            '    async with httpx.AsyncClient() as hc:\n'
+            '        sr = await hc.post(\n'
+            '            f"{base}/api/v1/auth/signup",\n'
+            '            json={\n'
+            f'                "login": "{login}",\n'
+            f'                "password": "{password}",\n'
+            '                "tz": "Asia/Yekaterinburg",\n'
+            '            },\n'
+            '            headers={"X-Request-Id": "t25-signup"},\n'
+            '        )\n'
+            '        assert sr.status_code == 201, sr.text\n'
+            '        uid = sr.json()["id"]\n'
+            '        # 1. Unhappy: missing or wrong key -> 401\n'
+            '        r401 = await hc.post(\n'
+            '            url,\n'
+            '            headers={"X-Request-Id": "t25-401"},\n'
+            f'            json={{"login": "{login}"}},\n'
+            '        )\n'
+            '        assert r401.status_code == 401, r401.text\n'
+            '        # 2. Unhappy: empty or invalid payload -> 422\n'
+            '        r422 = await hc.post(\n'
+            '            url,\n'
+            '            headers={\n'
+            '                "X-Service-Api-Key": key,\n'
+            '                "X-Request-Id": "t25-422",\n'
+            '            },\n'
+            '            json={},\n'
+            '        )\n'
+            '        assert r422.status_code == 422, r422.text\n'
+            '        # 3. Happy: exact login match\n'
+            '        r_login = await hc.post(\n'
+            '            url,\n'
+            '            headers={\n'
+            '                "X-Service-Api-Key": key,\n'
+            '                "X-Request-Id": "t25-login",\n'
+            '            },\n'
+            f'            json={{"login": "{login}"}},\n'
+            '        )\n'
+            '        assert r_login.status_code == 200, r_login.text\n'
+            '        assert r_login.json() == {\n'
+            '            "items": [\n'
+            '                {\n'
+            '                    "user_id": uid,\n'
+            f'                    "login": "{login}",\n'
+            '                    "tz": "Asia/Yekaterinburg",\n'
+            '                }\n'
+            '            ]\n'
+            '        }\n'
+            '        # 4. Unhappy: unknown login -> empty list\n'
+            '        r_none = await hc.post(\n'
+            '            url,\n'
+            '            headers={\n'
+            '                "X-Service-Api-Key": key,\n'
+            '                "X-Request-Id": "t25-none",\n'
+            '            },\n'
+            '            json={"login": "nonexistent_t25_user"},\n'
+            '        )\n'
+            '        assert r_none.status_code == 200\n'
+            '        assert r_none.json() == {"items": []}\n'
+            '        # 5. Happy: batch user_ids lookup\n'
+            '        r_batch = await hc.post(\n'
+            '            url,\n'
+            '            headers={\n'
+            '                "X-Service-Api-Key": key,\n'
+            '                "X-Request-Id": "t25-batch",\n'
+            '            },\n'
+            '            json={"user_ids": [uid, str(uuid4())]},\n'
+            '        )\n'
+            '        assert r_batch.status_code == 200, r_batch.text\n'
+            '        assert r_batch.json() == r_login.json()\n'
+            'asyncio.run(check_t25())\n'
+        )
+        self._compose('exec', '-T', 'billing-api', 'python', '-c', code)
 
     def _check_degradation_and_worker_graceful_shutdown(self) -> None:
         """BIL-API-15, GW-NFR-R-01, BIL-NFR-R-09: DB outage yields 503; worker stops."""
