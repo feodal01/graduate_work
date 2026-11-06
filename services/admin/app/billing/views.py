@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from uuid import UUID
+from uuid import NAMESPACE_DNS, UUID, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from django.contrib import messages
 from django.http import Http404, HttpRequest, HttpResponse
-from django.shortcuts import render
+from django.shortcuts import redirect, render
+from users.models import AuthIdentity
 from users.request_id import get_request_id
 
 from billing.clients import (
     AuthLookupUnavailableError,
+    BillingConflictError,
     BillingNotFoundError,
     BillingOperationEventItem,
     BillingOutboxTaskItem,
@@ -168,6 +171,16 @@ def _try_parse_uuid(raw: str) -> UUID | None:
         return UUID(cleaned)
     except ValueError:
         return None
+
+
+def _get_admin_user_uuid(request: HttpRequest) -> UUID:
+    identity = AuthIdentity.objects.filter(user_id=request.user.pk).first()
+    if identity is not None:
+        return identity.auth_user_id
+    return uuid5(
+        NAMESPACE_DNS,
+        f'django-admin:{request.user.pk}:{request.user.get_username()}',
+    )
 
 
 def _parse_pagination(request: HttpRequest) -> tuple[int, int]:
@@ -649,6 +662,100 @@ def payment_detail(request: HttpRequest, payment_id: UUID) -> HttpResponse:
             'outbox_tasks': task_views,
             'auth_warning': auth_warning,
         },
+    )
+
+
+def payment_refund_confirm(request: HttpRequest, payment_id: UUID) -> HttpResponse:
+    request_id = get_request_id(request)
+    billing_client = get_billing_client()
+    try:
+        card = billing_client.get_payment_card(payment_id, request_id=request_id)
+    except BillingNotFoundError as exc:
+        raise Http404('Платёж не найден') from exc
+    except BillingUnavailableError:
+        return render(
+            request,
+            'admin/billing/unavailable.html',
+            status=503,
+        )
+
+    profiles, enrich_degraded = _enrich_profiles(
+        [card.user_id],
+        request_id=request_id,
+    )
+    auth_warning = (
+        'Сервис Auth временно недоступен: показаны UUID пользователя и даты в UTC.'
+        if enrich_degraded
+        else None
+    )
+    user_profile = profiles.get(card.user_id)
+    sub_view = (
+        _build_subscription_row(card.subscription, user_profile)
+        if card.subscription is not None
+        else None
+    )
+
+    reason_value = ''
+    form_error: str | None = None
+    status_code = 200
+
+    if request.method == 'POST':
+        reason_value = (request.POST.get('reason') or '').strip()
+        if not reason_value:
+            form_error = 'Укажите причину возврата'
+            status_code = 400
+        else:
+            admin_uuid = _get_admin_user_uuid(request)
+            try:
+                created_refund = billing_client.create_refund(
+                    payment_id,
+                    admin_user_id=admin_uuid,
+                    reason=reason_value,
+                    request_id=request_id,
+                )
+                if created_refund.status == 'succeeded':
+                    messages.success(
+                        request,
+                        'Возврат успешно выполнен, доступ к новинкам закрыт.',
+                    )
+                elif created_refund.status == 'processing':
+                    messages.info(
+                        request,
+                        'Возврат создан и находится в обработке на стороне ЮKassa.',
+                    )
+                else:
+                    messages.warning(
+                        request,
+                        f'Попытка возврата отклонена провайдером: '
+                        f'{created_refund.rejection_reason or "rejected"}.',
+                    )
+                return redirect('admin:billing_payment_detail', payment_id=payment_id)
+            except BillingNotFoundError as exc:
+                raise Http404('Платёж не найден') from exc
+            except BillingConflictError as exc:
+                form_error = exc.detail
+                status_code = 409
+            except BillingUnavailableError:
+                return render(
+                    request,
+                    'admin/billing/unavailable.html',
+                    status=503,
+                )
+
+    return render(
+        request,
+        'admin/billing/refund_confirm.html',
+        {
+            'payment_id': card.id,
+            'card': card,
+            'user_login': user_profile.login if user_profile is not None else None,
+            'amount_display': format_amount_rub(card.amount_kopeks, card.currency),
+            'subscription': sub_view,
+            'reason': reason_value,
+            'form_error': form_error,
+            'auth_warning': auth_warning,
+        },
+        status=status_code,
     )
 
 

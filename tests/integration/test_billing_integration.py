@@ -102,7 +102,7 @@ class BillingIntegrationCheck:
         self._check_admin_billing_lists_t27()
         self._check_refund_lifecycle_t29()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06..T-29 live Docker checks passed.')
+        print('All Billing T-06..T-30 (FEAT-01..FEAT-03) live Docker checks passed.')
 
     def _http(
         self,
@@ -2518,6 +2518,55 @@ class BillingIntegrationCheck:
             if not_found_card.status != 404:
                 raise AssertionError(
                     f'Expected 404 on unknown payment card, got {not_found_card}'
+                )
+
+            # 5b. T-30 (ADM-FR-05): refund confirmation page in Django admin
+            ref_confirm_get = self._admin_http(
+                'GET',
+                f'/admin/billing/payments/{pid}/refund/',
+                admin_cookie=admin_cookie,
+            )
+            ref_confirm_body = ref_confirm_get.text()
+            if (
+                ref_confirm_get.status != 200
+                or pid not in ref_confirm_body
+                or login not in ref_confirm_body
+                or '299 ₽' not in ref_confirm_body
+                or 'доступ к новинкам закроется' not in ref_confirm_body
+            ):
+                raise AssertionError(
+                    f'Unexpected refund confirmation page: {ref_confirm_body}'
+                )
+
+            # Empty reason POST -> 400 with validation error
+            csrf_tok = next(
+                (
+                    part.split('=', 1)[1]
+                    for part in admin_cookie.split('; ')
+                    if part.startswith('csrftoken=')
+                ),
+                '',
+            )
+            empty_post_data = urllib.parse.urlencode(
+                {'csrfmiddlewaretoken': csrf_tok, 'reason': '   '}
+            ).encode('utf-8')
+            empty_ref_post = self._admin_http(
+                'POST',
+                f'/admin/billing/payments/{pid}/refund/',
+                admin_cookie=admin_cookie,
+                data=empty_post_data,
+                headers={
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Referer': f'{self.base_url}/admin/billing/payments/{pid}/refund/',
+                },
+                follow_redirects=False,
+            )
+            if (
+                empty_ref_post.status != 400
+                or 'Укажите причину возврата' not in empty_ref_post.text()
+            ):
+                raise AssertionError(
+                    f'Expected 400 on empty refund reason, got {empty_ref_post}'
                 )
 
             # 6. Auth unavailable -> admin lists still return 200 OK with UUID & UTC

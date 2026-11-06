@@ -1,0 +1,77 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}Подтверждение возврата платежа {{ payment_id }}{% endblock %}
+
+{% block content %}
+<h1>Подтверждение полного возврата платежа {{ payment_id }}</h1>
+<p>
+  <a href="{% url 'admin:billing_payment_detail' payment_id %}">← Назад в карточку платежа</a> |
+  <a href="{% url 'admin:billing_payments' %}">К списку платежей</a>
+</p>
+
+{% if auth_warning %}
+<ul class="messagelist">
+  <li class="warning">{{ auth_warning }}</li>
+</ul>
+{% endif %}
+{% if form_error %}
+<ul class="messagelist">
+  <li class="error">{{ form_error }}</li>
+</ul>
+{% endif %}
+
+<h2>Сводка по операции</h2>
+<table>
+  <tbody>
+    <tr>
+      <th scope="row">Пользователь (логин и UUID)</th>
+      <td>
+        {% if user_login %}<strong>{{ user_login }}</strong> — {% endif %}
+        <code>{{ card.user_id }}</code>
+      </td>
+    </tr>
+    <tr>
+      <th scope="row">Платёж</th>
+      <td><code>{{ card.id }}</code> (ЮKassa: <code>{{ card.provider_payment_id|default:"—" }}</code>)</td>
+    </tr>
+    <tr>
+      <th scope="row">Сумма возврата (полная)</th>
+      <td><strong>{{ amount_display }}</strong></td>
+    </tr>
+    {% if subscription %}
+    <tr>
+      <th scope="row">Период подписки (UTC)</th>
+      <td>{{ subscription.starts_utc_display }} — {{ subscription.ends_utc_display }}</td>
+    </tr>
+    <tr>
+      <th scope="row">Период подписки (часовой пояс пользователя)</th>
+      <td>{{ subscription.starts_local_display }} — {{ subscription.ends_local_display }}</td>
+    </tr>
+    {% endif %}
+  </tbody>
+</table>
+
+<div class="module" style="padding: 12px; margin: 16px 0; border-left: 4px solid #ba2121;">
+  <strong>Внимание — последствия оформления возврата:</strong>
+  <ul>
+    <li>После подтверждения возврата платёжным провайдером <strong>доступ к новинкам закроется</strong> (состояние доступа в Auth обновится со сбросом кэша Redis).</li>
+    <li>Запланированное письмо об окончании подписки будет <strong>отменено</strong>.</li>
+    <li>Пользователю будет отправлено транзакционное <strong>письмо о выполненном возврате</strong>.</li>
+  </ul>
+</div>
+
+{% if card.can_refund %}
+<form method="post" action="{% url 'admin:billing_payment_refund' payment_id %}">
+  {% csrf_token %}
+  <div style="margin-bottom: 12px;">
+    <label for="id_reason"><strong>Причина возврата (обязательно для журнала действий поддержки):</strong></label><br>
+    <textarea id="id_reason" name="reason" rows="3" cols="60" placeholder="Укажите причину возврата средств">{{ reason }}</textarea>
+  </div>
+  <button type="submit" class="button" style="background-color: #ba2121; color: #fff;">Подтвердить возврат</button>
+  <a class="button" href="{% url 'admin:billing_payment_detail' payment_id %}">Отмена</a>
+</form>
+{% else %}
+<p><strong>Возврат по данному платежу недоступен:</strong> возврат разрешён только для платежа текущей активной подписки без активного или выполненного возврата.</p>
+<p><a class="button" href="{% url 'admin:billing_payment_detail' payment_id %}">Вернуться в карточку платежа</a></p>
+{% endif %}
+{% endblock %}

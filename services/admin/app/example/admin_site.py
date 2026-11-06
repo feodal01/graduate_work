@@ -81,6 +81,11 @@ class IntegratedAdminSite(admin.AdminSite):
                 self.admin_view(billing_views.payment_detail),
                 name='billing_payment_detail',
             ),
+            path(
+                'billing/payments/<uuid:payment_id>/refund/',
+                self.admin_view(billing_views.payment_refund_confirm),
+                name='billing_payment_refund',
+            ),
         ]
         return custom_urls + super().get_urls()
 

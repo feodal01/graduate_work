@@ -20,7 +20,7 @@
 <div class="module" style="padding: 12px; margin-bottom: 16px;">
   <strong>Доступные действия:</strong>
   {% if card.can_refund %}
-    <a class="button" href="/admin/billing/payments/{{ payment_id }}/refund/">Вернуть</a>
+    <a class="button" href="{% url 'admin:billing_payment_refund' payment_id %}">Вернуть</a>
   {% endif %}
   {% if card.can_reconcile_payment %}
     <form method="post" action="/admin/billing/operations/payment/{{ payment_id }}/reconcile/" style="display:inline;">

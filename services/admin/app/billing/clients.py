@@ -22,6 +22,14 @@ class BillingNotFoundError(Exception):
     """Запрошенная операция в Billing не найдена (404)."""
 
 
+class BillingConflictError(Exception):
+    """Операция отклонена доменными правилами Billing (409)."""
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(detail)
+
+
 class BillingContractError(BillingUnavailableError):
     """Ответ Billing не соответствует внутреннему контракту."""
 
@@ -523,6 +531,91 @@ class BillingAdminClient:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise BillingContractError('Invalid payment card payload') from exc
+
+    def create_refund(
+        self,
+        payment_id: UUID,
+        *,
+        admin_user_id: UUID,
+        reason: str,
+        request_id: str,
+    ) -> BillingRefundItem:
+        body = self._post_json(
+            f'/payments/{payment_id}/refunds',
+            json_body={
+                'admin_user_id': str(admin_user_id),
+                'reason': reason,
+            },
+            request_id=request_id,
+        )
+        try:
+            return BillingRefundItem(
+                id=_parse_uuid(body['id']),
+                payment_id=_parse_uuid(body['payment_id']),
+                subscription_id=_parse_uuid(body['subscription_id']),
+                provider_code=str(body['provider_code']),
+                provider_refund_id=(
+                    str(body['provider_refund_id'])
+                    if body.get('provider_refund_id') is not None
+                    else None
+                ),
+                amount_kopeks=int(body['amount_kopeks']),
+                currency=str(body['currency']),
+                status=str(body['status']),
+                reason=str(body['reason']),
+                rejection_reason=(
+                    str(body['rejection_reason'])
+                    if body.get('rejection_reason') is not None
+                    else None
+                ),
+                admin_user_id=_parse_uuid(body['admin_user_id']),
+                created_at=_parse_iso_datetime(body['created_at']),
+                updated_at=_parse_iso_datetime(body['updated_at']),
+                can_reconcile=bool(body.get('can_reconcile', False)),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BillingContractError('Invalid refund payload') from exc
+
+    def _post_json(
+        self,
+        path: str,
+        *,
+        json_body: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        try:
+            response = self._http_client.request(
+                'POST',
+                f'{self._base_url}{path}',
+                json=json_body,
+                headers={
+                    'X-Service-Api-Key': self._service_api_key,
+                    'X-Request-Id': request_id,
+                },
+            )
+        except httpx.HTTPError as exc:
+            raise BillingUnavailableError('Billing service request failed') from exc
+
+        if response.status_code == 404:
+            raise BillingNotFoundError('Resource not found in Billing')
+        if response.status_code == 409:
+            detail = 'Операция запрещена правилами биллинга'
+            try:
+                err_body = response.json()
+                if isinstance(err_body, dict) and err_body.get('detail'):
+                    detail = str(err_body['detail'])
+            except ValueError:
+                pass
+            raise BillingConflictError(detail)
+        if response.status_code not in (200, 201):
+            raise BillingUnavailableError(f'Billing service returned status {response.status_code}')
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise BillingContractError('Billing response is not valid JSON') from exc
+        if not isinstance(data, dict):
+            raise BillingContractError('Billing response must be a JSON object')
+        return data
 
     def _get_json(
         self,
