@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 from django.contrib.auth import logout as django_logout
 from django.http import HttpRequest, HttpResponse
@@ -19,8 +19,8 @@ from users.auth_client import (
     AuthUnavailableError,
     get_auth_client,
 )
-from users.request_id import get_request_id
 from users.rate_limit import rate_limited_response
+from users.request_id import get_request_id
 
 
 class AuthAuthorizationMiddleware:
@@ -76,16 +76,30 @@ class AuthAuthorizationMiddleware:
                     exc.retry_after_seconds,
                 )
             except (AuthUnavailableError, AuthContractError):
+                if self._allow_degraded_when_auth_unavailable(request):
+                    request.auth_roles = ()
+                    return self._get_response(request)
                 return self._unavailable(request)
         except AuthForbiddenError:
             return self._end_session(request)
         except AuthRateLimitedError as exc:
             return rate_limited_response(request, exc.retry_after_seconds)
         except (AuthUnavailableError, AuthContractError):
+            if self._allow_degraded_when_auth_unavailable(request):
+                request.auth_roles = ()
+                return self._get_response(request)
             return self._unavailable(request)
 
         request.auth_roles = roles
         return self._get_response(request)
+
+    @staticmethod
+    def _allow_degraded_when_auth_unavailable(request: HttpRequest) -> bool:
+        return bool(
+            request.path.startswith('/admin/billing/')
+            and request.user.is_authenticated
+            and request.user.is_staff
+        )
 
     @staticmethod
     def _is_excluded(path: str) -> bool:

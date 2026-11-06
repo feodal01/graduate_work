@@ -1,0 +1,11 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}Карточка платежа {{ payment_id }}{% endblock %}
+
+{% block content %}
+<h1>Карточка платежа {{ payment_id }}</h1>
+<p>
+  <a href="{% url 'admin:billing_payments' %}">К списку платежей</a> |
+  <a href="{% url 'admin:billing_subscriptions' %}">К списку подписок</a>
+</p>
+{% endblock %}

@@ -1,0 +1,106 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}Платежи и проблемные операции{% endblock %}
+
+{% block content %}
+<h1>Платежи и проблемные операции (только чтение)</h1>
+<p>
+  <a href="{% url 'admin:billing_subscriptions' %}">Подписки</a> |
+  <a href="{% url 'admin:billing_payments' %}"><strong>Платежи и проблемные операции</strong></a> |
+  <a href="{% url 'admin:index' %}">На главную</a>
+</p>
+
+{% if auth_warning %}
+<ul class="messagelist">
+  <li class="warning">{{ auth_warning }}</li>
+</ul>
+{% endif %}
+{% if filter_error %}
+<ul class="messagelist">
+  <li class="error">{{ filter_error }}</li>
+</ul>
+{% endif %}
+
+<p style="margin-bottom: 12px;">
+  <strong>Фильтры:</strong>
+  <a href="{% url 'admin:billing_payments' %}?tab=all&amp;search_by={{ search_by }}&amp;q={{ q }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}">{% if active_tab == 'all' %}<strong>[Все]</strong>{% else %}Все{% endif %}</a> |
+  <a href="{% url 'admin:billing_payments' %}?tab=pending&amp;search_by={{ search_by }}&amp;q={{ q }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}">{% if active_tab == 'pending' %}<strong>[Ожидает оплаты]</strong>{% else %}Ожидает оплаты{% endif %}</a> |
+  <a href="{% url 'admin:billing_payments' %}?tab=succeeded&amp;search_by={{ search_by }}&amp;q={{ q }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}">{% if active_tab == 'succeeded' %}<strong>[Оплачен]</strong>{% else %}Оплачен{% endif %}</a> |
+  <a href="{% url 'admin:billing_payments' %}?tab=failed&amp;search_by={{ search_by }}&amp;q={{ q }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}">{% if active_tab == 'failed' %}<strong>[Не оплачен]</strong>{% else %}Не оплачен{% endif %}</a> |
+  <a href="{% url 'admin:billing_payments' %}?tab=has_refund&amp;search_by={{ search_by }}&amp;q={{ q }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}">{% if active_tab == 'has_refund' %}<strong>[Есть возврат]</strong>{% else %}Есть возврат{% endif %}</a> |
+  <a href="{% url 'admin:billing_payments' %}?tab=stuck&amp;search_by={{ search_by }}&amp;q={{ q }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}">{% if active_tab == 'stuck' %}<strong>[Зависшие операции]</strong>{% else %}Зависшие операции{% endif %}</a>
+</p>
+
+<form method="get" action="{% url 'admin:billing_payments' %}" style="margin-bottom: 16px;">
+  <input type="hidden" name="tab" value="{{ active_tab }}">
+  <label for="id_search_by">Искать по:</label>
+  <select id="id_search_by" name="search_by">
+    <option value="user" {% if search_by == 'user' %}selected{% endif %}>Логин или UUID пользователя</option>
+    <option value="payment_id" {% if search_by == 'payment_id' %}selected{% endif %}>UUID платежа</option>
+    <option value="provider_payment_id" {% if search_by == 'provider_payment_id' %}selected{% endif %}>Номер в ЮKassa</option>
+  </select>
+  <label for="id_q">Значение:</label>
+  <input id="id_q" type="text" name="q" value="{{ q }}" placeholder="Логин, UUID или номер ЮKassa" size="40">
+  <label for="id_date_from">Дата с:</label>
+  <input id="id_date_from" type="date" name="date_from" value="{{ date_from }}">
+  <label for="id_date_to">по:</label>
+  <input id="id_date_to" type="date" name="date_to" value="{{ date_to }}">
+  <button type="submit" class="button">Найти</button>
+  <a href="{% url 'admin:billing_payments' %}">Сбросить</a>
+</form>
+
+<p>Найдено платежей: <strong>{{ total }}</strong></p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Платёж (UUID)</th>
+      <th>Номер в ЮKassa</th>
+      <th>Пользователь (логин и UUID)</th>
+      <th>Тариф</th>
+      <th>Сумма</th>
+      <th>Статус платежа</th>
+      <th>Возврат</th>
+      <th>Создан (UTC)</th>
+      <th>Создан (часовой пояс пользователя)</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td>
+        <a href="{% url 'admin:billing_payment_detail' row.id %}"><code>{{ row.id }}</code></a>
+      </td>
+      <td><code>{{ row.provider_payment_id }}</code></td>
+      <td>
+        {% if row.user_login %}
+          <strong>{{ row.user_login }}</strong><br>
+        {% endif %}
+        <code>{{ row.user_id }}</code>
+      </td>
+      <td>{{ row.tariff_name }}</td>
+      <td>{{ row.amount_display }}</td>
+      <td>{{ row.status_label }}{% if row.is_stuck %} <em>(зависшая)</em>{% endif %}</td>
+      <td>{{ row.refund_label }}</td>
+      <td>{{ row.created_utc_display }}</td>
+      <td>{{ row.created_local_display }}</td>
+    </tr>
+  {% empty %}
+    <tr>
+      <td colspan="9">Нет записей по выбранному фильтру.</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+{% if prev_offset is not None or next_offset is not None %}
+<p style="margin-top: 12px;">
+  {% if prev_offset is not None %}
+    <a href="{% url 'admin:billing_payments' %}?tab={{ active_tab }}&amp;search_by={{ search_by }}&amp;q={{ q }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}&amp;limit={{ limit }}&amp;offset={{ prev_offset }}">← Предыдущая страница</a>
+  {% endif %}
+  {% if next_offset is not None %}
+    <a href="{% url 'admin:billing_payments' %}?tab={{ active_tab }}&amp;search_by={{ search_by }}&amp;q={{ q }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}&amp;limit={{ limit }}&amp;offset={{ next_offset }}">Следующая страница →</a>
+  {% endif %}
+</p>
+{% endif %}
+{% endblock %}

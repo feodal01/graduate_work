@@ -5,6 +5,7 @@ include = [
     "**/example/settings.py",
     "**/example/test_config.py",
     "app/movies/migrations/0003_catalog_relation_changes.py",
+    "**/billing/**/*.py",
 ]
 
 [lint]

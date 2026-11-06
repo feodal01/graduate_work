@@ -34,6 +34,7 @@ compose up -d --build \
     auth-db auth-redis auth-migrate auth-bootstrap auth \
     billing-db billing-migrate billing-api billing-worker \
     notifications-db notifications-migrate notifications-campaign-api \
+    theatre-db admin-migrate admin-collectstatic admin \
     jaeger
 compose up -d --no-deps gateway
 

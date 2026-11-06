@@ -99,8 +99,9 @@ class BillingIntegrationCheck:
         self._check_campaign_cancel_and_preemptive_cancel_t24()
         self._check_auth_user_lookup_t25()
         self._check_internal_billing_lists_t26()
+        self._check_admin_billing_lists_t27()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06..T-26 live Docker checks passed.')
+        print('All Billing T-06..T-27 live Docker checks passed.')
 
     def _http(
         self,
@@ -2287,6 +2288,266 @@ class BillingIntegrationCheck:
                 'asyncio.run(check_t26())\n'
             )
             self._compose('exec', '-T', 'billing-api', 'python', '-c', code)
+        finally:
+            cleanup_sql = (
+                f"DELETE FROM subscriptions WHERE id = '{sid}'; "
+                f"DELETE FROM payments WHERE id = '{pid}';"
+            )
+            assert self._psql(cleanup_sql).returncode == 0
+
+    def _login_django_admin(self) -> str:
+        """Log in to Django admin via /admin/login/ and return Cookie header."""
+        login_get = self._http('GET', '/admin/login/', follow_redirects=False)
+        if login_get.status != 200:
+            raise AssertionError(f'Expected 200 on /admin/login/, got {login_get}')
+        cookies: dict[str, str] = {}
+        for sc in login_get.set_cookies:
+            pair = sc.split(';', 1)[0]
+            if '=' in pair:
+                k, v = pair.split('=', 1)
+                cookies[k.strip()] = v.strip()
+        csrf_token = cookies.get('csrftoken', '')
+        env_values: dict[str, str] = {}
+        for raw_line in self.env_file.read_text(encoding='utf-8').splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            env_values[k.strip()] = v.strip().strip('"').strip("'")
+        admin_login = env_values.get('AUTH_ADMIN_LOGIN', 'Admin')
+        admin_password = env_values.get('AUTH_ADMIN_PASSWORD', '')
+        form_body = urllib.parse.urlencode(
+            {
+                'username': admin_login,
+                'password': admin_password,
+                'csrfmiddlewaretoken': csrf_token,
+                'next': '/admin/',
+            }
+        ).encode('utf-8')
+        cookie_hdr = '; '.join(f'{k}={v}' for k, v in cookies.items())
+        login_post = self._http(
+            'POST',
+            '/admin/login/',
+            data=form_body,
+            headers={
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Cookie': cookie_hdr,
+                'Referer': f'{self.base_url}/admin/login/',
+            },
+            follow_redirects=False,
+        )
+        if login_post.status not in (302, 303):
+            raise AssertionError(
+                f'Expected 302 on POST /admin/login/, got {login_post}'
+            )
+        for sc in login_post.set_cookies:
+            pair = sc.split(';', 1)[0]
+            if '=' in pair:
+                k, v = pair.split('=', 1)
+                cookies[k.strip()] = v.strip()
+        return '; '.join(f'{k}={v}' for k, v in cookies.items())
+
+    def _admin_http(
+        self,
+        method: str,
+        path: str,
+        *,
+        admin_cookie: str,
+        data: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        follow_redirects: bool = True,
+    ) -> HttpResult:
+        req_headers = {'Cookie': admin_cookie, **(headers or {})}
+        for _ in range(3):
+            res = self._http(
+                method,
+                path,
+                data=data,
+                headers=req_headers,
+                follow_redirects=follow_redirects,
+            )
+            if res.status != 429:
+                return res
+            retry_after = float(res.headers.get('Retry-After', '2'))
+            time.sleep(max(1.0, retry_after))
+        return res
+
+    def _check_admin_billing_lists_t27(self) -> None:
+        """T-27 (ADM-FR-01, ADM-FR-02, ADM-NFR-R-01..02): Django admin lists."""
+        # Wait for admin container health
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline:
+            res = self._http('GET', '/admin/login/', follow_redirects=False)
+            if res.status == 200:
+                break
+            time.sleep(1.0)
+        else:
+            raise AssertionError('Admin login page did not become ready within 60s')
+
+        # 1. Unauthenticated request redirects to /admin/login/
+        unauth = self._http(
+            'GET', '/admin/billing/subscriptions/', follow_redirects=False
+        )
+        if unauth.status != 302 or '/admin/login/' not in unauth.headers.get(
+            'Location', ''
+        ):
+            raise AssertionError(f'Expected redirect to /admin/login/, got {unauth}')
+
+        admin_cookie = self._login_django_admin()
+
+        # 2. Create user in Auth with Asia/Yekaterinburg timezone and seed subscription
+        login = f'AdmT27_{uuid4().hex[:8]}'
+        password = 'Saffron-Citadel-AdmT27-2026!'
+        signup_code = (
+            'import asyncio, httpx\n'
+            'from core.config import settings\n'
+            'async def s():\n'
+            '    base = str(settings.auth_client.service_url).rstrip("/")\n'
+            '    async with httpx.AsyncClient() as c:\n'
+            '        r = await c.post(\n'
+            '            f"{base}/api/v1/auth/signup",\n'
+            '            json={\n'
+            f'                "login": "{login}",\n'
+            f'                "password": "{password}",\n'
+            '                "tz": "Asia/Yekaterinburg",\n'
+            '            },\n'
+            '            headers={"X-Request-Id": "t27-signup"},\n'
+            '        )\n'
+            '        print("uid=" + r.json()["id"])\n'
+            'asyncio.run(s())\n'
+        )
+        out = self._compose(
+            'exec', '-T', 'billing-api', 'python', '-c', signup_code
+        ).strip()
+        uid = next(
+            line.split('=', 1)[1]
+            for line in out.splitlines()
+            if line.startswith('uid=')
+        )
+        pid = str(uuid4())
+        sid = str(uuid4())
+        prov_id = f'yk_t27_{uuid4().hex[:8]}'
+        ins_sql = (
+            f'INSERT INTO payments (id, user_id, tariff_id, provider_code, '
+            f'amount_kopeks, currency, status, provider_payment_id, idempotency_key) '
+            f"SELECT '{pid}', '{uid}', id, 'yookassa', price_kopeks, currency, "
+            f"'succeeded', '{prov_id}', '{pid}' "
+            f"FROM tariffs WHERE code = 'premium'; "
+            f'INSERT INTO subscriptions '
+            f'(id, user_id, tariff_id, payment_id, starts_at, ends_at) '
+            f"SELECT '{sid}', '{uid}', id, '{pid}', "
+            f"'2026-11-05T10:00:00Z'::timestamptz, "
+            f"'2026-12-05T10:00:00Z'::timestamptz "
+            f"FROM tariffs WHERE code = 'premium';"
+        )
+        assert self._psql(ins_sql).returncode == 0
+
+        try:
+            # 3. Search subscriptions by login and by UUID (UTC + Asia/Yekaterinburg)
+            for q_val in (login, uid):
+                sub_res = self._admin_http(
+                    'GET',
+                    f'/admin/billing/subscriptions/?q={q_val}',
+                    admin_cookie=admin_cookie,
+                )
+                body = sub_res.text()
+                if (
+                    sub_res.status != 200
+                    or login not in body
+                    or uid not in body
+                    or '05.11.2026 10:00 UTC' not in body
+                    or '05.11.2026 15:00 (Asia/Yekaterinburg)' not in body
+                    or f'/admin/billing/payments/{pid}/' not in body
+                ):
+                    raise AssertionError(
+                        f'Unexpected admin subscriptions page for q={q_val}: {body}'
+                    )
+
+            # 4. Unknown login -> empty list
+            empty_res = self._admin_http(
+                'GET',
+                '/admin/billing/subscriptions/?q=nonexistent_t27_login',
+                admin_cookie=admin_cookie,
+            )
+            if (
+                empty_res.status != 200
+                or 'Нет записей по выбранному фильтру' not in empty_res.text()
+            ):
+                raise AssertionError(
+                    f'Expected empty subscriptions list, got {empty_res.text()}'
+                )
+
+            # 5. Payments list search by provider_payment_id
+            pay_res = self._admin_http(
+                'GET',
+                f'/admin/billing/payments/?q={prov_id}',
+                admin_cookie=admin_cookie,
+            )
+            pay_body = pay_res.text()
+            if (
+                pay_res.status != 200
+                or pid not in pay_body
+                or prov_id not in pay_body
+                or login not in pay_body
+            ):
+                raise AssertionError(f'Unexpected admin payments page: {pay_body}')
+
+            # 6. Auth unavailable -> admin lists still return 200 OK with UUID & UTC
+            #    and login search shows warning (ADM-NFR-R-01)
+            self._compose('stop', 'auth')
+            try:
+                auth_down_sub = self._admin_http(
+                    'GET',
+                    f'/admin/billing/subscriptions/?q={uid}',
+                    admin_cookie=admin_cookie,
+                )
+                auth_down_body = auth_down_sub.text()
+                if (
+                    auth_down_sub.status != 200
+                    or uid not in auth_down_body
+                    or '05.11.2026 10:00 UTC' not in auth_down_body
+                ):
+                    raise AssertionError(
+                        f'Expected 200 with UUID & UTC when Auth is down, '
+                        f'got {auth_down_sub}'
+                    )
+
+                auth_down_login = self._admin_http(
+                    'GET',
+                    f'/admin/billing/subscriptions/?q={login}',
+                    admin_cookie=admin_cookie,
+                )
+                if (
+                    auth_down_login.status != 200
+                    or 'Поиск по логину временно недоступен, используйте UUID'
+                    not in auth_down_login.text()
+                ):
+                    raise AssertionError(
+                        f'Expected login warning when Auth is down, '
+                        f'got {auth_down_login.text()}'
+                    )
+            finally:
+                self._compose('start', 'auth')
+                self._wait_for_billing_and_auth_health()
+
+            # 7. Billing unavailable -> 503 page (ADM-NFR-R-02)
+            self._compose('stop', 'billing-api')
+            try:
+                bil_down = self._admin_http(
+                    'GET',
+                    '/admin/billing/subscriptions/',
+                    admin_cookie=admin_cookie,
+                )
+                if (
+                    bil_down.status != 503
+                    or 'Сервис биллинга временно недоступен' not in bil_down.text()
+                ):
+                    raise AssertionError(
+                        f'Expected 503 when billing-api is down, got {bil_down}'
+                    )
+            finally:
+                self._compose('start', 'billing-api')
+                self._wait_for_billing_and_auth_health()
         finally:
             cleanup_sql = (
                 f"DELETE FROM subscriptions WHERE id = '{sid}'; "

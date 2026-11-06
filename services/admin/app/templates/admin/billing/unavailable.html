@@ -1,0 +1,13 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}Сервис биллинга временно недоступен{% endblock %}
+
+{% block content %}
+<h1>Сервис биллинга временно недоступен</h1>
+<p>Не удалось получить данные из сервиса биллинга. Пожалуйста, обновите страницу через несколько секунд.</p>
+<p>
+  <a href="{% url 'admin:billing_subscriptions' %}">Подписки</a> |
+  <a href="{% url 'admin:billing_payments' %}">Платежи</a> |
+  <a href="{% url 'admin:index' %}">На главную админки</a>
+</p>
+{% endblock %}

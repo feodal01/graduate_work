@@ -5,6 +5,7 @@ from django.contrib.auth import logout as django_logout
 from django.shortcuts import redirect, render
 from django.urls import path
 
+from billing import views as billing_views
 from users import auth_views
 from users.auth_backend import (
     AUTH_ACCESS_TOKEN_SESSION_KEY,
@@ -64,6 +65,21 @@ class IntegratedAdminSite(admin.AdminSite):
                 'auth/user-roles/delete/',
                 self.admin_view(auth_views.user_role_delete),
                 name='auth_user_role_delete',
+            ),
+            path(
+                'billing/subscriptions/',
+                self.admin_view(billing_views.subscriptions_list),
+                name='billing_subscriptions',
+            ),
+            path(
+                'billing/payments/',
+                self.admin_view(billing_views.payments_list),
+                name='billing_payments',
+            ),
+            path(
+                'billing/payments/<uuid:payment_id>/',
+                self.admin_view(billing_views.payment_detail),
+                name='billing_payment_detail',
             ),
         ]
         return custom_urls + super().get_urls()

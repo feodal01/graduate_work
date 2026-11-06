@@ -141,13 +141,15 @@ class AuthClient:
         )
         self._raise_for_status(response, expected_status=200)
         payload = self._json_object(response)
-        if set(payload) != {
+        required_keys = {
             'id',
             'login',
             'first_name',
             'last_name',
             'created_at',
-        }:
+        }
+        allowed_keys = required_keys | {'email', 'locale', 'tz', 'user_version'}
+        if not required_keys.issubset(payload) or not set(payload).issubset(allowed_keys):
             raise AuthContractError
         login = payload['login']
         first_name = payload['first_name']
@@ -353,9 +355,7 @@ class AuthClient:
             raise AuthUnavailableError from exc
 
         if method == 'GET' and response.status_code in _RETRYABLE_AUTH_STATUSES:
-            raise _RetryableAuthError(
-                f'Auth returned HTTP {response.status_code}'
-            )
+            raise _RetryableAuthError(f'Auth returned HTTP {response.status_code}')
         return response
 
     @staticmethod

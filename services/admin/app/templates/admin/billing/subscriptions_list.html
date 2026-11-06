@@ -1,0 +1,92 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}Подписки пользователей{% endblock %}
+
+{% block content %}
+<h1>Подписки пользователей (только чтение)</h1>
+<p>
+  <a href="{% url 'admin:billing_subscriptions' %}"><strong>Подписки</strong></a> |
+  <a href="{% url 'admin:billing_payments' %}">Платежи и проблемные операции</a> |
+  <a href="{% url 'admin:index' %}">На главную</a>
+</p>
+
+{% if auth_warning %}
+<ul class="messagelist">
+  <li class="warning">{{ auth_warning }}</li>
+</ul>
+{% endif %}
+{% if filter_error %}
+<ul class="messagelist">
+  <li class="error">{{ filter_error }}</li>
+</ul>
+{% endif %}
+
+<form method="get" action="{% url 'admin:billing_subscriptions' %}" style="margin-bottom: 16px;">
+  <label for="id_q">Логин или UUID пользователя:</label>
+  <input id="id_q" type="text" name="q" value="{{ q }}" placeholder="Логин или UUID" size="36">
+  <label for="id_status">Статус:</label>
+  <select id="id_status" name="status">
+    <option value="" {% if not status_filter %}selected{% endif %}>Все</option>
+    <option value="active" {% if status_filter == 'active' %}selected{% endif %}>Активна</option>
+    <option value="expired" {% if status_filter == 'expired' %}selected{% endif %}>Завершена</option>
+    <option value="refunded" {% if status_filter == 'refunded' %}selected{% endif %}>Возвращена</option>
+  </select>
+  <label for="id_date_from">Дата с:</label>
+  <input id="id_date_from" type="date" name="date_from" value="{{ date_from }}">
+  <label for="id_date_to">по:</label>
+  <input id="id_date_to" type="date" name="date_to" value="{{ date_to }}">
+  <button type="submit" class="button">Найти</button>
+  <a href="{% url 'admin:billing_subscriptions' %}">Сбросить</a>
+</form>
+
+<p>Найдено записей: <strong>{{ total }}</strong></p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Пользователь (логин и UUID)</th>
+      <th>Тариф</th>
+      <th>Период (UTC)</th>
+      <th>Период (часовой пояс пользователя)</th>
+      <th>Статус</th>
+      <th>Сумма</th>
+      <th>Платёж</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td>
+        {% if row.user_login %}
+          <strong>{{ row.user_login }}</strong><br>
+        {% endif %}
+        <code>{{ row.user_id }}</code>
+      </td>
+      <td>{{ row.tariff_name }}</td>
+      <td>{{ row.starts_utc_display }} — {{ row.ends_utc_display }}</td>
+      <td>{{ row.starts_local_display }} — {{ row.ends_local_display }}</td>
+      <td>{{ row.status_label }}</td>
+      <td>{{ row.amount_display }}</td>
+      <td>
+        <a href="{% url 'admin:billing_payment_detail' row.payment_id %}">Карточка платежа ({{ row.payment_id }})</a>
+      </td>
+    </tr>
+  {% empty %}
+    <tr>
+      <td colspan="7">Нет записей по выбранному фильтру.</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+{% if prev_offset is not None or next_offset is not None %}
+<p style="margin-top: 12px;">
+  {% if prev_offset is not None %}
+    <a href="{% url 'admin:billing_subscriptions' %}?q={{ q }}&amp;status={{ status_filter }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}&amp;limit={{ limit }}&amp;offset={{ prev_offset }}">← Предыдущая страница</a>
+  {% endif %}
+  {% if next_offset is not None %}
+    <a href="{% url 'admin:billing_subscriptions' %}?q={{ q }}&amp;status={{ status_filter }}&amp;date_from={{ date_from }}&amp;date_to={{ date_to }}&amp;limit={{ limit }}&amp;offset={{ next_offset }}">Следующая страница →</a>
+  {% endif %}
+</p>
+{% endif %}
+{% endblock %}

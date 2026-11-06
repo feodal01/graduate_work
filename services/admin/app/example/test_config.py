@@ -28,6 +28,20 @@ class SettingsTests(TestCase):
         self.assertEqual(config.AUTH_CLIENT_REQUEST_TIMEOUT_SECONDS, 1.0)
         self.assertEqual(config.AUTH_CLIENT_BACKOFF_MAX_TRIES, 2)
         self.assertEqual(config.AUTH_CLIENT_BACKOFF_MAX_TIME_SECONDS, 0.5)
+        self.assertEqual(
+            config.SERVICE_API_KEY.get_secret_value(),
+            'local-service-api-key-that-is-32-chars',
+        )
+        self.assertEqual(
+            config.BILLING_INTERNAL_URL,
+            'http://127.0.0.1:8000/api/v1/internal/billing',
+        )
+        self.assertEqual(
+            config.AUTH_INTERNAL_URL,
+            'http://127.0.0.1:8000/api/v1/internal',
+        )
+        self.assertEqual(config.BILLING_CLIENT_CONNECT_TIMEOUT_SECONDS, 0.5)
+        self.assertEqual(config.BILLING_CLIENT_TIMEOUT_SECONDS, 3.0)
 
     def test_environment_is_typed_and_secrets_are_masked(self):
         environment = {
@@ -44,6 +58,11 @@ class SettingsTests(TestCase):
             'AUTH_CLIENT_REQUEST_TIMEOUT_SECONDS': '2.5',
             'AUTH_CLIENT_BACKOFF_MAX_TRIES': '3',
             'AUTH_CLIENT_BACKOFF_MAX_TIME_SECONDS': '1.5',
+            'SERVICE_API_KEY': 'test-internal-service-secret-key',
+            'BILLING_INTERNAL_URL': 'http://billing-api:8000/api/v1/internal/billing',
+            'AUTH_INTERNAL_URL': 'http://auth:8000/api/v1/internal',
+            'BILLING_CLIENT_CONNECT_TIMEOUT_SECONDS': '0.4',
+            'BILLING_CLIENT_TIMEOUT_SECONDS': '4.5',
         }
         with patch.dict(os.environ, environment, clear=True):
             config = Settings(_env_file=None)
@@ -59,11 +78,27 @@ class SettingsTests(TestCase):
         self.assertEqual(config.AUTH_CLIENT_REQUEST_TIMEOUT_SECONDS, 2.5)
         self.assertEqual(config.AUTH_CLIENT_BACKOFF_MAX_TRIES, 3)
         self.assertEqual(config.AUTH_CLIENT_BACKOFF_MAX_TIME_SECONDS, 1.5)
+        self.assertIsInstance(config.SERVICE_API_KEY, SecretStr)
+        self.assertEqual(
+            config.SERVICE_API_KEY.get_secret_value(),
+            'test-internal-service-secret-key',
+        )
+        self.assertEqual(
+            config.BILLING_INTERNAL_URL,
+            'http://billing-api:8000/api/v1/internal/billing',
+        )
+        self.assertEqual(
+            config.AUTH_INTERNAL_URL,
+            'http://auth:8000/api/v1/internal',
+        )
+        self.assertEqual(config.BILLING_CLIENT_CONNECT_TIMEOUT_SECONDS, 0.4)
+        self.assertEqual(config.BILLING_CLIENT_TIMEOUT_SECONDS, 4.5)
         self.assertIsInstance(config.SECRET_KEY, SecretStr)
         self.assertIsInstance(config.POSTGRES_PASSWORD, SecretStr)
         self.assertEqual(config.POSTGRES_PASSWORD.get_secret_value(), 'test-db-password')
         self.assertNotIn('test-admin-key', repr(config))
         self.assertNotIn('test-db-password', repr(config))
+        self.assertNotIn('test-internal-service-secret-key', repr(config))
 
     def test_dotenv_is_read_without_mutating_environment_and_env_wins(self):
         with TemporaryDirectory() as directory:

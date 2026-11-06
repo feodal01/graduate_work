@@ -40,3 +40,25 @@ class Settings(BaseSettings):
         gt=0,
         allow_inf_nan=False,
     )
+    SERVICE_API_KEY: SecretStr = Field(
+        default=SecretStr('local-service-api-key-that-is-32-chars'),
+        min_length=1,
+    )
+    BILLING_INTERNAL_URL: str = Field(
+        default='http://127.0.0.1:8000/api/v1/internal/billing',
+        min_length=1,
+    )
+    AUTH_INTERNAL_URL: str = Field(
+        default='http://127.0.0.1:8000/api/v1/internal',
+        min_length=1,
+    )
+    BILLING_CLIENT_CONNECT_TIMEOUT_SECONDS: float = Field(
+        default=0.5,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    BILLING_CLIENT_TIMEOUT_SECONDS: float = Field(
+        default=3.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
