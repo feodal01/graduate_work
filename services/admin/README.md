@@ -17,6 +17,15 @@ docker compose up -d --build
 | --- | --- |
 | Django Admin | `http://localhost/admin/` |
 | Роли Auth | `http://localhost/admin/auth/roles/` |
+| Подписки пользователей | `http://localhost/admin/billing/subscriptions/` |
+| Платежи и проблемные операции | `http://localhost/admin/billing/payments/` |
+| Зависшие операции | `http://localhost/admin/billing/payments/?tab=stuck` |
+| Не доставлено в Auth или Notifications | `http://localhost/admin/billing/payments/?tab=undelivered` |
+| Карточка платежа | `http://localhost/admin/billing/payments/<payment_id>/` |
+| Подтверждение и оформление возврата | `http://localhost/admin/billing/payments/<payment_id>/refund/` |
+| Ручной повтор и закрытие задачи outbox | `http://localhost/admin/billing/outbox-tasks/<task_id>/retry/`, `/close/` |
+| Принудительная сверка с ЮKassa | `http://localhost/admin/billing/operations/<type>/<id>/reconcile/` |
+| Журнал действий администраторов | `http://localhost/admin/billing/admin-actions/` |
 | Health | `http://localhost/admin/health` |
 | Пример статического файла | `http://localhost/static/admin/css/base.css` |
 
@@ -54,7 +63,7 @@ python app/manage.py runserver 127.0.0.1:8001
 
 Django получает конфигурацию через Pydantic Settings из `services/admin/.env`. Переменные окружения имеют приоритет над файлом; чтение файла не изменяет окружение процесса. Шаблон направляет запросы в Auth по адресу `http://127.0.0.1:8000/api/v1/auth`. Локальный адрес Admin: `http://127.0.0.1:8001/admin/`.
 
-Имена переменных и значения по умолчанию сохранены. `SQL_OPTIONS` необязателен. `SQL_PORT` должен быть целым числом от 1 до 65535, таймауты и общее время повторов — конечными положительными числами, `AUTH_CLIENT_BACKOFF_MAX_TRIES` — целым числом от 1. Пустые значения ключа Django, заданного пароля БД, имени БД, пользователя, хоста и адреса Auth отклоняются. `SECRET_KEY` и `POSTGRES_PASSWORD` хранятся в модели как `SecretStr` и преобразуются в строки при передаче Django; ошибки валидации скрывают входные значения.
+Имена переменных и значения по умолчанию сохранены. `SQL_OPTIONS` необязателен. `SQL_PORT` должен быть целым числом от 1 до 65535, таймауты и общее время повторов — конечными положительными числами, `AUTH_CLIENT_BACKOFF_MAX_TRIES` — целым числом от 1. Пустые значения ключа Django, заданного пароля БД, имени БД, пользователя, хоста и адреса Auth отклоняются. `SECRET_KEY` и `POSTGRES_PASSWORD` хранятся в модели как `SecretStr` и преобразуются в строки при передаче Django; ошибки валидации скрывают входные значения. Подключение раздела биллинга настраивается переменными `BILLING_INTERNAL_URL`, `AUTH_INTERNAL_URL`, `SERVICE_API_KEY`, `BILLING_CLIENT_CONNECT_TIMEOUT_SECONDS` и `BILLING_CLIENT_TIMEOUT_SECONDS`.
 
 ## Проверка
 
@@ -62,7 +71,15 @@ Django получает конфигурацию через Pydantic Settings и
 
 ```bash
 docker compose run --rm admin python manage.py check
-docker compose run --rm admin python manage.py test users example
+docker compose run --rm admin python manage.py test example.test_config example.test_health users.tests billing.tests
 ```
 
 Маршрут `/health/` внутри контейнера проверяет соединение с `theatre-db`. Gateway публикует этот маршрут как `/admin/health`.
+
+## Раздел «Биллинг и подписки»
+
+Приложение `services/admin/app/billing` не создаёт собственных таблиц в `theatre-db`: все данные подписок, платежей, возвратов, задач доставки и журнала действий читаются и изменяются по HTTP через внутренний API сервиса `Billing` (`BIL-API-06`–`BIL-API-14`), а логины и часовые пояса пользователей запрашиваются пакетом через внутренний API `Auth` (`POST /api/v1/internal/users/lookup`).
+
+- Все списки и карточка платежа открыты только для чтения; даты выводятся в двух колонках (`UTC` и часовой пояс пользователя).
+- При временной недоступности `Auth` (`ADM-NFR-R-01`) уже открытая сессия администратора продолжает работать со страницами `/admin/billing/*`: вместо логина отображается UUID пользователя, время выводится в `UTC` (с пометкой о недоступности часового пояса), при поиске по логину выводится подсказка искать по UUID, а кнопки «Вернуть», «Проверить в ЮKassa», «Повторить» и «Закрыть с причиной» остаются полностью рабочими.
+- При временной недоступности, тайм-ауте или ответе `5xx` от `Billing` (`ADM-NFR-R-02`) админка возвращает штатную страницу `503` без необработанного исключения; повторная отправка формы возврата или нажатие кнопок управления после восстановления безопасны.

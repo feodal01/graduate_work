@@ -2,7 +2,7 @@ https://github.com/feodal01/notifications_sprint_1
 
 # Онлайн-кинотеатр
 
-Репозиторий содержит Admin, Auth, Movies API, Movies ETL, UGC Events, UGC ETL, UGC API и Notifications. Корневой Docker Compose запускает приложения и общую инфраструктуру. Nginx принимает весь внешний HTTP-трафик. Jaeger принимает трассы Auth. ELK собирает логи приложений и Nginx, GlitchTip — ошибки приложений. Kafka и ClickHouse обслуживают события зрителя. MongoDB хранит закладки, лайки и рецензии.
+Репозиторий содержит Admin, Auth, Billing, Movies API, Movies ETL, UGC Events, UGC ETL, UGC API и Notifications. Корневой Docker Compose запускает приложения и общую инфраструктуру. Nginx принимает весь внешний HTTP-трафик. Jaeger принимает трассы сервисов. ELK собирает логи приложений и Nginx, GlitchTip — ошибки приложений. Kafka и ClickHouse обслуживают события зрителя. MongoDB хранит закладки, лайки и рецензии.
 
 ## Запуск
 
@@ -43,8 +43,9 @@ docker compose --profile observability up -d --build
 
 | Сервис | Назначение | Данные и зависимости | Подробное описание |
 | --- | --- | --- | --- |
-| Admin | Управляет каталогом и ролями через Django Admin; проверяет вход и административное право через Auth | Записывает каталог и технические записи пользователей в `theatre-db` | [README Admin](services/admin/README.md) |
-| Auth | Регистрирует пользователей, поддерживает вход по паролю и через Яндекс ID, выдаёт токены, отзывает все сессии при смене пароля, управляет правами и ограничивает запросы; хранит историю входов в [16 hash-секциях](services/auth/README.md#партиционирование-истории-входов) | Использует `auth-db` и `auth-redis`; обращается в Yandex OAuth | [README Auth](services/auth/README.md) |
+| Admin | Управляет каталогом, ролями и подписками/возвратами биллинга через Django Admin; проверяет вход и административное право через Auth | Записывает каталог и технические записи пользователей в `theatre-db`; читает и изменяет данные биллинга через внутренний API `Billing` и `Auth` | [README Admin](services/admin/README.md) |
+| Auth | Регистрирует пользователей, поддерживает вход по паролю и через Яндекс ID, выдаёт токены, отзывает все сессии при смене пароля, управляет правами (включая срочную роль `subscriber` с `expires_at`) и ограничивает запросы; хранит историю входов в [16 hash-секциях](services/auth/README.md#партиционирование-истории-входов) | Использует `auth-db` и `auth-redis`; обращается в Yandex OAuth | [README Auth](services/auth/README.md) |
+| Billing | Оформляет подписку «Премиум» через ЮKassa, сверяет статусы платежей и возвратов (`billing-api` + `billing-worker`), синхронизирует доступ к новинкам в Auth, отправляет и отменяет транзакционные письма в Notifications и предоставляет внутренний API для поддержки в Admin | Использует `billing-db` (`PostgreSQL 16`, `synchronous_commit=on`), обращается в ЮKassa API v3, Auth и Notifications Campaign API | [README Billing](services/billing/README.md), [ТЗ Биллинга](docs/billing/tz.md) |
 | Movies API | Возвращает список фильмов, результаты поиска и карточки фильмов | Читает Elasticsearch, использует `movies-redis` и проверяет доступ к полной карточке через Auth | [README Movies API](services/movies-api/README.md) |
 | Movies ETL | Переносит изменения каталога из PostgreSQL в Elasticsearch | Читает `theatre-db`; хранит состояние обработки в SQLite | [README Movies ETL](services/movies-etl/README.md) |
 | UGC Events | Принимает пакеты действий зрителя и публикует их в Kafka | Пишет в топик `ugc.events`; проверяет access JWT локально | [README UGC Events](services/ugc-events/README.md) |
@@ -79,7 +80,7 @@ Docker Compose читает корневой `.env`. Файл `.env.example` я�
 | `SENTRY_DB_USER`, `SENTRY_DB_PASSWORD`, `SENTRY_DB_NAME`, `SENTRY_SECRET_KEY` | `sentry-db`, `glitchtip`, `glitchtip-bootstrap` | База и секретный ключ GlitchTip |
 | `SENTRY_ADMIN_EMAIL`, `SENTRY_ADMIN_PASSWORD` | `glitchtip-bootstrap` | Администратор GlitchTip; пароль задаётся только при создании |
 | `SENTRY_PORT` | `glitchtip` | Публикует GlitchTip на `127.0.0.1`; по умолчанию `9000` |
-| `SENTRY_DSN`, `SENTRY_ENVIRONMENT`, `SENTRY_TRACES_SAMPLE_RATE` | Auth, Movies API, UGC Events, UGC API, UGC ETL | DSN проекта GlitchTip (проект с этим id и ключом создаёт `glitchtip-bootstrap`), окружение и доля трасс; пустой DSN выключает отправку ошибок |
+| `SENTRY_DSN`, `SENTRY_ENVIRONMENT`, `SENTRY_TRACES_SAMPLE_RATE` | Auth, Billing (`billing-api`, `billing-worker`), Movies API, UGC Events, UGC API, UGC ETL | DSN проекта GlitchTip (проект с этим id и ключом создаёт `glitchtip-bootstrap`), окружение и доля трасс; пустой DSN выключает отправку ошибок |
 | `THEATRE_POSTGRES_USER`, `THEATRE_POSTGRES_PASSWORD`, `THEATRE_POSTGRES_DB` | `theatre-db`, Admin, Movies ETL | Передаются как `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` |
 | `THEATRE_SQL_OPTIONS` | Admin | Передаётся как `SQL_OPTIONS` |
 | `AUTH_POSTGRES_USER`, `AUTH_POSTGRES_PASSWORD`, `AUTH_POSTGRES_DB` | `auth-db`, миграции Auth, Auth | Передаются как `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` |
@@ -87,7 +88,7 @@ Docker Compose читает корневой `.env`. Файл `.env.example` я�
 | `AUTH_ADMIN_LOGIN`, `AUTH_ADMIN_PASSWORD`, `AUTH_ADMIN_TZ` | `auth-bootstrap` | Создают начального суперпользователя Auth или повышают существующего пользователя с тем же логином; `AUTH_ADMIN_TZ` задаёт обязательный часовой пояс IANA, например `Europe/Moscow` |
 | `AUTH_CLIENT_CONNECT_TIMEOUT_SECONDS`, `AUTH_CLIENT_REQUEST_TIMEOUT_SECONDS` | Admin | Ограничивают ожидание внутренних запросов Admin к Auth |
 | `AUTH_CLIENT_BACKOFF_MAX_TRIES`, `AUTH_CLIENT_BACKOFF_MAX_TIME_SECONDS` | Admin | Ограничивают безопасные повторы внутренних запросов Admin к Auth |
-| `JWT_SECRET`, `JWT_ALGORITHM`, `SERVICE_API_KEY` | Auth, Movies API, UGC Events и UGC API | Auth выпускает JWT и проверяет сервисный ключ; Movies API проверяет access JWT и подписывает внутренний запрос сервисным ключом; UGC Events и UGC API получают `JWT_SECRET` и `JWT_ALGORITHM` как `AUTH_JWT_SECRET` и `AUTH_JWT_ALGORITHM` и проверяет access JWT локально |
+| `JWT_SECRET`, `JWT_ALGORITHM`, `SERVICE_API_KEY` | Auth, Admin, Billing (`billing-api`, `billing-worker`), Movies API, UGC Events и UGC API | Auth выпускает JWT и проверяет сервисный ключ; Admin и Billing подписывают внутренние вызовы сервисным ключом `SERVICE_API_KEY`; Billing, Movies API, UGC Events и UGC API проверяют access JWT |
 | `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` | Четыре узла ClickHouse и UGC ETL | Один пользователь на всех нодах; пароль также задаёт `secret` кластера и учётные данные реплик в `infra/clickhouse/config.d/cluster.xml`. Базу `ugc` создаёт UGC ETL запросом `ON CLUSTER` |
 | `MONGO_SHARD_CACHE_SIZE_GB` | Шесть узлов шардов MongoDB | Размер кэша WiredTiger каждого узла шарда в гигабайтах; по умолчанию `0.5`. Конфиг-серверы используют `0.25` |
 | `ACCESS_TOKEN_TTL_SECONDS`, `REFRESH_TOKEN_TTL_SECONDS`, `PASSWORD_*`, `AUTHORIZATION_CACHE_TTL_SECONDS` | Auth | Настройки токенов, паролей и RBAC-кэша |
@@ -100,6 +101,12 @@ Docker Compose читает корневой `.env`. Файл `.env.example` я�
 | `MOVIES_AUTH_CONNECT_TIMEOUT`, `MOVIES_AUTH_REQUEST_TIMEOUT`, `MOVIES_AUTH_BACKOFF_*` | Movies API | Таймауты и ограниченный повтор внутреннего вызова Auth |
 | `ETL_STATE_DATABASE_FILE_PATH`, `ETL_PRODUCER_BATCH_SIZE`, `ETL_WORKER_LEASE_SECONDS`, `ETL_JOB_MAX_ATTEMPTS`, `ETL_WORKER_POLL_INTERVAL_SECONDS`, `ETL_LOG_LEVEL`, `ETL_ELASTICSEARCH_TIMEOUT_SECONDS` | Movies ETL | Передаются без префикса `ETL_` |
 | `ETL_POSTGRES_BACKOFF_*`, `ETL_ELASTICSEARCH_BACKOFF_*` | Movies ETL | Передаются как `POSTGRES_BACKOFF__*`, `ELASTICSEARCH_BACKOFF__*` |
+| `BILLING_POSTGRES_USER`, `BILLING_POSTGRES_PASSWORD`, `BILLING_POSTGRES_DB` | `billing-db`, `billing-migrate`, `billing-api`, `billing-worker` | База данных сервиса Billing (`billing-db`) |
+| `YOOKASSA_SHOP_ID`, `YOOKASSA_SECRET_KEY`, `YOOKASSA_API_BASE_URL`, `YOOKASSA_TIMEOUT_SECONDS` | `billing-api`, `billing-worker` | Учётные данные и параметры подключения к ЮKassa API v3 |
+| `BILLING_PUBLIC_BASE_URL`, `RECONCILE_MIN_AGE_SECONDS`, `BILLING_RECONCILE_INTERVAL_SECONDS`, `BILLING_OUTBOX_INTERVAL_SECONDS`, `BILLING_OUTBOX_MAX_ATTEMPTS`, `BILLING_STUCK_THRESHOLD_SECONDS` | `billing-api`, `billing-worker` | Публичный базовый URL для `return_url` и ссылок в письмах, интервалы фоновой сверки и доставки `outbox_tasks`, порог зависших операций |
+| `BILLING_TRACING_ENABLED`, `BILLING_TRACING_SERVICE_NAME`, `BILLING_TRACING_SAMPLE_RATE` | `billing-api`, `billing-worker` | Включают трассировку OpenTelemetry, задают имя сервиса и долю сэмплинга для экспорта в Jaeger |
+| `NOTIFICATIONS_CAMPAIGN_API_KEY` | `notifications-campaign-api`, `billing-api`, `billing-worker` | Сервисный ключ `X-API-Key` внутреннего Campaign API для отправки и отмены писем биллинга |
+| `BILLING_INTERNAL_URL` | Admin | Внутренний адрес API сервиса Billing (`http://billing-api:8000/api/v1/internal/billing`, задаётся в `compose.yaml`) |
 
 #### Внутренняя сеть
 
@@ -109,6 +116,8 @@ Docker Compose читает корневой `.env`. Файл `.env.example` я�
 | --- | --- |
 | PostgreSQL каталога и Admin | `theatre-db:5432` |
 | PostgreSQL Auth | `auth-db:5432` |
+| PostgreSQL Billing | `billing-db:5432` |
+| HTTP API Billing | `billing-api:8000` |
 | Redis Auth | `auth-redis:6379` |
 | Redis Movies API | `movies-redis:6379` |
 | Elasticsearch | `elasticsearch:9200` |
@@ -142,6 +151,7 @@ PostgreSQL применяет `POSTGRES_PASSWORD` при первом созда
 | --- | --- |
 | `theatre_db_data` | Каталог фильмов и данные Admin |
 | `auth_db_data` | Пользователи, внешние учётные записи, роли и история входов Auth |
+| `billing_db_data` | Тарифы, платежи, подписки, возвраты, журнал переходов `operation_events`, журнал действий поддержки `admin_actions` и очередь `outbox_tasks` сервиса Billing (`synchronous_commit = on`) |
 | `auth_redis_data` | Версии сессий, блокировки смены пароля, токены обновления, отозванные токены доступа, состояния OAuth, кэш прав и данные ограничения запросов Auth; Redis использует журнал Append Only File (AOF) |
 | `elasticsearch_data` | Индекс фильмов |
 | `movies_etl_state` | SQLite-состояние Movies ETL |
@@ -173,6 +183,7 @@ ZooKeeper не имеет именованного тома. Схема табл
 | --- | --- | --- |
 | Admin | [services/admin/.env.example](services/admin/.env.example) | `services/admin/.env` |
 | Auth | [services/auth/.env.example](services/auth/.env.example) | `services/auth/.env` |
+| Billing | [services/billing/.env.example](services/billing/.env.example) | `services/billing/.env` |
 | Movies API | [services/movies-api/.env.example](services/movies-api/.env.example) | `services/movies-api/.env` |
 | Movies ETL | [services/movies-etl/.env.example](services/movies-etl/.env.example) | `services/movies-etl/.env` |
 | UGC Events | [services/ugc-events/.env.example](services/ugc-events/.env.example) | `services/ugc-events/.env` |
@@ -190,6 +201,13 @@ ZooKeeper не имеет именованного тома. Схема табл
 | Маршрут | Назначение |
 | --- | --- |
 | `http://localhost/admin/` | Django Admin |
+| `http://localhost/billing/` | Экран пользователя «Моя подписка» (`Billing`) |
+| `http://localhost/billing/login`, `/billing/logout`, `/billing/subscribe` | Вход, выход и оформление подписки (`Billing`) |
+| `http://localhost/billing/payments/{id}`, `/billing/payments/{id}/continue` | Экран результата оплаты и продолжение оплаты (`Billing`) |
+| `http://localhost/api/v1/billing/*` | Публичное API биллинга и вебхук ЮKassa |
+| `http://localhost/billing/health` | Состояние Billing и `billing-db` |
+| `http://localhost/billing/docs` | Swagger UI Billing |
+| `http://localhost/billing/openapi.json` | OpenAPI JSON Billing |
 | `http://localhost/static/admin/css/base.css` | Пример статического файла Django |
 | `http://localhost/api/v1/auth/*` | Префикс маршрутов Auth API |
 | `http://localhost/api/v1/auth/social/yandex/login?tz=Europe/Moscow` | Начать вход через Яндекс ID |
@@ -453,12 +471,36 @@ Campaign API работает отдельным внутренним проце
 docker compose exec -T notifications-api python - < infra/notifications/review_smoke.py
 ```
 
-Письма доступны на **http://localhost:8025**. Планировщик, API кампаний и обнаружение
-новинок включаются отдельными Compose-профилями после нужной первичной загрузки.
+Письма доступны на **http://localhost:8025**. Процесс `notifications-campaign-api` запускается в основном наборе сервисов (`GW-FR-02`) для приёма и отмены транзакционных писем биллинга; планировщик дайджестов и обнаружение новинок включаются отдельными Compose-профилями после нужной первичной загрузки.
 [README Notifications](services/notifications/README.md) содержит команды запуска и описание процессов;
 [настройки](services/notifications/docs/CONFIGURATION.md),
 [контракт кампаний](services/notifications/docs/CAMPAIGNS.md) и
 [первичная загрузка и обновление](docs/diagrams/notifications-arch/ROLLOUT.md) описаны отдельно.
+
+## Биллинг и подписки
+
+Сервис `Billing` (`services/billing`, контейнеры `billing-db`, `billing-migrate`, `billing-api` и `billing-worker`) управляет покупкой подписки «Премиум» (30 дней, 299 ₽) через ЮKassa API v3, открытием и закрытием доступа к новинкам в `Auth`, отправкой и отменой транзакционных писем через `Notifications Campaign API` и контролем операций в `Django Admin`. Полное ТЗ и план проекта находятся в [`docs/billing/tz.md`](docs/billing/tz.md) и [`docs/billing/plan.md`](docs/billing/plan.md).
+
+### Запуск и проверка (`GW-FR-02`)
+
+1. Скопируйте `.env.example` в `.env` и при необходимости укажите тестовые ключи магазина ЮKassa (`YOOKASSA_SHOP_ID`, `YOOKASSA_SECRET_KEY`).
+2. Запустите стек из корня репозитория (команда автоматически поднимает `billing-db`, применяет миграции `billing-migrate` до старта `billing-api` и `billing-worker` и запускает `notifications-campaign-api`):
+
+```bash
+docker compose up -d --build
+```
+
+3. Пользовательский интерфейс биллинга доступен по адресу `http://localhost/billing/` (вход `/billing/login`, экран «Моя подписка» `/billing/`, покупка `POST /billing/subscribe`, экран результата `/billing/payments/{id}`, продолжение оплаты `/billing/payments/{id}/continue`). Внутренние маршруты `/api/v1/internal/billing/*` закрыты на шлюзе `nginx` (`404`, `GW-FR-01`) и доступны только внутри сети Compose с заголовком `X-Service-Api-Key`.
+4. Раздел поддержки в Django Admin доступен по адресу `http://localhost/admin/` (вход `admin` / `Cinema-Admin-2026!`):
+   - `http://localhost/admin/billing/subscriptions/` — список подписок;
+   - `http://localhost/admin/billing/payments/` — список платежей, вкладки «Зависшие операции» (`?tab=stuck`) и «Не доставлено в Auth или Notifications» (`?tab=undelivered`);
+   - `http://localhost/admin/billing/payments/<id>/` и `/refund/` — карточка платежа, ручная сверка с ЮKassa, повтор/закрытие задач outbox и оформление полного возврата с причиной;
+   - `http://localhost/admin/billing/admin-actions/` — неизменяемый журнал действий администраторов.
+5. Сквозной интеграционный прогон всех сценариев биллинга (`T-06`–`T-37`) в Docker Compose:
+
+```bash
+./tests/integration/run_billing_integration.sh
+```
 
 ## Интеграция Auth и Movies API
 
@@ -586,6 +628,8 @@ uv run pytest
 | `movies-etl` | 3.10, 3.11, 3.12 | — |
 | `ugc-events`, `ugc-etl` | 3.11, 3.12, 3.14 | Нужны `datetime.UTC` и `typing.Self` (3.11+); в Docker работают на 3.14 |
 | `auth` | 3.12, 3.13, 3.14 | Код использует синтаксис обобщений PEP 695 (3.12+); интеграционные тесты работают с PostgreSQL и Redis, в CI их поднимают service containers `postgres:16` и `redis:7-alpine` |
+| `billing` | 3.12, 3.13, 3.14 | Интеграционные тесты проверяют инварианты схемы, блокировки `FOR UPDATE SKIP LOCKED` и транзакционный outbox на реальном PostgreSQL 16 |
+| `notifications` | 3.12, 3.13, 3.14 | Интеграционные и E2E-тесты работают с PostgreSQL, Redis, RabbitMQ и Mailpit |
 | `movies-api` | 3.12, 3.13, 3.14 | Код использует синтаксис обобщений PEP 695 (3.12+) |
 
 Задачи matrix не останавливают друг друга (`fail-fast: false`), поэтому падение на одной версии не скрывает результат на остальных. Unit-тесты не требуют `.env` и внешних сервисов: значения настроек для тестов задаёт `tests/conftest.py` каждого сервиса. Базы поднимаются только там, где тесты проверяют сам адаптер к базе: MongoDB для `ugc-api`, PostgreSQL и Redis для Auth. Логику сервисов и API Auth проверяет через in-memory фейки (`tests/fakes.py`), а тесты SQL-репозиториев и Redis-хранилищ помечены маркером `integration`. Локальный `uv run pytest` их пропускает, а в CI их запускает отдельная задача `auth-integration` (`uv run pytest -m integration`). Функциональные тесты на Docker-стеке (`functional_tests/`, `tests/functional/`) в CI не входят. Сервис `admin` (Django) в CI тоже не входит: у него нет тестов и конфигурации линтеров.
