@@ -263,6 +263,8 @@ class RefundConfirmationT30Tests(TestCase):
             BillingConflictError,
             BillingNotFoundError,
             BillingPaymentCardData,
+            BillingRefundItem,
+            BillingSubscriptionItem,
             BillingUnavailableError,
         )
 
@@ -296,13 +298,42 @@ class RefundConfirmationT30Tests(TestCase):
                     updated_at=t0,
                     can_refund=(self.mode == 'ok'),
                     can_reconcile_payment=False,
-                    subscription=None,
+                    subscription=BillingSubscriptionItem(
+                        id=UUID('88888888-8888-4888-8888-888888888888'),
+                        user_id=user_id,
+                        payment_id=payment_id,
+                        tariff_code='premium',
+                        tariff_name='Подписка «Премиум»',
+                        starts_at=t0,
+                        ends_at=t0,
+                        status='active',
+                        amount_kopeks=29900,
+                        currency='RUB',
+                        created_at=t0,
+                    ),
                     refunds=(),
                     operation_events=(),
                     outbox_tasks=(),
                 )
 
             def create_refund(self, payment_id: UUID, **_kwargs: object):
+                if self.mode == 'ok':
+                    return BillingRefundItem(
+                        id=UUID('77777777-7777-4777-8777-777777777777'),
+                        payment_id=payment_id,
+                        subscription_id=UUID('88888888-8888-4888-8888-888888888888'),
+                        provider_code='yookassa',
+                        provider_refund_id='yk_ref_ok',
+                        amount_kopeks=29900,
+                        currency='RUB',
+                        status='succeeded',
+                        reason='Возврат при недоступном Auth',
+                        rejection_reason=None,
+                        admin_user_id=user_id,
+                        created_at=t0,
+                        updated_at=t0,
+                        can_reconcile=False,
+                    )
                 if self.mode == 'conflict':
                     raise BillingConflictError(
                         'Возврат возможен только для платежа текущей активной подписки'
@@ -351,6 +382,28 @@ class RefundConfirmationT30Tests(TestCase):
             lookup_client=down_lkp,
         )
         self.assertEqual(res_post_503.status_code, 503)
+
+        # 4. Строки 12 и 13 матрицы 6.3 (T-37): после восстановления Billing (и при всё ещё
+        #    недоступном Auth) страница подтверждения открывается с UUID и временем в UTC,
+        #    а повторная отправка формы возврата проходит штатно (302)
+        bil.mode = 'ok'
+        res_get_auth_down = self._request('get', url, billing_client=bil, lookup_client=down_lkp)
+        self.assertEqual(res_get_auth_down.status_code, 200)
+        self.assertContains(res_get_auth_down, str(user_id))
+        self.assertContains(res_get_auth_down, '05.11.2026 10:00 UTC')
+
+        res_post_auth_down = self._request(
+            'post',
+            url,
+            data={'reason': 'Повторная отправка после восстановления Billing'},
+            billing_client=bil,
+            lookup_client=down_lkp,
+        )
+        self.assertEqual(res_post_auth_down.status_code, 302)
+        self.assertEqual(
+            res_post_auth_down['Location'],
+            reverse('admin:billing_payment_detail', args=[pay_id]),
+        )
 
     def test_billing_admin_client_create_refund_contract(self) -> None:
         """T-30: проверка HTTP-клиента create_refund (200, 404, 409, 503)."""

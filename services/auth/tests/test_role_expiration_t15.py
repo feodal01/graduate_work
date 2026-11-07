@@ -109,6 +109,32 @@ async def test_authorization_service_ignores_expired_role_and_caps_cache_ttl() -
     _, expired_snap = cache.items[user.id]
     assert expired_snap.nearest_expires_at is None
 
+    # 2. Строка 10 матрицы деградации 6.3 (T-37): при отказе Redis
+    #    проверка прав обычного подписчика автоматически переходит на чтение из БД
+    #    с учётом expires_at > now()
+    await auth_service.put_subscription_access(
+        user.id,
+        version=2,
+        expires_at=datetime.now(UTC) + timedelta(milliseconds=120),
+    )
+    cache.fail_reads = True
+    cache.fail_writes = True
+    assert (
+        await auth_service.can_read_film(
+            cur_user,
+            FilmAccessContext(creation_date=date(9999, 1, 1)),
+        )
+        is True
+    )
+    await asyncio.sleep(0.16)
+    assert (
+        await auth_service.can_read_film(
+            cur_user,
+            FilmAccessContext(creation_date=date(9999, 1, 1)),
+        )
+        is False
+    )
+
 
 async def test_snapshot_store_passes_capped_ttl_to_redis_lua_script() -> None:
     """AUTH-FR-03: RedisAuthorizationSnapshotStore передаёт усечённый TTL."""

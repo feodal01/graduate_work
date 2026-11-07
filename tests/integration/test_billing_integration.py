@@ -103,7 +103,7 @@ class BillingIntegrationCheck:
         self._check_refund_lifecycle_t29()
         self._check_e2e_acceptance_criteria_9_1_t36()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06..T-36 live Docker checks passed.')
+        print('All Billing T-06..T-37 live Docker checks passed.')
 
     def _http(
         self,
@@ -2996,32 +2996,134 @@ class BillingIntegrationCheck:
         assert self._psql(cleanup_sql).returncode == 0
 
     def _check_degradation_and_worker_graceful_shutdown(self) -> None:
-        """BIL-API-15, GW-NFR-R-01, BIL-NFR-R-09: DB outage yields 503; worker stops."""
-        self._compose('stop', 'billing-db')
+        """T-37 (6.3): DB/API outage yields 502/503; pending payment reconciles."""
+        pid_t37 = str(uuid4())
+        uid_t37 = str(uuid4())
+        yk_t37 = f'yk_t37_{uuid4().hex[:8]}'
+        assert (
+            self._psql(
+                f'INSERT INTO payments (id, user_id, tariff_id, provider_code, '
+                f'provider_payment_id, amount_kopeks, currency, status, '
+                f'idempotency_key, created_at, updated_at) VALUES '
+                f"('{pid_t37}', '{uid_t37}', "
+                f"'00000000-0000-0000-0000-000000000001', 'yookassa', '{yk_t37}', "
+                f"29900, 'RUB', 'pending', '{pid_t37}', now() - interval '25 hours', "
+                f"now() - interval '25 hours');"
+            ).returncode
+            == 0
+        )
         try:
-            degraded = self._http('GET', '/billing/health')
-            if degraded.status != 503 or degraded.json() != {
-                'status': 'unavailable',
-                'database': 'unavailable',
-            }:
-                raise AssertionError(
-                    f'Expected 503 when billing-db is stopped, got {degraded}'
+            self._compose('stop', 'billing-db')
+            try:
+                degraded = self._http('GET', '/billing/health')
+                if degraded.status != 503 or degraded.json() != {
+                    'status': 'unavailable',
+                    'database': 'unavailable',
+                }:
+                    raise AssertionError(
+                        f'Expected 503 when billing-db is stopped, got {degraded}'
+                    )
+                wh_degraded = self._http(
+                    'POST',
+                    '/api/v1/billing/webhooks/yookassa',
+                    data=json.dumps({'object': {'id': yk_t37}}).encode(),
+                    headers={'Content-Type': 'application/json'},
                 )
-        finally:
-            self._compose('start', 'billing-db')
+                if wh_degraded.status != 503:
+                    raise AssertionError(
+                        f'Expected 503 on webhook when DB is down: {wh_degraded}'
+                    )
+            finally:
+                self._compose('start', 'billing-db')
 
-        self._wait_for_billing_and_auth_health()
+            self._wait_for_billing_and_auth_health()
 
-        self._compose('stop', 'billing-worker')
-        worker_logs = self._compose('logs', '--tail=30', 'billing-worker')
-        if (
-            'Stopping billing-worker gracefully' not in worker_logs
-            or 'billing-worker stopped' not in worker_logs
-        ):
-            raise AssertionError(
-                f'billing-worker did not log graceful shutdown:\n{worker_logs}'
+            # Row 14 of matrix 6.3: nginx returns 502/503 when billing-api is stopped
+            self._compose('stop', 'billing-api')
+            try:
+                gw_err = self._http('GET', '/billing/health')
+                if gw_err.status not in (502, 503):
+                    raise AssertionError(
+                        f'Expected 502/503 when billing-api is stopped, got {gw_err}'
+                    )
+                # Pending payment stays pending in DB during outage
+                st_during = self._psql(
+                    f"SELECT status FROM payments WHERE id = '{pid_t37}';"
+                ).stdout.strip()
+                if st_during != 'pending':
+                    raise AssertionError(
+                        f'Expected pending status during outage, got {st_during}'
+                    )
+            finally:
+                self._compose('start', 'billing-api')
+
+            self._wait_for_billing_and_auth_health()
+
+            self._compose('stop', 'billing-worker')
+            worker_logs = self._compose('logs', '--tail=30', 'billing-worker')
+            if (
+                'Stopping billing-worker gracefully' not in worker_logs
+                or 'billing-worker stopped' not in worker_logs
+            ):
+                raise AssertionError(
+                    f'billing-worker did not log graceful shutdown:\n{worker_logs}'
+                )
+            self._compose('start', 'billing-worker')
+
+            # Startup reconciliation processes pending payment after recovery
+            rec_code = (
+                'import asyncio\n'
+                'from uuid import UUID\n'
+                'from core.config import settings\n'
+                'from db.sql.postgres import PostgresDatabase\n'
+                'from repositories.purchase import SQLAlchemyPurchaseRepository\n'
+                'from services.reconciler import PaymentReconciler\n'
+                'from clients.payment_provider import ProviderPaymentSnapshot\n'
+                'class _RecProv:\n'
+                '    provider_code = "yookassa"\n'
+                '    async def create_payment(self, req):\n'
+                '        raise NotImplementedError\n'
+                '    async def get_payment(self, pid, **kw):\n'
+                '        return ProviderPaymentSnapshot(\n'
+                '            provider_code="yookassa",\n'
+                '            provider_payment_id=pid,\n'
+                '            domain_status="succeeded",\n'
+                '            amount_kopeks=29900,\n'
+                '            currency="RUB",\n'
+                '            confirmation_url=None,\n'
+                '            failure_reason=None,\n'
+                '            metadata_payment_id=str(kw.get("expected_payment_id")),\n'
+                '            provider_details={"id": pid, "status": "succeeded"},\n'
+                '        )\n'
+                '    async def create_refund(self, req):\n'
+                '        raise NotImplementedError\n'
+                '    async def get_refund(self, rid, **kw):\n'
+                '        raise NotImplementedError\n'
+                '    async def find_refund_by_metadata(self, pid, **kw):\n'
+                '        return None\n'
+                'async def run_rec():\n'
+                '    db = PostgresDatabase(settings.postgres.dsn)\n'
+                '    repo = SQLAlchemyPurchaseRepository(db.sessionmaker)\n'
+                '    rec = PaymentReconciler(\n'
+                '        repository=repo, payment_provider=_RecProv()\n'
+                '    )\n'
+                '    await rec.reconcile_due_pending_payments(min_age_seconds=0.0)\n'
+                f'    p = await repo.get_payment(UUID("{pid_t37}"))\n'
+                '    assert p is not None and p.status == "succeeded"\n'
+                '    await db.close()\n'
+                'asyncio.run(run_rec())\n'
             )
-        self._compose('start', 'billing-worker')
+            self._compose('exec', '-T', 'billing-worker', 'python', '-c', rec_code)
+        finally:
+            assert (
+                self._psql(
+                    f"DELETE FROM outbox_tasks WHERE payment_id = '{pid_t37}'; "
+                    f"DELETE FROM operation_events WHERE operation_id = '{pid_t37}'; "
+                    f"DELETE FROM subscriptions WHERE payment_id = '{pid_t37}'; "
+                    f"DELETE FROM payments WHERE id = '{pid_t37}';"
+                ).returncode
+                == 0
+            )
 
     def _check_e2e_acceptance_criteria_9_1_t36(self) -> None:
         """T-36 (9.1): live E2E acceptance criteria, link navigation, p95 <= 300ms."""
