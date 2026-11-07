@@ -102,7 +102,7 @@ class BillingIntegrationCheck:
         self._check_admin_billing_lists_t27()
         self._check_refund_lifecycle_t29()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06..T-34 (FEAT-01..FEAT-04) live Docker checks passed.')
+        print('All Billing T-06..T-35 live Docker checks passed.')
 
     def _http(
         self,
@@ -273,6 +273,7 @@ class BillingIntegrationCheck:
             '/api/v1/internal/billing/subscriptions',
             '/api/v1/internal/billing/outbox-tasks',
             '/api/v1/internal/billing/admin-actions',
+            '/api/v1/internal/billing/metrics',
         ):
             res = self._http(
                 'GET',
@@ -2600,6 +2601,29 @@ class BillingIntegrationCheck:
                     raise AssertionError(
                         f'Unexpected undelivered outbox tab: {undeliv_body}'
                     )
+
+                # 5c-bis. T-35 (6.4): internal metrics endpoint reports undelivered task
+                metrics_code = (
+                    'import asyncio, httpx\n'
+                    'from core.config import ServiceSettings\n'
+                    'async def check_t35():\n'
+                    '    key = ServiceSettings().api_key.get_secret_value()\n'
+                    '    url = "http://127.0.0.1:8000/api/v1/internal/billing/metrics"\n'
+                    '    async with httpx.AsyncClient() as hc:\n'
+                    '        r = await hc.get(\n'
+                    '            url,\n'
+                    '            headers={\n'
+                    '                "X-Service-Api-Key": key,\n'
+                    '                "X-Request-Id": "t35-live",\n'
+                    '            },\n'
+                    '        )\n'
+                    '        assert r.status_code == 200, r.text\n'
+                    '        d = r.json()\n'
+                    '        assert d["outbox_requires_intervention_count"] >= 1, d\n'
+                    '        assert d["undelivered_outbox_count"] >= 1, d\n'
+                    'asyncio.run(check_t35())\n'
+                )
+                self._compose('exec', '-T', 'billing-api', 'python', '-c', metrics_code)
 
                 # 5d. T-32 (ADM-FR-07, BIL-API-12..13): close outbox task in admin
                 empty_close_data = urllib.parse.urlencode(

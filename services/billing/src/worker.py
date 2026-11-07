@@ -17,6 +17,7 @@ from core.observability import init_sentry
 from core.tracing import create_tracer_provider
 from db.sql.postgres import PostgresDatabase
 from repositories.purchase import SQLAlchemyPurchaseRepository
+from services.monitoring import OperationalMonitor
 from services.outbox_dispatcher import OutboxDispatcher
 from services.reconciler import PaymentReconciler
 
@@ -188,6 +189,10 @@ async def main() -> None:
         public_base_url=str(settings.worker.billing_public_base_url),
         outbox_dispatcher=outbox_dispatcher,
     )
+    monitor = OperationalMonitor(
+        repository=repo,
+        stuck_threshold_seconds=settings.worker.billing_stuck_threshold_seconds,
+    )
 
     runner_ref: list[BillingWorkerRunner] = []
 
@@ -199,6 +204,8 @@ async def main() -> None:
             min_age_seconds=settings.worker.reconcile_min_age_seconds,
             should_stop=is_stopping,
         )
+        if not is_stopping():
+            await monitor.check_and_emit_signals()
 
     async def outbox_step() -> None:
         await outbox_dispatcher.process_due_tasks(should_stop=is_stopping)

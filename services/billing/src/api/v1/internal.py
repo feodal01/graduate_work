@@ -147,6 +147,16 @@ class ManualReconcileResponse(BaseModel):
     transitioned: bool
 
 
+class OperationalMetricsResponse(BaseModel):
+    stuck_payments_count: int
+    stuck_refunds_count: int
+    stuck_operations_count: int
+    outbox_pending_count: int
+    outbox_stuck_pending_count: int
+    outbox_requires_intervention_count: int
+    undelivered_outbox_count: int
+
+
 class InternalPaymentCardResponse(BaseModel):
     id: UUID
     user_id: UUID
@@ -744,4 +754,31 @@ async def post_internal_operation_reconcile(
         payment_id=payment_id,
         status=status_val,
         transitioned=transitioned,
+    )
+
+
+@router.get(
+    '/metrics',
+    response_model=OperationalMetricsResponse,
+    responses={
+        401: {'description': 'Invalid or missing service API key'},
+        503: {'description': 'Database is unavailable'},
+    },
+)
+async def get_internal_operational_metrics(
+    repo: Annotated[PurchaseRepository, Depends(get_purchase_repository)],
+) -> OperationalMetricsResponse:
+    snapshot = await repo.get_operational_metrics(
+        stuck_threshold_seconds=settings.worker.billing_stuck_threshold_seconds,
+    )
+    return OperationalMetricsResponse(
+        stuck_payments_count=snapshot.stuck_payments_count,
+        stuck_refunds_count=snapshot.stuck_refunds_count,
+        stuck_operations_count=snapshot.stuck_operations_count,
+        outbox_pending_count=snapshot.outbox_pending_count,
+        outbox_stuck_pending_count=snapshot.outbox_stuck_pending_count,
+        outbox_requires_intervention_count=(
+            snapshot.outbox_requires_intervention_count
+        ),
+        undelivered_outbox_count=snapshot.undelivered_outbox_count,
     )

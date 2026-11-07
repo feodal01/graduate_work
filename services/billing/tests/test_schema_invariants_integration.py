@@ -1446,3 +1446,56 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
         'outbox_closed',
     }
     assert all(a.payment_id == payment.id for a in act_items)
+
+    # 8. T-35 (раздел 6.4): операционные метрики в PostgreSQL
+    stuck_pay_pg = uuid4()
+    intervene_pg = uuid4()
+    async with session_factory() as session:
+        session.add_all(
+            [
+                Payment(
+                    id=stuck_pay_pg,
+                    user_id=uuid4(),
+                    tariff_id=payment.tariff_id,
+                    provider_code='yookassa',
+                    amount_kopeks=29900,
+                    currency='RUB',
+                    status='pending',
+                    idempotency_key=stuck_pay_pg,
+                    created_at=now_utc - timedelta(minutes=25),
+                    updated_at=now_utc - timedelta(minutes=25),
+                ),
+                OutboxTask(
+                    id=intervene_pg,
+                    dedup_key=f't35_intervene:{intervene_pg}',
+                    target_service='auth',
+                    task_type='sync_access',
+                    payment_id=payment.id,
+                    user_id=user_id,
+                    access_version=4,
+                    payload={'version': 4},
+                    status='requires_intervention',
+                    attempts=20,
+                    last_error='Auth HTTP 422',
+                    created_at=now_utc - timedelta(minutes=2),
+                    updated_at=now_utc - timedelta(minutes=2),
+                ),
+            ]
+        )
+        await session.commit()
+
+    metrics_snap = await repo.get_operational_metrics(
+        stuck_threshold_seconds=600,
+        now_utc=now_utc,
+    )
+    assert metrics_snap.stuck_payments_count >= 1
+    assert metrics_snap.stuck_refunds_count == 0
+    assert metrics_snap.stuck_operations_count == (
+        metrics_snap.stuck_payments_count + metrics_snap.stuck_refunds_count
+    )
+    assert metrics_snap.outbox_stuck_pending_count >= 1
+    assert metrics_snap.outbox_requires_intervention_count >= 1
+    assert metrics_snap.undelivered_outbox_count == (
+        metrics_snap.outbox_requires_intervention_count
+        + metrics_snap.outbox_stuck_pending_count
+    )

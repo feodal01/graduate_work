@@ -34,6 +34,7 @@ def correlation_request_id(fallback_id: str) -> Iterator[str]:
         yield fallback_id
     finally:
         _request_id.reset(token)
+        sentry_sdk.set_tag('request_id', _request_id.get())
 
 
 class RequestIdLogstashFormatter(LogstashFormatterVersion1):
@@ -79,6 +80,7 @@ async def bind_request_id(
         return await call_next(request)
     finally:
         _request_id.reset(token)
+        sentry_sdk.set_tag('request_id', _request_id.get())
 
 
 def init_sentry(

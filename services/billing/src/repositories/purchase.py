@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from api.errors import BillingDomainError
+from core.observability import correlation_request_id
 from db.sql.errors import DatabaseUnavailableError
 from domain.subscription import (
     ReconcileSource,
@@ -256,6 +257,17 @@ class InternalAdminActionItemData:
 
 
 @dataclass(frozen=True, slots=True)
+class OperationalMetricsSnapshot:
+    stuck_payments_count: int
+    stuck_refunds_count: int
+    stuck_operations_count: int
+    outbox_pending_count: int
+    outbox_stuck_pending_count: int
+    outbox_requires_intervention_count: int
+    undelivered_outbox_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class InternalPaymentCardData:
     id: UUID
     user_id: UUID
@@ -390,6 +402,13 @@ class PurchaseRepository(Protocol):
         self,
         filters: InternalAdminActionFilter,
     ) -> tuple[int, list[InternalAdminActionItemData]]: ...
+
+    async def get_operational_metrics(
+        self,
+        *,
+        stuck_threshold_seconds: int = 600,
+        now_utc: datetime | None = None,
+    ) -> OperationalMetricsSnapshot: ...
 
     async def get_payment_by_provider_id(
         self,
@@ -1671,6 +1690,75 @@ class SQLAlchemyPurchaseRepository:
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 
+    async def get_operational_metrics(
+        self,
+        *,
+        stuck_threshold_seconds: int = 600,
+        now_utc: datetime | None = None,
+    ) -> OperationalMetricsSnapshot:
+        now = now_utc or datetime.now(UTC)
+        stuck_cutoff = now - timedelta(seconds=stuck_threshold_seconds)
+        try:
+            async with self._session_factory() as session:
+                stuck_payments_count = int(
+                    await session.scalar(
+                        select(func.count(Payment.id)).where(
+                            Payment.status == 'pending',
+                            Payment.created_at <= stuck_cutoff,
+                        )
+                    )
+                    or 0
+                )
+                stuck_refunds_count = int(
+                    await session.scalar(
+                        select(func.count(Refund.id)).where(
+                            Refund.status == 'processing',
+                            Refund.created_at <= stuck_cutoff,
+                        )
+                    )
+                    or 0
+                )
+                outbox_pending_count = int(
+                    await session.scalar(
+                        select(func.count(OutboxTask.id)).where(
+                            OutboxTask.status == 'pending'
+                        )
+                    )
+                    or 0
+                )
+                outbox_stuck_pending_count = int(
+                    await session.scalar(
+                        select(func.count(OutboxTask.id)).where(
+                            OutboxTask.status == 'pending',
+                            OutboxTask.created_at <= stuck_cutoff,
+                        )
+                    )
+                    or 0
+                )
+                outbox_requires_intervention_count = int(
+                    await session.scalar(
+                        select(func.count(OutboxTask.id)).where(
+                            OutboxTask.status == 'requires_intervention'
+                        )
+                    )
+                    or 0
+                )
+                return OperationalMetricsSnapshot(
+                    stuck_payments_count=stuck_payments_count,
+                    stuck_refunds_count=stuck_refunds_count,
+                    stuck_operations_count=(stuck_payments_count + stuck_refunds_count),
+                    outbox_pending_count=outbox_pending_count,
+                    outbox_stuck_pending_count=outbox_stuck_pending_count,
+                    outbox_requires_intervention_count=(
+                        outbox_requires_intervention_count
+                    ),
+                    undelivered_outbox_count=(
+                        outbox_requires_intervention_count + outbox_stuck_pending_count
+                    ),
+                )
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
     async def get_payment_by_provider_id(
         self,
         provider_code: str,
@@ -2185,6 +2273,7 @@ class SQLAlchemyPurchaseRepository:
                         error_msg = f'Unexpected delivery error: {exc}'
 
                     now_after = datetime.now(UTC)
+                    alert_msg: str | None = None
                     if outcome == 'completed':
                         task.status = 'completed'
                         task.last_error = None
@@ -2198,8 +2287,6 @@ class SQLAlchemyPurchaseRepository:
                             f'Outbox task {task.id} requires intervention '
                             f'(permanent error): {error_msg}'
                         )
-                        logger.error(alert_msg)
-                        sentry_sdk.capture_message(alert_msg, level='error')
                     else:
                         task.attempts += 1
                         task.last_error = error_msg
@@ -2210,14 +2297,16 @@ class SQLAlchemyPurchaseRepository:
                                 f'Outbox task {task.id} exhausted {max_attempts} '
                                 f'attempts and requires intervention: {error_msg}'
                             )
-                            logger.error(alert_msg)
-                            sentry_sdk.capture_message(alert_msg, level='error')
                         else:
                             backoff_sec = compute_outbox_backoff_seconds(task.attempts)
                             task.next_retry_at = now_after + timedelta(
                                 seconds=backoff_sec
                             )
                     await session.commit()
+                    if alert_msg is not None:
+                        with correlation_request_id(f'outbox-{task.id}'):
+                            logger.error(alert_msg)
+                            sentry_sdk.capture_message(alert_msg, level='error')
                     processed += 1
             return processed
         except (SQLAlchemyError, OSError) as exc:

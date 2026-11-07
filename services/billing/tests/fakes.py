@@ -17,6 +17,7 @@ from clients.payment_provider import (
     ProviderPaymentSnapshot,
     ProviderRefundSnapshot,
 )
+from core.observability import correlation_request_id
 from db.sql.errors import DatabaseUnavailableError
 from domain.subscription import (
     ReconcileSource,
@@ -41,6 +42,7 @@ from repositories.purchase import (
     InternalSubscriptionFilter,
     InternalSubscriptionItemData,
     LocalPaymentResultData,
+    OperationalMetricsSnapshot,
     OutboxDeliverFn,
     UserBillingOverviewData,
     UserPaymentHistoryItemData,
@@ -649,6 +651,7 @@ class InMemoryPurchaseRepository:
                 error_msg = f'Unexpected delivery error: {exc}'
 
             now_after = datetime.now(UTC)
+            alert_msg: str | None = None
             if outcome == 'completed':
                 task.status = 'completed'
                 task.last_error = None
@@ -660,8 +663,6 @@ class InMemoryPurchaseRepository:
                     f'Outbox task {task.id} requires intervention '
                     f'(permanent error): {error_msg}'
                 )
-                logger.error(alert_msg)
-                sentry_sdk.capture_message(alert_msg, level='error')
             else:
                 task.attempts += 1
                 task.last_error = error_msg
@@ -671,11 +672,13 @@ class InMemoryPurchaseRepository:
                         f'Outbox task {task.id} exhausted {max_attempts} '
                         f'attempts and requires intervention: {error_msg}'
                     )
-                    logger.error(alert_msg)
-                    sentry_sdk.capture_message(alert_msg, level='error')
                 else:
                     backoff_sec = compute_outbox_backoff_seconds(task.attempts)
                     task.next_retry_at = now_after + timedelta(seconds=backoff_sec)
+            if alert_msg is not None:
+                with correlation_request_id(f'outbox-{task.id}'):
+                    logger.error(alert_msg)
+                    sentry_sdk.capture_message(alert_msg, level='error')
             processed += 1
         return processed
 
@@ -1318,6 +1321,51 @@ class InMemoryPurchaseRepository:
             )
         total = len(items)
         return total, items[filters.offset : filters.offset + filters.limit]
+
+    async def get_operational_metrics(
+        self,
+        *,
+        stuck_threshold_seconds: int = 600,
+        now_utc: datetime | None = None,
+    ) -> OperationalMetricsSnapshot:
+        """Вычисляет операционные метрики для мониторинга (T-35, 6.4)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        now = now_utc or datetime.now(UTC)
+        stuck_cutoff = now - timedelta(seconds=stuck_threshold_seconds)
+
+        stuck_payments_count = sum(
+            1
+            for p in self.payments.values()
+            if p.status == 'pending' and p.created_at <= stuck_cutoff
+        )
+        stuck_refunds_count = sum(
+            1
+            for r in self.refunds.values()
+            if r.status == 'processing' and r.created_at <= stuck_cutoff
+        )
+        outbox_pending_count = sum(
+            1 for t in self.outbox_tasks.values() if t.status == 'pending'
+        )
+        outbox_stuck_pending_count = sum(
+            1
+            for t in self.outbox_tasks.values()
+            if t.status == 'pending' and t.created_at <= stuck_cutoff
+        )
+        outbox_requires_intervention_count = sum(
+            1 for t in self.outbox_tasks.values() if t.status == 'requires_intervention'
+        )
+        return OperationalMetricsSnapshot(
+            stuck_payments_count=stuck_payments_count,
+            stuck_refunds_count=stuck_refunds_count,
+            stuck_operations_count=(stuck_payments_count + stuck_refunds_count),
+            outbox_pending_count=outbox_pending_count,
+            outbox_stuck_pending_count=outbox_stuck_pending_count,
+            outbox_requires_intervention_count=outbox_requires_intervention_count,
+            undelivered_outbox_count=(
+                outbox_requires_intervention_count + outbox_stuck_pending_count
+            ),
+        )
 
     async def get_refund(self, refund_id: UUID) -> FakeRefundRow | None:
         """Возвращает возврат по ID (T-29)."""
