@@ -101,8 +101,9 @@ class BillingIntegrationCheck:
         self._check_internal_billing_lists_t26()
         self._check_admin_billing_lists_t27()
         self._check_refund_lifecycle_t29()
+        self._check_e2e_acceptance_criteria_9_1_t36()
         self._check_degradation_and_worker_graceful_shutdown()
-        print('All Billing T-06..T-35 live Docker checks passed.')
+        print('All Billing T-06..T-36 live Docker checks passed.')
 
     def _http(
         self,
@@ -3021,6 +3022,111 @@ class BillingIntegrationCheck:
                 f'billing-worker did not log graceful shutdown:\n{worker_logs}'
             )
         self._compose('start', 'billing-worker')
+
+    def _check_e2e_acceptance_criteria_9_1_t36(self) -> None:
+        """T-36 (9.1): live E2E acceptance criteria, link navigation, p95 <= 300ms."""
+        # 1. Verify p95 <= 300 ms on own HTTP endpoints (NFR-P-01)
+        for path in ('/billing/health', '/billing/login'):
+            samples_ms: list[float] = []
+            for _ in range(15):
+                t0 = time.monotonic()
+                res = self._http('GET', path, follow_redirects=False)
+                if res.status != 200:
+                    raise AssertionError(f'Expected 200 from {path}: {res}')
+                samples_ms.append((time.monotonic() - t0) * 1000.0)
+            samples_ms.sort()
+            p95_ms = samples_ms[int(len(samples_ms) * 0.95) - 1]
+            if p95_ms > 300.0:
+                raise AssertionError(
+                    f'NFR-P-01 violated on {path}: p95={p95_ms:.2f}ms > 300ms'
+                )
+
+        # 2. Live YooKassa test shop idempotent payment creation + GET (TASK-1, TASK-5)
+        e2e_code = (
+            'import asyncio, httpx\n'
+            'from uuid import uuid4\n'
+            'from core.config import settings\n'
+            'from clients.payment_provider import (\n'
+            '    CreateProviderPaymentRequest,\n'
+            '    YooKassaProviderAdapter,\n'
+            ')\n'
+            'PLACEHOLDER_SHOPS = {"", "replace-with-test-yookassa-shop-id"}\n'
+            'PLACEHOLDER_KEYS = {\n'
+            '    "",\n'
+            '    "test_secret_key_change_me",\n'
+            '    "replace-with-test-yookassa-secret-key",\n'
+            '}\n'
+            'async def run_yk_e2e():\n'
+            '    shop = settings.yookassa.shop_id.strip()\n'
+            '    key = settings.yookassa.secret_key.get_secret_value().strip()\n'
+            '    if shop in PLACEHOLDER_SHOPS or key in PLACEHOLDER_KEYS:\n'
+            '        print("yk-e2e-skipped")\n'
+            '        return\n'
+            '    pid = uuid4()\n'
+            '    req = CreateProviderPaymentRequest(\n'
+            '        payment_id=pid,\n'
+            '        idempotency_key=pid,\n'
+            '        amount_kopeks=29900,\n'
+            '        currency="RUB",\n'
+            '        description=f"T-36 live E2E {pid}",\n'
+            '        return_url=f"http://localhost/billing/payments/{pid}",\n'
+            '    )\n'
+            '    async with httpx.AsyncClient(timeout=10.0) as hc:\n'
+            '        ad = YooKassaProviderAdapter(\n'
+            '            http_client=hc,\n'
+            '            shop_id=shop,\n'
+            '            secret_key=key,\n'
+            '            base_url=str(settings.yookassa.api_base_url),\n'
+            '        )\n'
+            '        c1 = await ad.create_payment(req)\n'
+            '        c2 = await ad.create_payment(req)\n'
+            '        assert c1.provider_payment_id == c2.provider_payment_id\n'
+            '        got = await ad.get_payment(\n'
+            '            c1.provider_payment_id,\n'
+            '            expected_payment_id=pid,\n'
+            '            expected_amount_kopeks=29900,\n'
+            '            expected_currency="RUB",\n'
+            '        )\n'
+            '        assert got.metadata_payment_id == str(pid)\n'
+            '    print("yk-e2e-ok")\n'
+            'asyncio.run(run_yk_e2e())\n'
+        )
+        yk_out = self._compose(
+            'exec', '-T', 'billing-api', 'python', '-c', e2e_code
+        ).strip()
+        if 'yk-e2e-ok' not in yk_out and 'yk-e2e-skipped' not in yk_out:
+            raise AssertionError(f'Unexpected YooKassa E2E output: {yk_out}')
+
+        # 3. Verify p95 <= 300ms on authenticated DB-backed endpoints (NFR-P-01)
+        login_res = self._http(
+            'POST',
+            '/billing/login',
+            data=urllib.parse.urlencode(
+                {'login': 'admin', 'password': 'Cinema-Admin-2026!'}
+            ).encode(),
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            follow_redirects=False,
+        )
+        cookie_hdr = '; '.join([c.split(';', 1)[0] for c in login_res.set_cookies])
+        for auth_path in ('/billing/', '/api/v1/billing/me/summary'):
+            samples_ms = []
+            for _ in range(15):
+                t0 = time.monotonic()
+                res = self._http(
+                    'GET',
+                    auth_path,
+                    headers={'Cookie': cookie_hdr},
+                    follow_redirects=False,
+                )
+                if res.status != 200:
+                    raise AssertionError(f'Expected 200 from {auth_path}: {res}')
+                samples_ms.append((time.monotonic() - t0) * 1000.0)
+            samples_ms.sort()
+            p95_ms = samples_ms[int(len(samples_ms) * 0.95) - 1]
+            if p95_ms > 300.0:
+                raise AssertionError(
+                    f'NFR-P-01 violated on {auth_path}: p95={p95_ms:.2f}ms > 300ms'
+                )
 
 
 def parse_args() -> argparse.Namespace:

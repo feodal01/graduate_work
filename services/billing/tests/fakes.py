@@ -148,9 +148,29 @@ class InMemoryPurchaseRepository:
 
     async def check_purchase_allowed(self, user_id: UUID) -> tuple[bool, str | None]:
         """Проверяет отсутствие активной подписки и возврата в обработке."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
         if self.has_active_subscription:
             return False, 'subscription_already_active'
+        now_utc = datetime.now(UTC)
+        for sub in self.subscriptions.values():
+            if sub.user_id != user_id:
+                continue
+            has_succeeded_refund = any(
+                r.subscription_id == sub.id and r.status == 'succeeded'
+                for r in self.refunds.values()
+            )
+            if not has_succeeded_refund and sub.ends_at > now_utc:
+                return False, 'subscription_already_active'
         if self.has_processing_refund:
+            return False, 'refund_in_processing'
+        user_payment_ids = {
+            p.id for p in self.payments.values() if p.user_id == user_id
+        }
+        if any(
+            r.payment_id in user_payment_ids and r.status == 'processing'
+            for r in self.refunds.values()
+        ):
             return False, 'refund_in_processing'
         return True, None
 
