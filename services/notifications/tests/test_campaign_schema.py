@@ -171,7 +171,7 @@ def test_downgrade_refuses_to_destroy_external_deliveries(campaign_connection, d
     with pytest.raises(AssertionError, match="Cannot downgrade campaigns"):
         migrate(database_url, "downgrade", "003")
     assert conn.execute("SELECT version_num FROM alembic_version").fetchone() == (
-        "009_film_digest_selection",
+        "010_campaign_cancellation",
     )
     assert conn.execute(
         "SELECT count(*) FROM campaign_recipients JOIN deliveries USING(delivery_id)"
@@ -191,7 +191,7 @@ def test_configurable_batch_migration_and_safe_downgrade(campaign_connection, da
         migrate(database_url, "downgrade", "005_campaign_author")
     assert conn.execute("SELECT item_count FROM campaign_batches").fetchone() == (101,)
     assert conn.execute("SELECT version_num FROM alembic_version").fetchone() == (
-        "009_film_digest_selection",
+        "010_campaign_cancellation",
     )
 
 
@@ -332,7 +332,7 @@ def test_content_retention_downgrade_refuses_erased_text(campaign_connection, da
         migrate(database_url, "downgrade", "007_contact_privacy")
     assert {table: conn.execute(f"SELECT * FROM {table}").fetchall() for table in tables} == before
     assert conn.execute("SELECT version_num FROM alembic_version").fetchone() == (
-        "009_film_digest_selection",
+        "010_campaign_cancellation",
     )
     assert conn.execute(
         "SELECT column_name,is_nullable FROM information_schema.columns "
@@ -353,8 +353,8 @@ def test_cancelled_campaigns_table_and_cancelled_by_sender_constraint(
         "terminal_at=now()"
     )
     conn.commit()
-    with pytest.raises(AssertionError, match="Restore a pre-009 backup"):
-        migrate(database_url, "downgrade", "008_campaign_content_retention")
+    with pytest.raises(AssertionError, match="Restore a pre-010 backup"):
+        migrate(database_url, "downgrade", "009_film_digest_selection")
     assert conn.execute(
         "SELECT count(*) FROM cancelled_campaigns WHERE campaign_id=%s", (cid,)
     ).fetchone() == (1,)

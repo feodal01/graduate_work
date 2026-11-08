@@ -37,7 +37,7 @@ def test_incompatible_downgrade_preserves_schema_and_history(database_url, reaso
         migrate(database_url, "downgrade", "006_configurable_batch_size")
     with psycopg.connect(url) as connection:
         assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-            "009_film_digest_selection",
+            "010_campaign_cancellation",
         )
         assert (
             connection.execute("SELECT * FROM deliveries WHERE delivery_id=%s", (did,)).fetchone()
@@ -112,5 +112,5 @@ def test_campaign_reason_rejects_downgrade_without_changing_recipient(database_u
     with psycopg.connect(url) as connection:
         assert connection.execute("SELECT * FROM campaign_recipients").fetchall() == before
         assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-            "009_film_digest_selection",
+            "010_campaign_cancellation",
         )

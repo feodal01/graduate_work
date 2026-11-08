@@ -59,7 +59,7 @@ def test_selection_migration_preserves_assigned_and_unassigned_films(database_ur
         with pytest.raises(AssertionError, match="Restore a pre-009 backup"):
             migrate(database_url, "downgrade", "008_campaign_content_retention")
         assert conn.execute("SELECT version_num FROM alembic_version").fetchone() == (
-            "009_film_digest_selection",
+            "010_campaign_cancellation",
         )
         assert conn.execute(
             "SELECT included_in_digest FROM film_announcements WHERE assigned_run_id=%s", (run,)

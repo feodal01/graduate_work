@@ -75,7 +75,7 @@ docker compose ps
 
 ### Шаг 2. Покупка подписки, защита от двойного списания и открытие доступа (`TASK-1`, `TASK-5`, `TASK-6`)
 1. Нажать **«Оформить за 299 ₽»** (или отправить два параллельных запроса `POST /api/v1/billing/payments`): оба запроса возвращают один и тот же платёж `pending` с тем же `Idempotence-Key` и тем же `provider_payment_id` в ЮKassa.
-2. Перейти по `confirmation_url` на страницу ЮKassa и оплатить тестовой картой (`1111 1111 1111 1026`, `12/28`, CVV `000`) либо подать локальный сигнал вебхука:
+2. Перейти по `confirmation_url` на страницу ЮKassa и оплатить тестовой картой (`5555 5555 5555 4444` — Mastercard без 3-D Secure из списка тестовых карт ЮKassa; срок — любая будущая дата, например `12/28`; CVC — любой, например `000`) либо подать локальный сигнал вебхука:
    ```bash
    docker compose exec billing-api python -m emulate_webhook --id <provider_payment_id> --event payment.succeeded --base-url http://127.0.0.1:8000
    ```
