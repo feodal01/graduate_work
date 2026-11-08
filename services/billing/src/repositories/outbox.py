@@ -175,7 +175,9 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
                             continue
 
                     try:
-                        outcome, error_msg = await deliver_fn(task)
+                        outcome, error_msg = await deliver_fn(
+                            task  # pyright: ignore[reportArgumentType]  # Mapped[T]
+                        )
                     except Exception as exc:
                         logger.exception(
                             'Unexpected error delivering outbox task %s',

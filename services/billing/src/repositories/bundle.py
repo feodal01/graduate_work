@@ -39,10 +39,14 @@ class BillingRepositories:
         cls,
         session_factory: async_sessionmaker[AsyncSession],
     ) -> 'BillingRepositories':
+        # pyright не применяет дескриптор `Mapped[T]` при сверке ORM-модели с
+        # протоколом записи (видит `Mapped[UUID]` вместо `UUID`). Совместимость
+        # проверяют mypy (он понимает дескриптор) и
+        # test_orm_models_satisfy_record_protocols.
         outbox = SQLAlchemyOutboxRepository(session_factory)
         return cls(
-            payments=SQLAlchemyPaymentRepository(session_factory),
-            refunds=SQLAlchemyRefundRepository(session_factory),
+            payments=SQLAlchemyPaymentRepository(session_factory),  # pyright: ignore[reportArgumentType]
+            refunds=SQLAlchemyRefundRepository(session_factory),  # pyright: ignore[reportArgumentType]
             outbox=outbox,
             outbox_admin=outbox,
             user_views=SQLAlchemyUserBillingViews(session_factory),

@@ -10,11 +10,13 @@
 import ast
 import inspect
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args, get_origin, get_type_hints
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.orm import Mapped
 
 from api.errors import register_exception_handlers
 from domain.errors import (
@@ -23,6 +25,7 @@ from domain.errors import (
     EntityNotFoundError,
     RuleConflictError,
 )
+from models import OutboxTask, Payment, Refund
 from repositories.admin_queries import AdminQueries, SQLAlchemyAdminQueries
 from repositories.bundle import BillingRepositories
 from repositories.metrics import (
@@ -35,6 +38,11 @@ from repositories.outbox import (
     SQLAlchemyOutboxRepository,
 )
 from repositories.payments import PaymentRepository, SQLAlchemyPaymentRepository
+from repositories.records import (
+    OutboxTaskRecordProtocol,
+    PaymentRecordProtocol,
+    RefundRecordProtocol,
+)
 from repositories.refunds import RefundRepository, SQLAlchemyRefundRepository
 from repositories.user_views import SQLAlchemyUserBillingViews, UserBillingViews
 from tests.fakes import InMemoryPurchaseRepository
@@ -226,3 +234,34 @@ async def test_domain_errors_map_to_http_only_in_api_layer(
     assert api.json() == {'error_code': error.error_code, 'detail': error.detail}
     assert ui.status_code == status_code
     assert error.detail in ui.text
+
+
+@pytest.mark.parametrize(
+    ('model', 'protocol'),
+    [
+        (Payment, PaymentRecordProtocol),
+        (Refund, RefundRecordProtocol),
+        (OutboxTask, OutboxTaskRecordProtocol),
+    ],
+    ids=lambda t: t.__name__,
+)
+def test_orm_models_satisfy_record_protocols(model: type, protocol: type) -> None:
+    """Колонки ORM-модели совпадают с протоколом записи по имени, типу и NULL.
+
+    pyright не сверяет `Mapped[T]` с протоколом, поэтому в `bundle.py` и
+    `outbox.py` его проверка отключена; этот тест закрывает пробел.
+    """
+    columns = sa_inspect(model).columns
+    model_hints = get_type_hints(model)
+    for name, annotation in get_type_hints(protocol).items():
+        assert name in columns, f'{model.__name__} lacks column {name}'
+        mapped = model_hints[name]
+        assert get_origin(mapped) is Mapped, f'{model.__name__}.{name}: {mapped}'
+        (orm_type,) = get_args(mapped)
+        assert orm_type == annotation, (
+            f'{model.__name__}.{name}: Mapped[{orm_type}] != protocol {annotation}'
+        )
+        nullable = type(None) in get_args(annotation)
+        assert columns[name].nullable == nullable, (
+            f'{model.__name__}.{name}: nullable={columns[name].nullable}'
+        )
