@@ -24,3 +24,6 @@ research/storage/data/
 
 # Local agent plans, reports and scratch files.
 .superpowers/
+
+# Записи демо (tests/demo/record_billing_demo.py)
+tests/demo/output/

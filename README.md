@@ -502,6 +502,25 @@ docker compose up -d --build
 ./tests/integration/run_billing_integration.sh
 ```
 
+### Видео демо (раздел 9.2 ТЗ)
+
+Записи живого прогона на локальном стенде с тестовым магазином ЮKassa. Комментарии к каждому шагу показаны в кадре. Рядом с видео лежат хронология шагов (`.md`) и субтитры (`.vtt`). Видео в формате WebM открываются в Chrome, Firefox и VLC.
+
+| Сценарий | Что показано | Видео | Хронология |
+| --- | --- | --- | --- |
+| 1. Покупка подписки «Премиум» (шаги 1–2, `TASK-1`, `TASK-5`, `TASK-6`) | Вход, двойное нажатие «Оформить» без двойного списания, незавершённая оплата, оплата тестовой картой, открытие доступа к новинкам, письмо об оплате, запрет повторной покупки | [billing-demo-1-subscription-purchase.webm](docs/billing/demo/billing-demo-1-subscription-purchase.webm) | [шаги](docs/billing/demo/billing-demo-1-subscription-purchase.md) |
+| 2. Возврат средств администратором (шаг 3, `TASK-2`, `TASK-3`) | Поиск пользователя в Django Admin, карточка платежа, возврат с обязательной причиной, закрытие доступа, статус «Возвращена», письмо о возврате, отмена письма об окончании, журнал действий администраторов | [billing-demo-2-admin-refund.webm](docs/billing/demo/billing-demo-2-admin-refund.webm) | [шаги](docs/billing/demo/billing-demo-2-admin-refund.md) |
+
+Видео записывает скрипт [`tests/demo/record_billing_demo.py`](tests/demo/record_billing_demo.py) на поднятом стенде (`docker compose up -d`). Аргумент — номер сценария. Каждый запуск регистрирует нового пользователя. Перед первым запуском установите браузер и ffmpeg для Playwright:
+
+```bash
+uv run --with playwright playwright install chromium ffmpeg
+```
+
+```bash
+uv run --with playwright --with httpx python tests/demo/record_billing_demo.py 2
+```
+
 ## Интеграция Auth и Movies API
 
 Movies API проверяет доступ только для `GET /api/v1/films/{film_id}/`. Список, поиск и healthcheck не вызывают Auth.
