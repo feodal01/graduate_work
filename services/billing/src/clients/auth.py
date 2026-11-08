@@ -161,6 +161,9 @@ class HttpAuthGateway:
 
         if response.status_code in (401, 403, 422):
             raise AuthInvalidCredentialsError()
+        if response.status_code == 429:
+            # Лимит запросов пользователя в Auth, а не отказ сервиса: не путать с 503.
+            raise AuthRateLimitExceededError()
         if response.status_code != 200:
             logger.error(
                 'Unexpected Auth profile response status=%s',

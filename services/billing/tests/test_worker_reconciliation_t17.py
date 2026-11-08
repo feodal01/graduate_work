@@ -58,7 +58,8 @@ async def test_background_reconcile_respects_min_age_seconds() -> None:
     auth = ConfigurableAuthGateway(user_id=uuid4())
     dispatcher = OutboxDispatcher(repository=repo, auth_gateway=auth)
     reconciler = PaymentReconciler(
-        repository=repo,
+        payments=repo,
+        refunds=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
         outbox_dispatcher=dispatcher,
@@ -97,7 +98,8 @@ async def test_background_reconcile_recreates_missing_provider_id_within_24h() -
     repo = InMemoryPurchaseRepository()
     provider = FakeProviderGateway(id_prefix='yk-recovered')
     reconciler = PaymentReconciler(
-        repository=repo,
+        payments=repo,
+        refunds=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
     )
@@ -130,7 +132,8 @@ async def test_background_reconcile_closes_payment_older_than_24h() -> None:
     repo = InMemoryPurchaseRepository()
     provider = FakeProviderGateway()
     reconciler = PaymentReconciler(
-        repository=repo,
+        payments=repo,
+        refunds=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
     )
@@ -161,7 +164,8 @@ async def test_background_reconcile_handles_4xx_and_anomalies() -> None:
     repo = InMemoryPurchaseRepository()
     provider = FakeProviderGateway()
     reconciler = PaymentReconciler(
-        repository=repo,
+        payments=repo,
+        refunds=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
     )

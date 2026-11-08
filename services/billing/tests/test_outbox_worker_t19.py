@@ -3,7 +3,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from repositories.purchase import compute_outbox_backoff_seconds
+from repositories.outbox import compute_outbox_backoff_seconds
 from services.outbox_dispatcher import (
     NotificationsGateway,
     NotificationsPermanentError,

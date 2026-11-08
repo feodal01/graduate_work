@@ -1,7 +1,6 @@
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from datetime import datetime
-from typing import Protocol
 from uuid import UUID
 
 from opentelemetry import trace
@@ -17,18 +16,14 @@ from clients.notifications import (
     NotificationsTransientError,
 )
 from core.observability import correlation_request_id
-from repositories.purchase import (
-    DeliveryOutcome,
-    OutboxDeliverFn,
-    OutboxTaskRecordProtocol,
-)
+from repositories.outbox import DeliveryOutcome, OutboxRepository
+from repositories.records import OutboxTaskRecordProtocol
 
 __all__ = [
     'NotificationsGateway',
     'NotificationsPermanentError',
     'NotificationsTransientError',
     'OutboxDispatcher',
-    'OutboxRepositoryProtocol',
 ]
 
 logger = logging.getLogger(__name__)
@@ -43,27 +38,13 @@ _EMAIL_BATCH_TASK_TYPES = frozenset(
 )
 
 
-class OutboxRepositoryProtocol(Protocol):
-    async def process_due_outbox_tasks(
-        self,
-        deliver_fn: OutboxDeliverFn,
-        *,
-        target_services: Sequence[str] = ('auth', 'notifications'),
-        payment_id: UUID | None = None,
-        task_id: UUID | None = None,
-        limit: int = 20,
-        max_attempts: int = 20,
-        should_stop: Callable[[], bool] | None = None,
-    ) -> int: ...
-
-
 class OutboxDispatcher:
     """Диспетчер доставки задач из outbox_tasks в Auth и Notifications (T-16, T-19)."""
 
     def __init__(
         self,
         *,
-        repository: OutboxRepositoryProtocol,
+        repository: OutboxRepository,
         auth_gateway: AuthGateway,
         notifications_gateway: NotificationsGateway | None = None,
         max_attempts: int = 20,

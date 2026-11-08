@@ -5,10 +5,14 @@ import httpx
 import pytest
 
 from core.config import settings
-from dependencies import get_purchase_repository, get_service_credentials
+from dependencies import get_repositories, get_service_credentials
 from main import create_app
 from security.service_credentials import ServiceCredentials
-from tests.fakes import FakeOutboxTaskRow, InMemoryPurchaseRepository
+from tests.fakes import (
+    FakeOutboxTaskRow,
+    InMemoryPurchaseRepository,
+    in_memory_repositories,
+)
 
 SERVICE_KEY = 'billing-internal-outbox-list-key-long-enough'
 OUTBOX_PATH = '/api/v1/internal/billing/outbox-tasks'
@@ -31,7 +35,7 @@ async def test_outbox_tasks_list_requires_service_key_step(
     """T-31 (BIL-API-11, BIL-NFR-SEC-03): проверка сервисного ключа."""
     repo = InMemoryPurchaseRepository()
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_purchase_repository] = lambda: repo
+    app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(repo)
     app.dependency_overrides[get_service_credentials] = lambda: ServiceCredentials(
         SERVICE_KEY
     )
@@ -146,7 +150,7 @@ async def test_outbox_tasks_list_threshold_filters_and_unhappy_paths(
     )
 
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_purchase_repository] = lambda: repo
+    app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(repo)
     app.dependency_overrides[get_service_credentials] = lambda: ServiceCredentials(
         SERVICE_KEY
     )

@@ -17,8 +17,8 @@ from dependencies import (
     get_outbox_dispatcher,
     get_payment_providers,
     get_payment_reconciler,
-    get_purchase_repository,
     get_purchase_service,
+    get_repositories,
     get_service_credentials,
 )
 from main import create_app
@@ -26,7 +26,11 @@ from security.service_credentials import ServiceCredentials
 from services.outbox_dispatcher import OutboxDispatcher
 from services.purchase import PurchaseService
 from services.reconciler import PaymentReconciler
-from tests.fakes import FakeProviderGateway, InMemoryPurchaseRepository
+from tests.fakes import (
+    FakeProviderGateway,
+    InMemoryPurchaseRepository,
+    in_memory_repositories,
+)
 
 SERVICE_KEY = 'billing-e2e-acceptance-t36-service-key-long-enough'
 PLACEHOLDER_SHOP_IDS = {'', 'replace-with-test-yookassa-shop-id'}
@@ -147,20 +151,22 @@ async def test_e2e_acceptance_criteria_task_1_to_6_and_link_navigation() -> None
         notifications_gateway=ntf_gw,
     )
     reconciler = PaymentReconciler(
-        repository=repo,
+        payments=repo,
+        refunds=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
         outbox_dispatcher=dispatcher,
     )
     purchase_svc = PurchaseService(
-        repository=repo,
+        payments=repo,
+        user_views=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         reconciler=reconciler,
         public_base_url='http://localhost',
     )
 
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_purchase_repository] = lambda: repo
+    app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(repo)
     app.dependency_overrides[get_payment_providers] = lambda: (
         PaymentProviderRegistry.single(provider)
     )
@@ -531,20 +537,24 @@ async def test_live_yookassa_test_shop_sandbox_e2e() -> None:
             notifications_gateway=ntf_gw,
         )
         reconciler = PaymentReconciler(
-            repository=repo,
+            payments=repo,
+            refunds=repo,
             payment_providers=PaymentProviderRegistry.single(adapter),
             public_base_url='http://localhost',
             outbox_dispatcher=dispatcher,
         )
         purchase_svc = PurchaseService(
-            repository=repo,
+            payments=repo,
+            user_views=repo,
             payment_providers=PaymentProviderRegistry.single(adapter),
             reconciler=reconciler,
             public_base_url='http://localhost',
         )
 
         app = create_app(app_lifespan=None)
-        app.dependency_overrides[get_purchase_repository] = lambda: repo
+        app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(
+            repo
+        )
         app.dependency_overrides[get_payment_providers] = lambda: (
             PaymentProviderRegistry.single(adapter)
         )

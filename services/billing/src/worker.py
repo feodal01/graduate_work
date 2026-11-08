@@ -16,7 +16,7 @@ from core.logger import LOGGING, add_logstash_handler
 from core.observability import init_sentry
 from core.tracing import create_tracer_provider
 from db.sql.postgres import PostgresDatabase
-from repositories.purchase import SQLAlchemyPurchaseRepository
+from repositories.bundle import BillingRepositories
 from services.monitoring import OperationalMonitor
 from services.outbox_dispatcher import OutboxDispatcher
 from services.reconciler import PaymentReconciler
@@ -169,21 +169,22 @@ async def main() -> None:
         api_key=settings.notifications_client.campaign_api_key.get_secret_value(),
     )
     payment_providers = build_payment_provider_registry(settings.payment_providers)
-    repo = SQLAlchemyPurchaseRepository(database.sessionmaker)
+    repos = BillingRepositories.sqlalchemy(database.sessionmaker)
     outbox_dispatcher = OutboxDispatcher(
-        repository=repo,
+        repository=repos.outbox,
         auth_gateway=auth_gateway,
         notifications_gateway=notifications_gateway,
         max_attempts=settings.worker.billing_outbox_max_attempts,
     )
     reconciler = PaymentReconciler(
-        repository=repo,
+        payments=repos.payments,
+        refunds=repos.refunds,
         payment_providers=payment_providers,
         public_base_url=str(settings.worker.billing_public_base_url),
         outbox_dispatcher=outbox_dispatcher,
     )
     monitor = OperationalMonitor(
-        repository=repo,
+        repository=repos.metrics,
         stuck_threshold_seconds=settings.worker.billing_stuck_threshold_seconds,
     )
 

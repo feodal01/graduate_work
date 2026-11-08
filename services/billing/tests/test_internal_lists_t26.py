@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from core.config import settings
-from dependencies import get_purchase_repository, get_service_credentials
+from dependencies import get_repositories, get_service_credentials
 from main import create_app
 from security.service_credentials import ServiceCredentials
 from tests.fakes import (
@@ -13,6 +13,7 @@ from tests.fakes import (
     FakeRefundRow,
     FakeSubscriptionRow,
     InMemoryPurchaseRepository,
+    in_memory_repositories,
 )
 
 SERVICE_KEY = 'billing-internal-admin-service-key-long-enough'
@@ -232,7 +233,7 @@ async def test_internal_lists_require_service_api_key_step(
     """T-26 (BIL-NFR-SEC-03, NFR-SEC-01): проверка сервисного ключа."""
     repo = InMemoryPurchaseRepository()
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_purchase_repository] = lambda: repo
+    app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(repo)
     app.dependency_overrides[get_service_credentials] = lambda: ServiceCredentials(
         SERVICE_KEY
     )
@@ -264,7 +265,7 @@ async def test_internal_subscriptions_filters_and_unhappy_paths() -> None:
     ids = _seed_subscriptions_and_payments(repo, now_utc)
 
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_purchase_repository] = lambda: repo
+    app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(repo)
     app.dependency_overrides[get_service_credentials] = lambda: ServiceCredentials(
         SERVICE_KEY
     )
@@ -394,7 +395,7 @@ async def test_internal_payments_filters_stuck_and_unhappy_paths(
     ids = _seed_subscriptions_and_payments(repo, now_utc)
 
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_purchase_repository] = lambda: repo
+    app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(repo)
     app.dependency_overrides[get_service_credentials] = lambda: ServiceCredentials(
         SERVICE_KEY
     )

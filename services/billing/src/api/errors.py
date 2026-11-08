@@ -10,6 +10,12 @@ from starlette.types import ExceptionHandler
 
 from api.templates import render_error_page
 from db.sql.errors import DatabaseUnavailableError
+from domain.errors import (
+    BillingError,
+    DependencyUnavailableError,
+    EntityNotFoundError,
+    RuleConflictError,
+)
 
 
 class BillingDomainError(Exception):
@@ -103,6 +109,31 @@ async def domain_error_handler(
     return error_response(exc.status_code, exc.error_code, exc.detail)
 
 
+def http_status_for_rule_error(exc: BillingError) -> int:
+    """HTTP-статус для доменной ошибки: решает слой API, а не репозиторий."""
+    if isinstance(exc, EntityNotFoundError):
+        return status.HTTP_404_NOT_FOUND
+    if isinstance(exc, RuleConflictError):
+        return status.HTTP_409_CONFLICT
+    if isinstance(exc, DependencyUnavailableError):
+        return status.HTTP_503_SERVICE_UNAVAILABLE
+    return status.HTTP_400_BAD_REQUEST
+
+
+async def rule_error_handler(
+    request: Request,
+    exc: BillingError,
+) -> Response:
+    return await domain_error_handler(
+        request,
+        BillingDomainError(
+            exc.detail,
+            error_code=exc.error_code,
+            status_code=http_status_for_rule_error(exc),
+        ),
+    )
+
+
 async def database_unavailable_handler(
     request: Request,
     exc: DatabaseUnavailableError,
@@ -167,6 +198,7 @@ async def ui_error_screen_handler(
 
 def register_exception_handlers(app: FastAPI) -> None:
     _register_handler(app, BillingDomainError, domain_error_handler)
+    _register_handler(app, BillingError, rule_error_handler)
     _register_handler(app, DatabaseUnavailableError, database_unavailable_handler)
     _register_handler(app, RequestValidationError, validation_error_handler)
     _register_handler(app, UILoginRedirectError, ui_login_redirect_handler)

@@ -435,20 +435,20 @@ async def test_sqlalchemy_purchase_repository_concurrent_and_blocking_rules(
     migrated_billing_db: async_sessionmaker[AsyncSession],
 ) -> None:
     """T-10: проверка SQLAlchemyPurchaseRepository на реальном PostgreSQL."""
-    from repositories.purchase import SQLAlchemyPurchaseRepository
+    from repositories.bundle import BillingRepositories
 
     session_factory = migrated_billing_db
-    repo = SQLAlchemyPurchaseRepository(session_factory)
+    repos = BillingRepositories.sqlalchemy(session_factory)
     user_id = uuid4()
 
     # 1. Изначально покупка разрешена
-    allowed, code = await repo.check_purchase_allowed(user_id)
+    allowed, code = await repos.payments.check_purchase_allowed(user_id)
     assert allowed is True and code is None
 
     # 2. Два конкурентных вызова возвращают один и тот же pending-платёж
     res_a, res_b = await asyncio.gather(
-        repo.get_or_create_pending_payment(user_id),
-        repo.get_or_create_pending_payment(user_id),
+        repos.payments.get_or_create_pending_payment(user_id),
+        repos.payments.get_or_create_pending_payment(user_id),
     )
     pay_a, is_new_a = res_a
     pay_b, is_new_b = res_b
@@ -457,7 +457,7 @@ async def test_sqlalchemy_purchase_repository_concurrent_and_blocking_rules(
     assert pay_a.last_checked_at is None
 
     # 3. save_provider_payment_created не ставит last_checked_at
-    updated = await repo.save_provider_payment_created(
+    updated = await repos.payments.save_provider_payment_created(
         pay_a.id,
         provider_payment_id='yk-pg-1',
         confirmation_url='https://yoomoney.ru/checkout/1',
@@ -466,7 +466,7 @@ async def test_sqlalchemy_purchase_repository_concurrent_and_blocking_rules(
     assert updated.provider_payment_id == 'yk-pg-1'
     assert updated.last_checked_at is None
 
-    checked = await repo.record_payment_checked(
+    checked = await repos.payments.record_payment_checked(
         pay_a.id,
         confirmation_url='https://yoomoney.ru/checkout/1',
         provider_details={'id': 'yk-pg-1', 'status': 'pending'},
@@ -475,12 +475,12 @@ async def test_sqlalchemy_purchase_repository_concurrent_and_blocking_rules(
 
     # 4. Два параллельных finalize_payment_failed пишут ровно одно событие
     await asyncio.gather(
-        repo.finalize_payment_failed(
+        repos.payments.finalize_payment_failed(
             pay_a.id,
             failure_reason='canceled_by_provider',
             source='continue',
         ),
-        repo.finalize_payment_failed(
+        repos.payments.finalize_payment_failed(
             pay_a.id,
             failure_reason='canceled_by_provider',
             source='continue',
@@ -543,16 +543,15 @@ async def test_sqlalchemy_purchase_repository_concurrent_and_blocking_rules(
         )
         await session.commit()
 
-    allowed_sub, code_sub = await repo.check_purchase_allowed(user_id)
+    allowed_sub, code_sub = await repos.payments.check_purchase_allowed(user_id)
     assert allowed_sub is False
     assert code_sub == 'subscription_already_active'
 
     # И внутри транзакции get_or_create_pending_payment под lock выбрасывается 409
-    from api.errors import BillingDomainError
+    from domain.errors import RuleConflictError
 
-    with pytest.raises(BillingDomainError) as exc_info:
-        await repo.get_or_create_pending_payment(user_id)
-    assert exc_info.value.status_code == 409
+    with pytest.raises(RuleConflictError) as exc_info:
+        await repos.payments.get_or_create_pending_payment(user_id)
     assert exc_info.value.error_code == 'subscription_already_active'
 
 
@@ -561,16 +560,16 @@ async def test_t11_atomic_reconciliation_succeeded_failed_and_concurrent_race(
 ) -> None:
     """T-11 (BIL-FR-04, BIL-FR-08, BIL-FR-13, инв. 6, 7, 11): фиксация в БД."""
     from domain.subscription import SubscriptionState, compute_subscription_state
-    from repositories.purchase import SQLAlchemyPurchaseRepository
+    from repositories.bundle import BillingRepositories
 
     session_factory = migrated_billing_db
-    repo = SQLAlchemyPurchaseRepository(session_factory)
+    repos = BillingRepositories.sqlalchemy(session_factory)
     user_id = uuid4()
 
     # 1. Создаём pending-платёж и сохраняем provider_payment_id
-    payment, is_new = await repo.get_or_create_pending_payment(user_id)
+    payment, is_new = await repos.payments.get_or_create_pending_payment(user_id)
     assert is_new is True
-    await repo.save_provider_payment_created(
+    await repos.payments.save_provider_payment_created(
         payment.id,
         provider_payment_id='yk-race-succeeded-1',
         confirmation_url='https://yoomoney.ru/checkout/race-1',
@@ -579,25 +578,25 @@ async def test_t11_atomic_reconciliation_succeeded_failed_and_concurrent_race(
 
     # 2. Запускаем 4 параллельных процесса фиксации оплаты
     results = await asyncio.gather(
-        repo.finalize_payment_succeeded(
+        repos.payments.finalize_payment_succeeded(
             payment.id,
             source='webhook',
             provider_details={'id': 'yk-race-succeeded-1', 'status': 'succeeded'},
             public_base_url='http://localhost',
         ),
-        repo.finalize_payment_succeeded(
+        repos.payments.finalize_payment_succeeded(
             payment.id,
             source='reconcile',
             provider_details={'id': 'yk-race-succeeded-1', 'status': 'succeeded'},
             public_base_url='http://localhost',
         ),
-        repo.finalize_payment_succeeded(
+        repos.payments.finalize_payment_succeeded(
             payment.id,
             source='continue',
             provider_details={'id': 'yk-race-succeeded-1', 'status': 'succeeded'},
             public_base_url='http://localhost',
         ),
-        repo.finalize_payment_succeeded(
+        repos.payments.finalize_payment_succeeded(
             payment.id,
             source='admin',
             provider_details={'id': 'yk-race-succeeded-1', 'status': 'succeeded'},
@@ -665,7 +664,7 @@ async def test_t11_atomic_reconciliation_succeeded_failed_and_concurrent_race(
         assert len(succeeded_events) == 1
 
     # 4. Попытка перевести уже оплаченный платёж в failed игнорируется (инвариант 7 и 8)
-    after_fail, failed_transitioned = await repo.finalize_payment_failed(
+    after_fail, failed_transitioned = await repos.payments.finalize_payment_failed(
         payment.id,
         failure_reason='late_cancel',
         source='reconcile',
@@ -675,14 +674,14 @@ async def test_t11_atomic_reconciliation_succeeded_failed_and_concurrent_race(
 
     # 5. Проверяем атомарную фиксацию неуспешной оплаты (failed + письмо отказа)
     user_2 = uuid4()
-    pay_2, _ = await repo.get_or_create_pending_payment(user_2)
+    pay_2, _ = await repos.payments.get_or_create_pending_payment(user_2)
     res_fail_1, res_fail_2 = await asyncio.gather(
-        repo.finalize_payment_failed(
+        repos.payments.finalize_payment_failed(
             pay_2.id,
             failure_reason='insufficient_funds',
             source='webhook',
         ),
-        repo.finalize_payment_failed(
+        repos.payments.finalize_payment_failed(
             pay_2.id,
             failure_reason='insufficient_funds',
             source='reconcile',
@@ -706,20 +705,20 @@ async def test_t12_t13_t16_and_t17_repository_queries_and_skip_locked(
     migrated_billing_db: async_sessionmaker[AsyncSession],
 ) -> None:
     """T-12, T-13, T-16, T-17: локальный результат и SKIP LOCKED в PostgreSQL."""
-    from repositories.purchase import (
-        DeliveryOutcome,
-        OutboxTaskRecordProtocol,
-        SQLAlchemyPurchaseRepository,
-    )
+    from repositories.bundle import BillingRepositories
+    from repositories.outbox import DeliveryOutcome
+    from repositories.records import OutboxTaskRecordProtocol
 
     session_factory = migrated_billing_db
-    repo = SQLAlchemyPurchaseRepository(session_factory)
+    repos = BillingRepositories.sqlalchemy(session_factory)
     user_id = uuid4()
-    payment, _ = await repo.get_or_create_pending_payment(user_id)
-    await repo.finalize_payment_succeeded(payment.id, source='webhook')
+    payment, _ = await repos.payments.get_or_create_pending_payment(user_id)
+    await repos.payments.finalize_payment_succeeded(payment.id, source='webhook')
 
     # 1. T-12: проверяем get_local_payment_result_for_user
-    local_own = await repo.get_local_payment_result_for_user(payment.id, user_id)
+    local_own = await repos.user_views.get_local_payment_result_for_user(
+        payment.id, user_id
+    )
     assert local_own is not None
     assert local_own.status == 'succeeded'
     assert local_own.subscription_ends_at is not None
@@ -737,24 +736,28 @@ async def test_t12_t13_t16_and_t17_repository_queries_and_skip_locked(
         task_row.status = 'completed'
         await session.commit()
 
-    local_delivered = await repo.get_local_payment_result_for_user(payment.id, user_id)
+    local_delivered = await repos.user_views.get_local_payment_result_for_user(
+        payment.id, user_id
+    )
     assert local_delivered is not None
     assert local_delivered.auth_access_delivered is True
 
     # Чужой пользователь получает None (защита BIL-NFR-SEC-03)
-    local_foreign = await repo.get_local_payment_result_for_user(payment.id, uuid4())
+    local_foreign = await repos.user_views.get_local_payment_result_for_user(
+        payment.id, uuid4()
+    )
     assert local_foreign is None
 
     # 2. T-13: проверяем get_payment_for_user для своего и чужого пользователя
-    own_pay = await repo.get_payment_for_user(payment.id, user_id)
+    own_pay = await repos.payments.get_payment_for_user(payment.id, user_id)
     assert own_pay is not None and own_pay.id == payment.id
-    foreign_pay = await repo.get_payment_for_user(payment.id, uuid4())
+    foreign_pay = await repos.payments.get_payment_for_user(payment.id, uuid4())
     assert foreign_pay is None
 
     # 3. T-16: проверяем FOR UPDATE SKIP LOCKED в process_due_auth_outbox_tasks
     user_3 = uuid4()
-    pay_3, _ = await repo.get_or_create_pending_payment(user_3)
-    await repo.finalize_payment_succeeded(pay_3.id, source='webhook')
+    pay_3, _ = await repos.payments.get_or_create_pending_payment(user_3)
+    await repos.payments.finalize_payment_succeeded(pay_3.id, source='webhook')
 
     delivered_calls: list[int] = []
 
@@ -766,13 +769,15 @@ async def test_t12_t13_t16_and_t17_repository_queries_and_skip_locked(
 
     # Два параллельных воркера обрабатывают одну задачу без дублей благодаря SKIP LOCKED
     c1, c2 = await asyncio.gather(
-        repo.process_due_auth_outbox_tasks(deliver_ok, payment_id=pay_3.id),
-        repo.process_due_auth_outbox_tasks(deliver_ok, payment_id=pay_3.id),
+        repos.outbox.process_due_auth_outbox_tasks(deliver_ok, payment_id=pay_3.id),
+        repos.outbox.process_due_auth_outbox_tasks(deliver_ok, payment_id=pay_3.id),
     )
     assert c1 + c2 == 1
     assert delivered_calls == [1]
 
-    local_after = await repo.get_local_payment_result_for_user(pay_3.id, user_3)
+    local_after = await repos.user_views.get_local_payment_result_for_user(
+        pay_3.id, user_3
+    )
     assert local_after is not None and local_after.auth_access_delivered is True
 
     # 4. T-17: проверяем list_due_pending_payments с отступом min_age_seconds
@@ -818,7 +823,7 @@ async def test_t12_t13_t16_and_t17_repository_queries_and_skip_locked(
         )
         await session.commit()
 
-    due_rows = await repo.list_due_pending_payments(
+    due_rows = await repos.payments.list_due_pending_payments(
         min_age_seconds=5.0,
         throttle_seconds=5.0,
         limit=10,
@@ -831,20 +836,24 @@ async def test_t12_t13_t16_and_t17_repository_queries_and_skip_locked(
     # Два параллельных воркера через claim_next_due_pending_payment (SKIP LOCKED)
     # захватывают mature_pay_id ровно один раз без дублей (BIL-NFR-S-01)
     claimed_1, claimed_2 = await asyncio.gather(
-        repo.claim_next_due_pending_payment(min_age_seconds=5.0, throttle_seconds=5.0),
-        repo.claim_next_due_pending_payment(min_age_seconds=5.0, throttle_seconds=5.0),
+        repos.payments.claim_next_due_pending_payment(
+            min_age_seconds=5.0, throttle_seconds=5.0
+        ),
+        repos.payments.claim_next_due_pending_payment(
+            min_age_seconds=5.0, throttle_seconds=5.0
+        ),
     )
     claimed_ids = [c.id for c in (claimed_1, claimed_2) if c is not None]
     assert claimed_ids == [mature_pay_id]
 
     # Проверяем record_payment_reconcile_error с экспоненциальным backoff
-    err_1 = await repo.record_payment_reconcile_error(
+    err_1 = await repos.payments.record_payment_reconcile_error(
         mature_pay_id,
         error_message='YooKassa timeout #1',
     )
     assert err_1.provider_details is not None
     assert err_1.provider_details['_reconcile_errors'] == 1
-    err_2 = await repo.record_payment_reconcile_error(
+    err_2 = await repos.payments.record_payment_reconcile_error(
         mature_pay_id,
         error_message='YooKassa timeout #2',
     )
@@ -858,17 +867,15 @@ async def test_t19_outbox_worker_skip_locked_backoff_intervention_and_stale_vers
     migrated_billing_db: async_sessionmaker[AsyncSession],
 ) -> None:
     """T-19 (BIL-FR-11, BIL-FR-14, BIL-NFR-R-04, BIL-NFR-S-01): воркер outbox в БД."""
-    from repositories.purchase import (
-        DeliveryOutcome,
-        OutboxTaskRecordProtocol,
-        SQLAlchemyPurchaseRepository,
-    )
+    from repositories.bundle import BillingRepositories
+    from repositories.outbox import DeliveryOutcome
+    from repositories.records import OutboxTaskRecordProtocol
 
     session_factory = migrated_billing_db
-    repo = SQLAlchemyPurchaseRepository(session_factory)
+    repos = BillingRepositories.sqlalchemy(session_factory)
     user_id = uuid4()
-    pay_1, _ = await repo.get_or_create_pending_payment(user_id)
-    await repo.finalize_payment_succeeded(pay_1.id, source='webhook')
+    pay_1, _ = await repos.payments.get_or_create_pending_payment(user_id)
+    await repos.payments.finalize_payment_succeeded(pay_1.id, source='webhook')
 
     # 1. Проверяем SKIP LOCKED сразу по двум target_service ('auth', 'notifications')
     delivered_keys: list[str] = []
@@ -881,12 +888,12 @@ async def test_t19_outbox_worker_skip_locked_backoff_intervention_and_stale_vers
         return 'completed', None
 
     w1, w2 = await asyncio.gather(
-        repo.process_due_outbox_tasks(
+        repos.outbox.process_due_outbox_tasks(
             deliver_all_ok,
             target_services=('auth', 'notifications'),
             payment_id=pay_1.id,
         ),
-        repo.process_due_outbox_tasks(
+        repos.outbox.process_due_outbox_tasks(
             deliver_all_ok,
             target_services=('auth', 'notifications'),
             payment_id=pay_1.id,
@@ -944,7 +951,7 @@ async def test_t19_outbox_worker_skip_locked_backoff_intervention_and_stale_vers
         called_for_stale += 1
         return 'completed', None
 
-    processed_stale = await repo.process_due_outbox_tasks(
+    processed_stale = await repos.outbox.process_due_outbox_tasks(
         should_not_be_called,
         task_id=stale_task_id,
     )
@@ -981,7 +988,7 @@ async def test_t19_outbox_worker_skip_locked_backoff_intervention_and_stale_vers
     ) -> tuple[DeliveryOutcome, str | None]:
         return 'transient_error', 'Notifications 503 Service Unavailable'
 
-    await repo.process_due_outbox_tasks(
+    await repos.outbox.process_due_outbox_tasks(
         deliver_transient_fail,
         task_id=flaky_task_id,
         max_attempts=2,
@@ -996,7 +1003,7 @@ async def test_t19_outbox_worker_skip_locked_backoff_intervention_and_stale_vers
         row_after_1.next_retry_at = datetime.now(UTC) - timedelta(seconds=1)
         await session.commit()
 
-    await repo.process_due_outbox_tasks(
+    await repos.outbox.process_due_outbox_tasks(
         deliver_transient_fail,
         task_id=flaky_task_id,
         max_attempts=2,
@@ -1013,34 +1020,34 @@ async def test_t23_get_user_billing_overview_in_real_postgres(
     migrated_billing_db: async_sessionmaker[AsyncSession],
 ) -> None:
     """T-23 (BIL-FR-09, BIL-API-02): get_user_billing_overview в PostgreSQL."""
-    from repositories.purchase import SQLAlchemyPurchaseRepository
+    from repositories.bundle import BillingRepositories
 
     session_factory = migrated_billing_db
-    repo = SQLAlchemyPurchaseRepository(session_factory)
+    repos = BillingRepositories.sqlalchemy(session_factory)
     user_id = uuid4()
     other_user_id = uuid4()
 
     # 1. Пустой пользователь -> нет подписки, пустая история
-    empty_ov = await repo.get_user_billing_overview(user_id)
+    empty_ov = await repos.user_views.get_user_billing_overview(user_id)
     assert empty_ov.pending_payment_id is None
     assert empty_ov.latest_subscription_ends_at is None
     assert empty_ov.payments == []
 
     # 2. Чужой платёж не попадает в выборку
-    other_pay, _ = await repo.get_or_create_pending_payment(other_user_id)
-    await repo.finalize_payment_succeeded(other_pay.id, source='webhook')
+    other_pay, _ = await repos.payments.get_or_create_pending_payment(other_user_id)
+    await repos.payments.finalize_payment_succeeded(other_pay.id, source='webhook')
 
     # 3. Неуспешный платёж, затем успешный платёж с подпиской и возвратом в обработке
-    pay_fail, _ = await repo.get_or_create_pending_payment(user_id)
-    await repo.finalize_payment_failed(
+    pay_fail, _ = await repos.payments.get_or_create_pending_payment(user_id)
+    await repos.payments.finalize_payment_failed(
         pay_fail.id,
         failure_reason='insufficient_funds',
         source='webhook',
     )
-    pay_ok, _ = await repo.get_or_create_pending_payment(user_id)
-    await repo.finalize_payment_succeeded(pay_ok.id, source='webhook')
+    pay_ok, _ = await repos.payments.get_or_create_pending_payment(user_id)
+    await repos.payments.finalize_payment_succeeded(pay_ok.id, source='webhook')
 
-    ov_activating = await repo.get_user_billing_overview(user_id)
+    ov_activating = await repos.user_views.get_user_billing_overview(user_id)
     assert ov_activating.pending_payment_id is None
     assert ov_activating.latest_subscription_ends_at is not None
     assert ov_activating.latest_subscription_auth_delivered is False
@@ -1078,7 +1085,7 @@ async def test_t23_get_user_billing_overview_in_real_postgres(
         )
         await session.commit()
 
-    ov_active_ref = await repo.get_user_billing_overview(user_id)
+    ov_active_ref = await repos.user_views.get_user_billing_overview(user_id)
     assert ov_active_ref.latest_subscription_auth_delivered is True
     assert ov_active_ref.latest_subscription_has_processing_refund is True
     assert ov_active_ref.latest_subscription_has_succeeded_refund is False
@@ -1091,7 +1098,7 @@ async def test_t23_get_user_billing_overview_in_real_postgres(
         ref_row.status = 'succeeded'
         await session.commit()
 
-    ov_refunded = await repo.get_user_billing_overview(user_id)
+    ov_refunded = await repos.user_views.get_user_billing_overview(user_id)
     assert ov_refunded.latest_subscription_has_succeeded_refund is True
     assert ov_refunded.latest_subscription_has_processing_refund is False
     assert ov_refunded.payments[0].refund_status == 'succeeded'
@@ -1101,14 +1108,14 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
     migrated_billing_db: async_sessionmaker[AsyncSession],
 ) -> None:
     """T-26 (BIL-API-06, BIL-API-07): списки подписок и платежей в PostgreSQL."""
-    from repositories.purchase import (
+    from repositories.bundle import BillingRepositories
+    from repositories.read_models import (
         InternalPaymentFilter,
         InternalSubscriptionFilter,
-        SQLAlchemyPurchaseRepository,
     )
 
     session_factory = migrated_billing_db
-    repo = SQLAlchemyPurchaseRepository(session_factory)
+    repos = BillingRepositories.sqlalchemy(session_factory)
     now_utc = datetime.now(UTC)
 
     user_active = uuid4()
@@ -1116,18 +1123,18 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
     user_stuck = uuid4()
 
     # 1. Активная подписка
-    pay_active, _ = await repo.get_or_create_pending_payment(user_active)
-    await repo.save_provider_payment_created(
+    pay_active, _ = await repos.payments.get_or_create_pending_payment(user_active)
+    await repos.payments.save_provider_payment_created(
         pay_active.id,
         provider_payment_id='yk_t26_pg_active',
         confirmation_url='https://yookassa.test/confirm/1',
         provider_details={'id': 'yk_t26_pg_active'},
     )
-    await repo.finalize_payment_succeeded(pay_active.id, source='webhook')
+    await repos.payments.finalize_payment_succeeded(pay_active.id, source='webhook')
 
     # 2. Возвращённая подписка
-    pay_ref, _ = await repo.get_or_create_pending_payment(user_refunded)
-    await repo.finalize_payment_succeeded(pay_ref.id, source='webhook')
+    pay_ref, _ = await repos.payments.get_or_create_pending_payment(user_refunded)
+    await repos.payments.finalize_payment_succeeded(pay_ref.id, source='webhook')
     async with session_factory() as session:
         sub_ref = await session.scalar(
             select(Subscription).where(Subscription.payment_id == pay_ref.id)
@@ -1166,7 +1173,10 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
         await session.commit()
 
     # Проверяем фильтрацию подписок по user_id и вычисленному статусу
-    sub_total_act, sub_items_act = await repo.list_internal_subscriptions(
+    (
+        sub_total_act,
+        sub_items_act,
+    ) = await repos.admin_queries.list_internal_subscriptions(
         InternalSubscriptionFilter(user_id=user_active, status='active'),
         now_utc=now_utc,
     )
@@ -1174,7 +1184,10 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
     assert sub_items_act[0].payment_id == pay_active.id
     assert sub_items_act[0].status == 'active'
 
-    sub_total_ref, sub_items_ref = await repo.list_internal_subscriptions(
+    (
+        sub_total_ref,
+        sub_items_ref,
+    ) = await repos.admin_queries.list_internal_subscriptions(
         InternalSubscriptionFilter(user_id=user_refunded, status='refunded'),
         now_utc=now_utc,
     )
@@ -1183,7 +1196,7 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
     assert sub_items_ref[0].status == 'refunded'
 
     # Проверяем фильтрацию платежей (по provider_payment_id, has_refund и stuck=True)
-    pay_total_prov, pay_items_prov = await repo.list_internal_payments(
+    pay_total_prov, pay_items_prov = await repos.admin_queries.list_internal_payments(
         InternalPaymentFilter(provider_payment_id='yk_t26_pg_active'),
         now_utc=now_utc,
     )
@@ -1191,7 +1204,7 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
     assert pay_items_prov[0].id == pay_active.id
     assert pay_items_prov[0].has_refund is False
 
-    pay_total_ref, pay_items_ref = await repo.list_internal_payments(
+    pay_total_ref, pay_items_ref = await repos.admin_queries.list_internal_payments(
         InternalPaymentFilter(user_id=user_refunded, has_refund=True),
         now_utc=now_utc,
     )
@@ -1199,7 +1212,7 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
     assert pay_items_ref[0].id == pay_ref.id
     assert pay_items_ref[0].refund_status == 'succeeded'
 
-    pay_total_stuck, pay_items_stuck = await repo.list_internal_payments(
+    pay_total_stuck, pay_items_stuck = await repos.admin_queries.list_internal_payments(
         InternalPaymentFilter(user_id=user_stuck, stuck=True),
         stuck_threshold_seconds=600,
         now_utc=now_utc,
@@ -1209,7 +1222,9 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
     assert pay_items_stuck[0].is_stuck is True
 
     # T-28 (BIL-API-08): полная карточка платежа в PostgreSQL
-    card_act = await repo.get_internal_payment_card(pay_active.id, now_utc=now_utc)
+    card_act = await repos.admin_queries.get_internal_payment_card(
+        pay_active.id, now_utc=now_utc
+    )
     assert card_act is not None
     assert card_act.id == pay_active.id
     assert card_act.can_refund is True
@@ -1218,7 +1233,9 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
     assert len(card_act.operation_events) >= 2
     assert len(card_act.outbox_tasks) == 3
 
-    card_ref = await repo.get_internal_payment_card(pay_ref.id, now_utc=now_utc)
+    card_ref = await repos.admin_queries.get_internal_payment_card(
+        pay_ref.id, now_utc=now_utc
+    )
     assert card_ref is not None
     assert card_ref.can_refund is False
     assert card_ref.subscription is not None
@@ -1226,38 +1243,41 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
     assert len(card_ref.refunds) == 1
     assert card_ref.refunds[0].status == 'succeeded'
 
-    assert await repo.get_internal_payment_card(uuid4(), now_utc=now_utc) is None
+    assert (
+        await repos.admin_queries.get_internal_payment_card(uuid4(), now_utc=now_utc)
+        is None
+    )
 
 
 async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
     migrated_billing_db: async_sessionmaker[AsyncSession],
 ) -> None:
     """T-29 (BIL-FR-10, BIL-NFR-R-02..03, инв. 4, 5, 7, 9, 11): возврат в БД."""
-    from api.errors import BillingDomainError
-    from repositories.purchase import SQLAlchemyPurchaseRepository
+    from domain.errors import EntityNotFoundError, RuleConflictError
+    from repositories.bundle import BillingRepositories
 
     session_factory = migrated_billing_db
-    repo = SQLAlchemyPurchaseRepository(session_factory)
+    repos = BillingRepositories.sqlalchemy(session_factory)
     user_id = uuid4()
     admin_id = uuid4()
 
-    payment, _ = await repo.get_or_create_pending_payment(user_id)
-    await repo.save_provider_payment_created(
+    payment, _ = await repos.payments.get_or_create_pending_payment(user_id)
+    await repos.payments.save_provider_payment_created(
         payment.id,
         provider_payment_id='yk_t29_pg_pay',
         confirmation_url='https://yookassa.test/confirm',
         provider_details={'id': 'yk_t29_pg_pay'},
     )
-    await repo.finalize_payment_succeeded(payment.id, source='webhook')
+    await repos.payments.finalize_payment_succeeded(payment.id, source='webhook')
 
     # 1. Две параллельные попытки создать возврат дают 1 возврат processing (инв. 4)
     res_1, res_2 = await asyncio.gather(
-        repo.get_or_create_processing_refund(
+        repos.refunds.get_or_create_processing_refund(
             payment.id,
             admin_user_id=admin_id,
             reason='Первая попытка возврата',
         ),
-        repo.get_or_create_processing_refund(
+        repos.refunds.get_or_create_processing_refund(
             payment.id,
             admin_user_id=admin_id,
             reason='Первая попытка возврата',
@@ -1268,12 +1288,12 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
     ref_1 = res_1[0]
 
     # 2. Первая попытка отменяется (rejected), после чего разрешена новая (инв. 4)
-    await repo.finalize_refund_rejected(
+    await repos.refunds.finalize_refund_rejected(
         ref_1.id,
         rejection_reason='rejected_by_provider',
         source='reconcile',
     )
-    ref_2, created_2 = await repo.get_or_create_processing_refund(
+    ref_2, created_2 = await repos.refunds.get_or_create_processing_refund(
         payment.id,
         admin_user_id=admin_id,
         reason='Вторая попытка возврата',
@@ -1282,14 +1302,14 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
     assert ref_2.id != ref_1.id
 
     # 3. Атомарная фиксация succeeded при гонке двух процессов (инв. 7)
-    await repo.save_provider_refund_created(
+    await repos.refunds.save_provider_refund_created(
         ref_2.id,
         provider_refund_id='yk_t29_pg_ref_2',
         provider_details={'id': 'yk_t29_pg_ref_2'},
     )
     fin_1, fin_2 = await asyncio.gather(
-        repo.finalize_refund_succeeded(ref_2.id, source='admin'),
-        repo.finalize_refund_succeeded(ref_2.id, source='webhook'),
+        repos.refunds.finalize_refund_succeeded(ref_2.id, source='admin'),
+        repos.refunds.finalize_refund_succeeded(ref_2.id, source='webhook'),
     )
     assert {fin_1[1], fin_2[1]} == {True, False}
 
@@ -1315,25 +1335,24 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
 
     # 4. Повторный возврат после succeeded запрещён с 409 (инв. 4, 5),
     #    а для несуществующего payment_id возвращается 404 payment_not_found
-    with pytest.raises(BillingDomainError) as exc_info:
-        await repo.get_or_create_processing_refund(
+    with pytest.raises(RuleConflictError) as exc_info:
+        await repos.refunds.get_or_create_processing_refund(
             payment.id,
             admin_user_id=admin_id,
             reason='Третья попытка',
         )
-    assert exc_info.value.status_code == 409
 
-    with pytest.raises(BillingDomainError) as not_found_exc:
-        await repo.get_or_create_processing_refund(
+    assert exc_info.value.error_code == 'refund_already_succeeded'
+    with pytest.raises(EntityNotFoundError) as not_found_exc:
+        await repos.refunds.get_or_create_processing_refund(
             uuid4(),
             admin_user_id=admin_id,
             reason='Неизвестный платёж',
         )
-    assert not_found_exc.value.status_code == 404
     assert not_found_exc.value.error_code == 'payment_not_found'
 
     # 5. T-31 (BIL-API-11): выборка проблемных задач outbox в PostgreSQL
-    from repositories.purchase import InternalOutboxFilter
+    from repositories.read_models import InternalOutboxFilter
 
     now_utc = datetime.now(UTC)
     intervene_task_id = uuid4()
@@ -1391,7 +1410,7 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
         )
         await session.commit()
 
-    ob_total, ob_items = await repo.list_internal_outbox_tasks(
+    ob_total, ob_items = await repos.outbox_admin.list_internal_outbox_tasks(
         InternalOutboxFilter(user_id=user_id),
         stuck_threshold_seconds=600,
         now_utc=now_utc,
@@ -1400,7 +1419,7 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
     assert [t.id for t in ob_items] == [intervene_task_id, old_pending_task_id]
 
     # 6. T-32 (BIL-API-12, BIL-API-13): retry и close задач outbox в PostgreSQL
-    retried_item = await repo.retry_outbox_task_by_admin(
+    retried_item = await repos.outbox_admin.retry_outbox_task_by_admin(
         intervene_task_id,
         admin_user_id=admin_id,
         reason='Повторная отправка',
@@ -1416,7 +1435,7 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
         t_row.status = 'requires_intervention'
         await session.commit()
 
-    closed_item = await repo.close_outbox_task_by_admin(
+    closed_item = await repos.outbox_admin.close_outbox_task_by_admin(
         intervene_task_id,
         admin_user_id=admin_id,
         reason='Закрыто в PG тесте T-32',
@@ -1424,19 +1443,19 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
     )
     assert closed_item.status == 'closed'
 
-    with pytest.raises(BillingDomainError) as close_409:
-        await repo.close_outbox_task_by_admin(
+    with pytest.raises(RuleConflictError) as close_409:
+        await repos.outbox_admin.close_outbox_task_by_admin(
             old_pending_task_id,
             admin_user_id=admin_id,
             reason='Pending не закрывается напрямую',
             now_utc=now_utc,
         )
-    assert close_409.value.status_code == 409
 
+    assert close_409.value.error_code == 'outbox_task_not_requires_intervention'
     # 7. T-33 (BIL-API-14): журнал действий администраторов в PostgreSQL
-    from repositories.purchase import InternalAdminActionFilter
+    from repositories.read_models import InternalAdminActionFilter
 
-    act_total, act_items = await repo.list_internal_admin_actions(
+    act_total, act_items = await repos.admin_queries.list_internal_admin_actions(
         InternalAdminActionFilter(admin_user_id=admin_id)
     )
     assert act_total == 4
@@ -1484,7 +1503,7 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
         )
         await session.commit()
 
-    metrics_snap = await repo.get_operational_metrics(
+    metrics_snap = await repos.metrics.get_operational_metrics(
         stuck_threshold_seconds=600,
         now_utc=now_utc,
     )

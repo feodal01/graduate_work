@@ -9,18 +9,22 @@ from api.errors import BillingDomainError
 from clients.payment_provider import PaymentProviderError
 from core.config import settings
 from dependencies import (
+    get_admin_queries,
+    get_metrics_repository,
+    get_outbox_admin_repository,
     get_outbox_dispatcher,
     get_payment_reconciler,
-    get_purchase_repository,
     require_internal_service,
 )
-from repositories.purchase import (
+from repositories.admin_queries import AdminQueries
+from repositories.metrics import OperationalMetricsRepository
+from repositories.outbox import OutboxAdminRepository
+from repositories.read_models import (
     InternalAdminActionFilter,
     InternalOutboxFilter,
     InternalOutboxTaskItemData,
     InternalPaymentFilter,
     InternalSubscriptionFilter,
-    PurchaseRepository,
 )
 from services.outbox_dispatcher import OutboxDispatcher
 from services.reconciler import PaymentReconciler
@@ -253,7 +257,7 @@ def _validate_date_range(
     },
 )
 async def get_internal_subscriptions(
-    repo: Annotated[PurchaseRepository, Depends(get_purchase_repository)],
+    repo: Annotated[AdminQueries, Depends(get_admin_queries)],
     user_id: UUID | None = None,
     status: Literal['active', 'expired', 'refunded'] | None = None,
     created_from: datetime | None = None,
@@ -308,7 +312,7 @@ async def get_internal_subscriptions(
     },
 )
 async def get_internal_payments(
-    repo: Annotated[PurchaseRepository, Depends(get_purchase_repository)],
+    repo: Annotated[AdminQueries, Depends(get_admin_queries)],
     status: Literal['pending', 'succeeded', 'failed'] | None = None,
     has_refund: bool | None = None,
     stuck: bool = False,
@@ -386,7 +390,7 @@ async def get_internal_payments(
 )
 async def get_internal_payment_card(
     payment_id: UUID,
-    repo: Annotated[PurchaseRepository, Depends(get_purchase_repository)],
+    repo: Annotated[AdminQueries, Depends(get_admin_queries)],
 ) -> InternalPaymentCardResponse:
     card = await repo.get_internal_payment_card(payment_id)
     if card is None:
@@ -490,7 +494,7 @@ async def get_internal_payment_card(
     },
 )
 async def get_internal_outbox_tasks(
-    repo: Annotated[PurchaseRepository, Depends(get_purchase_repository)],
+    repo: Annotated[OutboxAdminRepository, Depends(get_outbox_admin_repository)],
     target_service: Literal['auth', 'notifications'] | None = None,
     status: Literal['pending', 'requires_intervention'] | None = None,
     user_id: UUID | None = None,
@@ -620,7 +624,7 @@ def _to_outbox_task_response(
 async def post_internal_outbox_task_retry(
     task_id: UUID,
     payload: RetryOutboxTaskRequest,
-    repo: Annotated[PurchaseRepository, Depends(get_purchase_repository)],
+    repo: Annotated[OutboxAdminRepository, Depends(get_outbox_admin_repository)],
     dispatcher: Annotated[OutboxDispatcher, Depends(get_outbox_dispatcher)],
 ) -> InternalOutboxTaskItemResponse:
     updated = await repo.retry_outbox_task_by_admin(
@@ -647,7 +651,7 @@ async def post_internal_outbox_task_retry(
 async def post_internal_outbox_task_close(
     task_id: UUID,
     payload: CloseOutboxTaskRequest,
-    repo: Annotated[PurchaseRepository, Depends(get_purchase_repository)],
+    repo: Annotated[OutboxAdminRepository, Depends(get_outbox_admin_repository)],
 ) -> InternalOutboxTaskItemResponse:
     closed = await repo.close_outbox_task_by_admin(
         task_id,
@@ -667,7 +671,7 @@ async def post_internal_outbox_task_close(
     },
 )
 async def get_internal_admin_actions(
-    repo: Annotated[PurchaseRepository, Depends(get_purchase_repository)],
+    repo: Annotated[AdminQueries, Depends(get_admin_queries)],
     admin_user_id: UUID | None = None,
     action_type: Literal['refund_requested', 'outbox_retried', 'outbox_closed']
     | None = None,
@@ -766,7 +770,7 @@ async def post_internal_operation_reconcile(
     },
 )
 async def get_internal_operational_metrics(
-    repo: Annotated[PurchaseRepository, Depends(get_purchase_repository)],
+    repo: Annotated[OperationalMetricsRepository, Depends(get_metrics_repository)],
 ) -> OperationalMetricsResponse:
     snapshot = await repo.get_operational_metrics(
         stuck_threshold_seconds=settings.worker.billing_stuck_threshold_seconds,

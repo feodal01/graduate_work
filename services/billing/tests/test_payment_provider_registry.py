@@ -127,9 +127,16 @@ async def test_new_purchase_goes_to_active_provider_and_records_its_code() -> No
     registry, yookassa, second = _two_providers(active_code='cloudpayments')
     repo = InMemoryPurchaseRepository()
     service = PurchaseService(
-        repository=repo,
+        payments=repo,
+        user_views=repo,
         payment_providers=registry,
         public_base_url='http://localhost',
+        reconciler=PaymentReconciler(
+            payments=repo,
+            refunds=repo,
+            payment_providers=registry,
+            public_base_url='http://localhost',
+        ),
     )
 
     outcome = await service.start_or_continue_purchase(uuid4())
@@ -147,7 +154,9 @@ async def test_existing_payment_reconciles_via_its_own_provider() -> None:
     repo = InMemoryPurchaseRepository()
     payment = _pending_payment('yookassa', 'yk-pay-old')
     repo.payments[payment.id] = payment
-    reconciler = PaymentReconciler(repository=repo, payment_providers=registry)
+    reconciler = PaymentReconciler(
+        payments=repo, refunds=repo, payment_providers=registry
+    )
 
     await reconciler.reconcile_payment(
         payment.id,
@@ -165,7 +174,9 @@ async def test_webhook_lookup_is_scoped_to_provider_code() -> None:
     repo = InMemoryPurchaseRepository()
     payment = _pending_payment('cloudpayments', 'shared-id-1')
     repo.payments[payment.id] = payment
-    reconciler = PaymentReconciler(repository=repo, payment_providers=registry)
+    reconciler = PaymentReconciler(
+        payments=repo, refunds=repo, payment_providers=registry
+    )
 
     # Тот же внешний id, пришедший вебхуком другого провайдера, не находится.
     foreign = await reconciler.reconcile_by_provider_operation_id(
@@ -201,7 +212,9 @@ async def test_refund_goes_to_provider_of_the_paid_payment() -> None:
         ends_at=now_utc + timedelta(days=29),
         created_at=now_utc - timedelta(days=1),
     )
-    reconciler = PaymentReconciler(repository=repo, payment_providers=registry)
+    reconciler = PaymentReconciler(
+        payments=repo, refunds=repo, payment_providers=registry
+    )
 
     outcome = await reconciler.create_or_reconcile_refund(
         payment.id,
@@ -220,7 +233,9 @@ async def test_payment_of_unconfigured_provider_stays_pending() -> None:
     repo = InMemoryPurchaseRepository()
     payment = _pending_payment('legacy', 'legacy-1')
     repo.payments[payment.id] = payment
-    reconciler = PaymentReconciler(repository=repo, payment_providers=registry)
+    reconciler = PaymentReconciler(
+        payments=repo, refunds=repo, payment_providers=registry
+    )
 
     with pytest.raises(UnknownPaymentProviderError):
         await reconciler.reconcile_payment(

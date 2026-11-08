@@ -13,6 +13,7 @@ from dependencies import (
 from domain.subscription import compute_my_subscription_summary
 from main import create_app
 from services.purchase import PurchaseService
+from services.reconciler import PaymentReconciler
 from tests.fakes import (
     ConfigurableAuthGateway,
     FakeOutboxTaskRow,
@@ -31,9 +32,16 @@ def _build_t23_app(
 ) -> FastAPI:
     app = create_app(app_lifespan=None)
     service = PurchaseService(
-        repository=repo,
+        payments=repo,
+        user_views=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
+        reconciler=PaymentReconciler(
+            payments=repo,
+            refunds=repo,
+            payment_providers=PaymentProviderRegistry.single(provider),
+            public_base_url='http://localhost',
+        ),
     )
     app.dependency_overrides[get_purchase_service] = lambda: service
     app.dependency_overrides[get_auth_gateway] = lambda: auth

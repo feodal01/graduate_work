@@ -117,7 +117,8 @@ async def test_reconciler_immediately_dispatches_auth_access() -> None:
         max_attempts=20,
     )
     reconciler = PaymentReconciler(
-        repository=repo,
+        payments=repo,
+        refunds=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
         outbox_dispatcher=dispatcher,
@@ -181,7 +182,8 @@ async def test_immediate_dispatch_handles_auth_outage_and_4xx(
         max_attempts=2,
     )
     reconciler = PaymentReconciler(
-        repository=repo,
+        payments=repo,
+        refunds=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
         outbox_dispatcher=dispatcher,

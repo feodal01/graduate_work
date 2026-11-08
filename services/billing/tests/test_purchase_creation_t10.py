@@ -14,6 +14,7 @@ from clients.payment_provider import (
 from clients.payment_provider_registry import PaymentProviderRegistry
 from dependencies import AuthenticatedUser, get_auth_gateway, get_payment_providers
 from main import create_app
+from services.reconciler import PaymentReconciler
 from tests.fakes import (
     ConfigurableAuthGateway,
     FakeProviderGateway,
@@ -46,9 +47,16 @@ async def purchase_test_env() -> AsyncGenerator[
     repo = InMemoryPurchaseRepository()
     provider = FakeProviderGateway()
     service = PurchaseService(
-        repository=repo,
+        payments=repo,
+        user_views=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
+        reconciler=PaymentReconciler(
+            payments=repo,
+            refunds=repo,
+            payment_providers=PaymentProviderRegistry.single(provider),
+            public_base_url='http://localhost',
+        ),
     )
 
     app = create_app(app_lifespan=None)

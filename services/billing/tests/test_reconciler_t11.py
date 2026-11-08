@@ -157,7 +157,8 @@ async def test_reconciler_succeeded_creates_subscription_version_and_outbox() ->
     )
 
     reconciler = PaymentReconciler(
-        repository=repo,
+        payments=repo,
+        refunds=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
     )
@@ -222,7 +223,8 @@ async def test_reconciler_failed_marks_payment_failed_and_enqueues_failure_email
     )
 
     reconciler = PaymentReconciler(
-        repository=repo,
+        payments=repo,
+        refunds=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
     )
@@ -272,7 +274,8 @@ async def test_reconciler_pending_snapshot_and_lookup_branches() -> None:
     )
 
     reconciler = PaymentReconciler(
-        repository=repo,
+        payments=repo,
+        refunds=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
     )
@@ -342,7 +345,8 @@ async def test_reconciler_throttle_for_continue_and_bypass_for_admin() -> None:
     )
 
     reconciler = PaymentReconciler(
-        repository=repo,
+        payments=repo,
+        refunds=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
     )
@@ -390,7 +394,8 @@ async def test_reconciler_unhappy_provider_errors_never_corrupt_pending_payment(
     provider.error = provider_error
 
     reconciler = PaymentReconciler(
-        repository=repo,
+        payments=repo,
+        refunds=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
     )

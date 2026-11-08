@@ -1,13 +1,13 @@
 from dataclasses import dataclass
 from uuid import UUID
 
-from api.errors import BillingDomainError
 from clients.payment_provider import (
     CreateProviderPaymentRequest,
     PaymentProviderError,
     ProviderPermanentError,
 )
 from clients.payment_provider_registry import PaymentProviderRegistry
+from domain.errors import DependencyUnavailableError, EntityNotFoundError
 from domain.subscription import (
     MySubscriptionActionType,
     MySubscriptionStatusKey,
@@ -19,7 +19,9 @@ from domain.subscription import (
     format_user_datetime,
     humanize_failure_reason,
 )
-from repositories.purchase import PaymentRecordProtocol, PurchaseRepository
+from repositories.payments import PaymentRepository
+from repositories.records import PaymentRecordProtocol
+from repositories.user_views import UserBillingViews
 from services.reconciler import CHECK_THROTTLE_WINDOW, PaymentReconciler
 
 __all__ = [
@@ -84,24 +86,22 @@ class PurchaseService:
     def __init__(
         self,
         *,
-        repository: PurchaseRepository,
+        payments: PaymentRepository,
+        user_views: UserBillingViews,
         payment_providers: PaymentProviderRegistry,
         public_base_url: str,
-        reconciler: PaymentReconciler | None = None,
+        reconciler: PaymentReconciler,
     ) -> None:
-        self._repo = repository
+        self._payments = payments
+        self._views = user_views
         self._providers = payment_providers
         self._public_base_url = public_base_url.rstrip('/')
-        self._reconciler = reconciler or PaymentReconciler(
-            repository=repository,
-            payment_providers=payment_providers,
-            public_base_url=self._public_base_url,
-        )
+        self._reconciler = reconciler
 
     async def start_or_continue_purchase(self, user_id: UUID) -> PurchaseOutcome:
         # Новый платёж закрепляется за активным провайдером из конфигурации;
         # уже созданный продолжает идти через свой provider_code.
-        payment, is_new = await self._repo.get_or_create_pending_payment(
+        payment, is_new = await self._payments.get_or_create_pending_payment(
             user_id,
             provider_code=self._providers.active_code,
         )
@@ -116,12 +116,11 @@ class PurchaseService:
         user_id: UUID,
     ) -> PurchaseOutcome:
         """Продолжить оплату (/continue, T-13, BIL-FR-04, BIL-NFR-R-06)."""
-        payment = await self._repo.get_payment_for_user(payment_id, user_id)
+        payment = await self._payments.get_payment_for_user(payment_id, user_id)
         if payment is None:
-            raise BillingDomainError(
+            raise EntityNotFoundError(
                 'Платёж не найден',
                 error_code='payment_not_found',
-                status_code=404,
             )
 
         if payment.status == 'succeeded':
@@ -159,12 +158,11 @@ class PurchaseService:
         user_tz: str,
     ) -> PaymentResultView:
         """Читает только локальный статус из БД для Э3 без ЮKassa (BIL-FR-04)."""
-        local = await self._repo.get_local_payment_result_for_user(payment_id, user_id)
+        local = await self._views.get_local_payment_result_for_user(payment_id, user_id)
         if local is None:
-            raise BillingDomainError(
+            raise EntityNotFoundError(
                 'Платёж не найден',
                 error_code='payment_not_found',
-                status_code=404,
             )
 
         amount_display = format_amount_rubles(local.amount_kopeks)
@@ -220,7 +218,7 @@ class PurchaseService:
         user_tz: str,
     ) -> MySubscriptionView:
         """Возвращает статус по 7 правилам US-U-05 и историю платежей (BIL-FR-09)."""
-        overview = await self._repo.get_user_billing_overview(user_id)
+        overview = await self._views.get_user_billing_overview(user_id)
         tariff_price_display = format_amount_rubles(overview.tariff_price_kopeks)
         summary = compute_my_subscription_summary(
             pending_payment_id=overview.pending_payment_id,
@@ -278,19 +276,17 @@ class PurchaseService:
                 respect_throttle=respect_throttle,
             )
         except PaymentProviderError as exc:
-            raise BillingDomainError(
+            raise DependencyUnavailableError(
                 'Не удалось связаться с платёжной системой, попробуйте ещё раз',
                 error_code='payment_provider_unavailable',
-                status_code=503,
             ) from exc
 
         if outcome.status == 'pending':
             url = outcome.confirmation_url or payment.confirmation_url
             if not url:
-                raise BillingDomainError(
+                raise DependencyUnavailableError(
                     'Не удалось связаться с платёжной системой, попробуйте ещё раз',
                     error_code='payment_provider_unavailable',
-                    status_code=503,
                 )
             return PurchaseOutcome(
                 payment_id=payment.id,
@@ -329,7 +325,7 @@ class PurchaseService:
                 )
             )
         except ProviderPermanentError as exc:
-            _, transitioned = await self._repo.finalize_payment_failed(
+            _, transitioned = await self._payments.finalize_payment_failed(
                 payment.id,
                 failure_reason=exc.message,
                 source='continue',
@@ -337,19 +333,17 @@ class PurchaseService:
             )
             if transitioned and self._reconciler is not None:
                 await self._reconciler.notify_payment_tasks(payment.id)
-            raise BillingDomainError(
+            raise DependencyUnavailableError(
                 'Не удалось связаться с платёжной системой, попробуйте ещё раз',
                 error_code='payment_provider_rejected',
-                status_code=503,
             ) from exc
         except PaymentProviderError as exc:
-            raise BillingDomainError(
+            raise DependencyUnavailableError(
                 'Не удалось связаться с платёжной системой, попробуйте ещё раз',
                 error_code='payment_provider_unavailable',
-                status_code=503,
             ) from exc
 
-        payment = await self._repo.save_provider_payment_created(
+        payment = await self._payments.save_provider_payment_created(
             payment.id,
             provider_payment_id=snapshot.provider_payment_id,
             confirmation_url=snapshot.confirmation_url,
@@ -366,10 +360,9 @@ class PurchaseService:
             )
 
         if not snapshot.confirmation_url:
-            raise BillingDomainError(
+            raise DependencyUnavailableError(
                 'Не удалось связаться с платёжной системой, попробуйте ещё раз',
                 error_code='payment_provider_unavailable',
-                status_code=503,
             )
         return PurchaseOutcome(
             payment_id=payment.id,

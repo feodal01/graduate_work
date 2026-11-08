@@ -8,7 +8,7 @@ from clients.payment_provider import ProviderTransientError
 from clients.payment_provider_registry import PaymentProviderRegistry
 from dependencies import (
     get_payment_reconciler,
-    get_purchase_repository,
+    get_repositories,
     get_service_credentials,
 )
 from main import create_app
@@ -19,6 +19,7 @@ from tests.fakes import (
     FakeProviderGateway,
     FakeRefundRow,
     InMemoryPurchaseRepository,
+    in_memory_repositories,
 )
 
 SERVICE_KEY = 'billing-internal-manual-reconcile-key-long-enough'
@@ -45,11 +46,13 @@ async def test_manual_reconcile_auth_and_not_found_step(
     repo = InMemoryPurchaseRepository()
     provider = FakeProviderGateway()
     reconciler = PaymentReconciler(
-        repository=repo, payment_providers=PaymentProviderRegistry.single(provider)
+        payments=repo,
+        refunds=repo,
+        payment_providers=PaymentProviderRegistry.single(provider),
     )
 
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_purchase_repository] = lambda: repo
+    app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(repo)
     app.dependency_overrides[get_payment_reconciler] = lambda: reconciler
     app.dependency_overrides[get_service_credentials] = lambda: ServiceCredentials(
         SERVICE_KEY
@@ -77,7 +80,9 @@ async def test_manual_reconcile_payment_and_refund_bypass_throttle() -> None:
     repo = InMemoryPurchaseRepository()
     provider = FakeProviderGateway()
     reconciler = PaymentReconciler(
-        repository=repo, payment_providers=PaymentProviderRegistry.single(provider)
+        payments=repo,
+        refunds=repo,
+        payment_providers=PaymentProviderRegistry.single(provider),
     )
 
     now_utc = datetime.now(UTC)
@@ -103,7 +108,7 @@ async def test_manual_reconcile_payment_and_refund_bypass_throttle() -> None:
     )
 
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_purchase_repository] = lambda: repo
+    app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(repo)
     app.dependency_overrides[get_payment_reconciler] = lambda: reconciler
     app.dependency_overrides[get_service_credentials] = lambda: ServiceCredentials(
         SERVICE_KEY

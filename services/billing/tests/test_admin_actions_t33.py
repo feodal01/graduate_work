@@ -4,7 +4,7 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from dependencies import get_purchase_repository, get_service_credentials
+from dependencies import get_repositories, get_service_credentials
 from main import create_app
 from security.service_credentials import ServiceCredentials
 from tests.fakes import (
@@ -12,6 +12,7 @@ from tests.fakes import (
     FakeOutboxTaskRow,
     FakeRefundRow,
     InMemoryPurchaseRepository,
+    in_memory_repositories,
 )
 
 SERVICE_KEY = 'billing-internal-admin-actions-key-long-enough'
@@ -35,7 +36,7 @@ async def test_admin_actions_list_requires_service_key_step(
     """T-33 (BIL-API-14, BIL-NFR-SEC-03): проверка сервисного ключа."""
     repo = InMemoryPurchaseRepository()
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_purchase_repository] = lambda: repo
+    app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(repo)
     app.dependency_overrides[get_service_credentials] = lambda: ServiceCredentials(
         SERVICE_KEY
     )
@@ -121,7 +122,7 @@ async def test_admin_actions_list_filters_target_resolution_and_unhappy_paths() 
     )
 
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_purchase_repository] = lambda: repo
+    app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(repo)
     app.dependency_overrides[get_service_credentials] = lambda: ServiceCredentials(
         SERVICE_KEY
     )

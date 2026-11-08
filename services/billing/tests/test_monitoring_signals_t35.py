@@ -24,7 +24,7 @@ from core.observability import (
     correlation_request_id,
     get_current_request_id,
 )
-from dependencies import get_purchase_repository, get_service_credentials
+from dependencies import get_repositories, get_service_credentials
 from main import create_app
 from security.service_credentials import ServiceCredentials
 from services.monitoring import OperationalMonitor
@@ -33,6 +33,7 @@ from tests.fakes import (
     FakePaymentRow,
     FakeRefundRow,
     InMemoryPurchaseRepository,
+    in_memory_repositories,
 )
 
 SERVICE_KEY = 'billing-internal-metrics-key-long-enough'
@@ -466,7 +467,7 @@ async def test_internal_metrics_endpoint_is_side_effect_free_and_handles_errors(
     )
 
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_purchase_repository] = lambda: repo
+    app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(repo)
     app.dependency_overrides[get_service_credentials] = lambda: ServiceCredentials(
         SERVICE_KEY
     )

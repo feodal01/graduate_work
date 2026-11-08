@@ -48,7 +48,8 @@ async def webhook_test_env() -> AsyncGenerator[
     auth = ConfigurableAuthGateway(user_id=user_id)
     dispatcher = OutboxDispatcher(repository=repo, auth_gateway=auth)
     reconciler = PaymentReconciler(
-        repository=repo,
+        payments=repo,
+        refunds=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
         outbox_dispatcher=dispatcher,

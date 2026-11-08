@@ -15,6 +15,7 @@ from dependencies import (
 )
 from main import create_app
 from services.purchase import PurchaseService
+from services.reconciler import PaymentReconciler
 from tests.fakes import (
     ConfigurableAuthGateway,
     FakePaymentRow,
@@ -41,9 +42,16 @@ async def continue_test_env() -> AsyncGenerator[
     provider = FakeProviderGateway(id_prefix='yk-cont')
     auth = ConfigurableAuthGateway(user_id=user_id)
     service = PurchaseService(
-        repository=repo,
+        payments=repo,
+        user_views=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
+        reconciler=PaymentReconciler(
+            payments=repo,
+            refunds=repo,
+            payment_providers=PaymentProviderRegistry.single(provider),
+            public_base_url='http://localhost',
+        ),
     )
 
     app = create_app(app_lifespan=None)

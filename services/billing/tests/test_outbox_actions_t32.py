@@ -8,7 +8,7 @@ import pytest
 from clients.auth import AuthServiceUnavailableError, SubscriptionAccessSyncResult
 from dependencies import (
     get_outbox_dispatcher,
-    get_purchase_repository,
+    get_repositories,
     get_service_credentials,
 )
 from main import create_app
@@ -19,6 +19,7 @@ from tests.fakes import (
     FakePaymentRow,
     FakeSubscriptionRow,
     InMemoryPurchaseRepository,
+    in_memory_repositories,
 )
 
 SERVICE_KEY = 'billing-internal-outbox-actions-key-long-enough'
@@ -81,7 +82,7 @@ async def test_outbox_actions_require_service_key_and_404_step(
     dispatcher = OutboxDispatcher(repository=repo, auth_gateway=auth_gw)
 
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_purchase_repository] = lambda: repo
+    app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(repo)
     app.dependency_overrides[get_outbox_dispatcher] = lambda: dispatcher
     app.dependency_overrides[get_service_credentials] = lambda: ServiceCredentials(
         SERVICE_KEY
@@ -186,7 +187,7 @@ async def test_outbox_retry_and_close_happy_and_unhappy_paths() -> None:
     )
 
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_purchase_repository] = lambda: repo
+    app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(repo)
     app.dependency_overrides[get_outbox_dispatcher] = lambda: dispatcher
     app.dependency_overrides[get_service_credentials] = lambda: ServiceCredentials(
         SERVICE_KEY

@@ -65,6 +65,8 @@ class FakeAuthGateway:
         self.last_request_id = request_id
         if self.profile_status == 503:
             raise AuthServiceUnavailableError()
+        if self.profile_status == 429:
+            raise AuthRateLimitExceededError()
         if self.profile_status == 401 or access_token != self.access_token:
             raise AuthInvalidCredentialsError()
         return self.user_id, self.user_login, self.user_tz
@@ -409,3 +411,41 @@ async def test_ui_and_api_user_authentication_redirects_or_returns_401_and_503(
     )
     assert down_api.status_code == 503
     assert down_api.json()['error_code'] == 'auth_unavailable'
+
+
+async def test_user_rate_limit_in_auth_shows_429_not_auth_outage(
+    login_client: tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],
+) -> None:
+    """Регрессия: лимит запросов в Auth — это 429, а не «Auth недоступен».
+
+    Раньше 11-я быстрая загрузка «Моей подписки» за минуту показывала экран
+    «Сервис авторизации временно недоступен» (503), хотя Auth работал.
+    """
+    client, app, fake_auth = login_client
+
+    @app.get('/billing/rate-probe')
+    async def ui_probe(
+        user: AuthenticatedUser = Depends(require_ui_user),
+    ) -> dict[str, str]:
+        return {'login': user.login}
+
+    @app.get('/api/v1/billing/rate-probe')
+    async def api_probe(
+        user: AuthenticatedUser = Depends(require_api_user),
+    ) -> dict[str, str]:
+        return {'login': user.login}
+
+    fake_auth.profile_status = 429
+    client.cookies.set('billing_access_token', 'valid-access-token')
+
+    ui = await client.get('/billing/rate-probe')
+    assert ui.status_code == 429
+    assert 'Слишком много запросов' in ui.text
+    assert 'временно недоступен' not in ui.text
+
+    api = await client.get(
+        '/api/v1/billing/rate-probe',
+        headers={'Authorization': 'Bearer valid-access-token'},
+    )
+    assert api.status_code == 429
+    assert api.json()['error_code'] == 'auth_rate_limited'

@@ -17,7 +17,7 @@ from clients.payment_provider import (
 from clients.payment_provider_registry import PaymentProviderRegistry
 from dependencies import (
     get_payment_reconciler,
-    get_purchase_repository,
+    get_repositories,
     get_service_credentials,
 )
 from domain.subscription import build_subscription_expiration_email_payload
@@ -25,7 +25,12 @@ from main import create_app
 from security.service_credentials import ServiceCredentials
 from services.outbox_dispatcher import OutboxDispatcher
 from services.reconciler import PaymentReconciler
-from tests.fakes import FakePaymentRow, FakeSubscriptionRow, InMemoryPurchaseRepository
+from tests.fakes import (
+    FakePaymentRow,
+    FakeSubscriptionRow,
+    InMemoryPurchaseRepository,
+    in_memory_repositories,
+)
 
 SERVICE_KEY = 'billing-internal-refund-service-key-long-enough'
 
@@ -230,7 +235,8 @@ async def test_refund_api_full_lifecycle_consequences_and_unhappy_paths() -> Non
         notifications_gateway=ntf_gw,
     )
     reconciler = PaymentReconciler(
-        repository=repo,
+        payments=repo,
+        refunds=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
         outbox_dispatcher=dispatcher,
@@ -268,7 +274,7 @@ async def test_refund_api_full_lifecycle_consequences_and_unhappy_paths() -> Non
     repo.access_versions[user_id] = 1
 
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_purchase_repository] = lambda: repo
+    app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(repo)
     app.dependency_overrides[get_payment_reconciler] = lambda: reconciler
     app.dependency_overrides[get_service_credentials] = lambda: ServiceCredentials(
         SERVICE_KEY
@@ -398,7 +404,8 @@ async def test_background_refund_reconcile_24h_metadata_lookup_and_webhook() -> 
         notifications_gateway=ntf_gw,
     )
     reconciler = PaymentReconciler(
-        repository=repo,
+        payments=repo,
+        refunds=repo,
         payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
         outbox_dispatcher=dispatcher,

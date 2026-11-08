@@ -118,6 +118,20 @@ async def test_http_auth_gateway_login_profile_and_error_mapping() -> None:
 
 
 @pytest.mark.asyncio
+async def test_profile_rate_limit_is_not_reported_as_auth_outage() -> None:
+    """Регрессия: 429 от /profile — лимит пользователя, а не недоступность Auth."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={'detail': 'Too many requests'})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        gateway = HttpAuthGateway(http_client=http_client, base_url='http://auth:8000')
+
+        with pytest.raises(AuthRateLimitExceededError):
+            await gateway.get_current_user('tok', request_id='req-429')
+
+
+@pytest.mark.asyncio
 async def test_http_auth_gateway_network_failures_and_best_effort_logout() -> None:
     """Обрыв сети при login/profile даёт 503, а при logout подавляется."""
 

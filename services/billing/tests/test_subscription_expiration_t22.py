@@ -55,7 +55,8 @@ async def test_subscription_expiration_email_scheduled_on_exact_end_date_t() -> 
             notifications_gateway=ntf_gateway,
         )
         reconciler = PaymentReconciler(
-            repository=repo,
+            payments=repo,
+            refunds=repo,
             payment_providers=PaymentProviderRegistry.single(provider),
             public_base_url='https://cinema.example',
             outbox_dispatcher=dispatcher,

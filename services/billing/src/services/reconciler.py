@@ -1,8 +1,8 @@
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, Protocol
+from typing import Literal, Protocol
 from uuid import UUID
 
 from opentelemetry import trace
@@ -16,7 +16,9 @@ from clients.payment_provider import (
 from clients.payment_provider_registry import PaymentProviderRegistry
 from core.observability import correlation_request_id
 from domain.subscription import ReconcileSource
-from repositories.purchase import PaymentRecordProtocol, RefundRecordProtocol
+from repositories.payments import PaymentRepository
+from repositories.records import PaymentRecordProtocol, RefundRecordProtocol
+from repositories.refunds import RefundRepository
 
 logger = logging.getLogger(__name__)
 
@@ -54,77 +56,6 @@ class RefundReconcileOutcome:
     throttled: bool
 
 
-class ReconcileRepositoryProtocol(Protocol):
-    async def get_payment(
-        self,
-        payment_id: UUID,
-    ) -> PaymentRecordProtocol | None: ...
-
-    async def get_payment_by_provider_id(
-        self,
-        provider_code: str,
-        provider_payment_id: str,
-    ) -> PaymentRecordProtocol | None: ...
-
-    async def list_due_pending_payments(
-        self,
-        *,
-        min_age_seconds: float,
-        throttle_seconds: float = 5.0,
-        limit: int = 20,
-    ) -> Sequence[PaymentRecordProtocol]: ...
-
-    async def claim_next_due_pending_payment(
-        self,
-        *,
-        min_age_seconds: float,
-        throttle_seconds: float = 5.0,
-    ) -> PaymentRecordProtocol | None: ...
-
-    async def record_payment_reconcile_error(
-        self,
-        payment_id: UUID,
-        *,
-        error_message: str,
-    ) -> PaymentRecordProtocol: ...
-
-    async def save_provider_payment_created(
-        self,
-        payment_id: UUID,
-        *,
-        provider_payment_id: str,
-        confirmation_url: str | None,
-        provider_details: dict[str, Any],
-    ) -> PaymentRecordProtocol: ...
-
-    async def record_payment_checked(
-        self,
-        payment_id: UUID,
-        *,
-        confirmation_url: str | None = None,
-        provider_details: dict[str, Any] | None = None,
-    ) -> PaymentRecordProtocol: ...
-
-    async def finalize_payment_succeeded(
-        self,
-        payment_id: UUID,
-        *,
-        source: ReconcileSource,
-        provider_details: dict[str, Any] | None = None,
-        public_base_url: str = 'http://localhost',
-    ) -> tuple[PaymentRecordProtocol, bool]: ...
-
-    async def finalize_payment_failed(
-        self,
-        payment_id: UUID,
-        *,
-        failure_reason: str,
-        source: ReconcileSource,
-        provider_details: dict[str, Any] | None = None,
-        public_base_url: str = 'http://localhost',
-    ) -> tuple[PaymentRecordProtocol, bool]: ...
-
-
 class OutboxDispatcherProtocol(Protocol):
     async def try_deliver_payment_tasks(self, payment_id: UUID) -> int: ...
 
@@ -135,12 +66,14 @@ class PaymentReconciler:
     def __init__(
         self,
         *,
-        repository: ReconcileRepositoryProtocol,
+        payments: PaymentRepository,
+        refunds: RefundRepository,
         payment_providers: PaymentProviderRegistry,
         public_base_url: str = 'http://localhost',
         outbox_dispatcher: OutboxDispatcherProtocol | None = None,
     ) -> None:
-        self._repo = repository
+        self._payments = payments
+        self._refunds = refunds
         self._providers = payment_providers
         self._public_base_url = public_base_url.rstrip('/')
         self._outbox_dispatcher = outbox_dispatcher
@@ -157,7 +90,7 @@ class PaymentReconciler:
         source: ReconcileSource,
         respect_throttle: bool = True,
     ) -> ReconcileOutcome:
-        payment = await self._repo.get_payment(payment_id)
+        payment = await self._payments.get_payment(payment_id)
         if payment is None:
             raise LookupError(f'Payment {payment_id} not found')
 
@@ -176,7 +109,7 @@ class PaymentReconciler:
         respect_throttle: bool = False,
     ) -> ReconcileOutcome | None:
         cleaned_id = provider_payment_id.strip()
-        payment = await self._repo.get_payment_by_provider_id(
+        payment = await self._payments.get_payment_by_provider_id(
             provider_code,
             cleaned_id,
         )
@@ -208,18 +141,16 @@ class PaymentReconciler:
         if pay_outcome is not None:
             return pay_outcome
 
-        get_refund_by_prov = getattr(self._repo, 'get_refund_by_provider_id', None)
-        if get_refund_by_prov is not None:
-            refund = await get_refund_by_prov(
-                provider_code,
-                cleaned_id,
+        refund = await self._refunds.get_refund_by_provider_id(
+            provider_code,
+            cleaned_id,
+        )
+        if refund is not None:
+            return await self.reconcile_refund_record(
+                refund,
+                source=source,
+                respect_throttle=respect_throttle,
             )
-            if refund is not None:
-                return await self.reconcile_refund_record(
-                    refund,
-                    source=source,
-                    respect_throttle=respect_throttle,
-                )
         return None
 
     async def reconcile_due_pending_payments(
@@ -236,7 +167,7 @@ class PaymentReconciler:
         for _ in range(limit):
             if should_stop is not None and should_stop():
                 break
-            payment = await self._repo.claim_next_due_pending_payment(
+            payment = await self._payments.claim_next_due_pending_payment(
                 min_age_seconds=min_age_seconds,
                 throttle_seconds=throttle_sec,
             )
@@ -261,7 +192,7 @@ class PaymentReconciler:
                         payment.id,
                         exc,
                     )
-                    await self._repo.record_payment_reconcile_error(
+                    await self._payments.record_payment_reconcile_error(
                         payment.id,
                         error_message=str(exc),
                     )
@@ -299,7 +230,7 @@ class PaymentReconciler:
             # Инвариант 13: если за 24 часа жизни ключа номер ЮKassa не получен,
             # переводим платёж в Не оплачен (средства не списаны).
             if (now_utc - created_at) >= IDEMPOTENCY_KEY_TTL:
-                updated, transitioned = await self._repo.finalize_payment_failed(
+                updated, transitioned = await self._payments.finalize_payment_failed(
                     payment.id,
                     failure_reason='idempotency_key_expired',
                     source=source,
@@ -333,7 +264,7 @@ class PaymentReconciler:
                     )
                 )
             except ProviderPermanentError as exc:
-                updated, transitioned = await self._repo.finalize_payment_failed(
+                updated, transitioned = await self._payments.finalize_payment_failed(
                     payment.id,
                     failure_reason=exc.message,
                     source=source,
@@ -351,7 +282,7 @@ class PaymentReconciler:
                     throttled=False,
                 )
 
-            payment = await self._repo.save_provider_payment_created(
+            payment = await self._payments.save_provider_payment_created(
                 payment.id,
                 provider_payment_id=created_snapshot.provider_payment_id,
                 confirmation_url=created_snapshot.confirmation_url,
@@ -419,7 +350,7 @@ class PaymentReconciler:
 
         if snapshot.domain_status == 'pending':
             confirmation_url = snapshot.confirmation_url or payment.confirmation_url
-            updated = await self._repo.record_payment_checked(
+            updated = await self._payments.record_payment_checked(
                 payment.id,
                 confirmation_url=confirmation_url,
                 provider_details=snapshot.provider_details,
@@ -435,7 +366,7 @@ class PaymentReconciler:
             )
 
         if snapshot.domain_status == 'succeeded':
-            updated, transitioned = await self._repo.finalize_payment_succeeded(
+            updated, transitioned = await self._payments.finalize_payment_succeeded(
                 payment.id,
                 source=source,
                 provider_details=snapshot.provider_details,
@@ -454,7 +385,7 @@ class PaymentReconciler:
             )
 
         reason = snapshot.failure_reason or 'canceled_by_provider'
-        updated, transitioned = await self._repo.finalize_payment_failed(
+        updated, transitioned = await self._payments.finalize_payment_failed(
             payment.id,
             failure_reason=reason,
             source=source,
@@ -481,17 +412,14 @@ class PaymentReconciler:
         reason: str,
     ) -> RefundReconcileOutcome:
         """Создаёт или повторяет полный возврат и запускает сверку GET (BIL-FR-10)."""
-        get_or_create_fn = getattr(self._repo, 'get_or_create_processing_refund')
-        save_created_fn = getattr(self._repo, 'save_provider_refund_created')
-        finalize_rejected_fn = getattr(self._repo, 'finalize_refund_rejected')
 
-        refund, _ = await get_or_create_fn(
+        refund, _ = await self._refunds.get_or_create_processing_refund(
             payment_id,
             admin_user_id=admin_user_id,
             reason=reason,
         )
         if not refund.provider_refund_id:
-            payment = await self._repo.get_payment(refund.payment_id)
+            payment = await self._payments.get_payment(refund.payment_id)
             if payment is None or not payment.provider_payment_id:
                 return self._build_refund_outcome(
                     refund,
@@ -512,7 +440,7 @@ class PaymentReconciler:
                     )
                 )
             except ProviderPermanentError as exc:
-                updated, transitioned = await finalize_rejected_fn(
+                updated, transitioned = await self._refunds.finalize_refund_rejected(
                     refund.id,
                     rejection_reason=exc.message,
                     source='admin',
@@ -534,7 +462,7 @@ class PaymentReconciler:
                     throttled=False,
                 )
 
-            refund = await save_created_fn(
+            refund = await self._refunds.save_provider_refund_created(
                 refund.id,
                 provider_refund_id=created_snap.provider_refund_id,
                 provider_details=created_snap.provider_details,
@@ -565,8 +493,7 @@ class PaymentReconciler:
         source: ReconcileSource,
         respect_throttle: bool = True,
     ) -> RefundReconcileOutcome:
-        get_refund_fn = getattr(self._repo, 'get_refund')
-        refund = await get_refund_fn(refund_id)
+        refund = await self._refunds.get_refund(refund_id)
         if refund is None:
             raise LookupError(f'Refund {refund_id} not found')
         return await self.reconcile_refund_record(
@@ -582,17 +509,13 @@ class PaymentReconciler:
         limit: int = 20,
         should_stop: Callable[[], bool] | None = None,
     ) -> int:
-        claim_fn = getattr(self._repo, 'claim_next_due_processing_refund', None)
-        record_err_fn = getattr(self._repo, 'record_refund_reconcile_error', None)
-        if claim_fn is None:
-            return 0
         processed = 0
         throttle_sec = CHECK_THROTTLE_WINDOW.total_seconds()
         tracer = trace.get_tracer('billing.reconciler')
         for _ in range(limit):
             if should_stop is not None and should_stop():
                 break
-            refund = await claim_fn(
+            refund = await self._refunds.claim_next_due_processing_refund(
                 min_age_seconds=min_age_seconds,
                 throttle_seconds=throttle_sec,
             )
@@ -618,11 +541,10 @@ class PaymentReconciler:
                         refund.id,
                         exc,
                     )
-                    if record_err_fn is not None:
-                        await record_err_fn(
-                            refund.id,
-                            error_message=str(exc),
-                        )
+                    await self._refunds.record_refund_reconcile_error(
+                        refund.id,
+                        error_message=str(exc),
+                    )
         return processed
 
     async def _reconcile_background_refund(
@@ -638,11 +560,8 @@ class PaymentReconciler:
                 throttled=False,
             )
 
-        save_created_fn = getattr(self._repo, 'save_provider_refund_created')
-        finalize_rejected_fn = getattr(self._repo, 'finalize_refund_rejected')
-
         if not refund.provider_refund_id:
-            payment = await self._repo.get_payment(refund.payment_id)
+            payment = await self._payments.get_payment(refund.payment_id)
             if payment is None or not payment.provider_payment_id:
                 return self._build_refund_outcome(
                     refund,
@@ -667,7 +586,10 @@ class PaymentReconciler:
                     expected_currency=refund.currency.strip(),
                 )
                 if found_snap is None:
-                    updated, transitioned = await finalize_rejected_fn(
+                    (
+                        updated,
+                        transitioned,
+                    ) = await self._refunds.finalize_refund_rejected(
                         refund.id,
                         rejection_reason='not_created_in_provider',
                         source=source,
@@ -677,7 +599,7 @@ class PaymentReconciler:
                         transitioned=transitioned,
                         throttled=False,
                     )
-                refund = await save_created_fn(
+                refund = await self._refunds.save_provider_refund_created(
                     refund.id,
                     provider_refund_id=found_snap.provider_refund_id,
                     provider_details=found_snap.provider_details,
@@ -697,7 +619,10 @@ class PaymentReconciler:
                         )
                     )
                 except ProviderPermanentError as exc:
-                    updated, transitioned = await finalize_rejected_fn(
+                    (
+                        updated,
+                        transitioned,
+                    ) = await self._refunds.finalize_refund_rejected(
                         refund.id,
                         rejection_reason=exc.message,
                         source=source,
@@ -707,7 +632,7 @@ class PaymentReconciler:
                         transitioned=transitioned,
                         throttled=False,
                     )
-                refund = await save_created_fn(
+                refund = await self._refunds.save_provider_refund_created(
                     refund.id,
                     provider_refund_id=created_snap.provider_refund_id,
                     provider_details=created_snap.provider_details,
@@ -726,7 +651,7 @@ class PaymentReconciler:
     ) -> tuple[UUID, str, bool]:
         """Принудительная сверка по кнопке администратора без лимита 5 с (BIL-FR-15)."""
         if operation_type == 'payment':
-            payment = await self._repo.get_payment(operation_id)
+            payment = await self._payments.get_payment(operation_id)
             if payment is None:
                 raise LookupError(f'Payment {operation_id} not found')
             pay_out = await self._reconcile_background_payment(
@@ -735,8 +660,7 @@ class PaymentReconciler:
             )
             return pay_out.payment_id, pay_out.status, pay_out.transitioned
 
-        get_refund_fn = getattr(self._repo, 'get_refund')
-        refund = await get_refund_fn(operation_id)
+        refund = await self._refunds.get_refund(operation_id)
         if refund is None:
             raise LookupError(f'Refund {operation_id} not found')
         ref_out = await self._reconcile_background_refund(
@@ -777,10 +701,6 @@ class PaymentReconciler:
                 throttled=True,
             )
 
-        record_checked_fn = getattr(self._repo, 'record_refund_checked')
-        finalize_succeeded_fn = getattr(self._repo, 'finalize_refund_succeeded')
-        finalize_rejected_fn = getattr(self._repo, 'finalize_refund_rejected')
-
         snapshot = await self._providers.get(refund.provider_code).get_refund(
             refund.provider_refund_id,
             expected_refund_id=refund.id,
@@ -788,7 +708,7 @@ class PaymentReconciler:
             expected_currency=refund.currency.strip(),
         )
         if snapshot.domain_status == 'processing':
-            updated = await record_checked_fn(
+            updated = await self._refunds.record_refund_checked(
                 refund.id,
                 provider_details=snapshot.provider_details,
             )
@@ -799,7 +719,7 @@ class PaymentReconciler:
             )
 
         if snapshot.domain_status == 'succeeded':
-            updated, transitioned = await finalize_succeeded_fn(
+            updated, transitioned = await self._refunds.finalize_refund_succeeded(
                 refund.id,
                 source=source,
                 provider_details=snapshot.provider_details,
@@ -816,7 +736,7 @@ class PaymentReconciler:
             )
 
         rej_reason = snapshot.rejection_reason or 'canceled_by_provider'
-        updated, transitioned = await finalize_rejected_fn(
+        updated, transitioned = await self._refunds.finalize_refund_rejected(
             refund.id,
             rejection_reason=rej_reason,
             source=source,

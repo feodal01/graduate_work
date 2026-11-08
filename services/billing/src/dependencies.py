@@ -13,6 +13,7 @@ from api.errors import (
 from clients.auth import (
     AuthGateway,
     AuthInvalidCredentialsError,
+    AuthRateLimitExceededError,
     AuthServiceUnavailableError,
 )
 from clients.notifications import NotificationsGateway
@@ -21,7 +22,10 @@ from core.config import settings
 from core.observability import get_current_request_id
 from db.health import HealthCheck
 from db.sql.postgres import PostgresDatabase
-from repositories.purchase import PurchaseRepository, SQLAlchemyPurchaseRepository
+from repositories.admin_queries import AdminQueries
+from repositories.bundle import BillingRepositories
+from repositories.metrics import OperationalMetricsRepository
+from repositories.outbox import OutboxAdminRepository
 from security.service_credentials import ServiceCredentials
 from services.outbox_dispatcher import OutboxDispatcher
 from services.purchase import PurchaseService
@@ -29,6 +33,7 @@ from services.reconciler import PaymentReconciler
 
 ACCESS_TOKEN_COOKIE = 'billing_access_token'
 REFRESH_TOKEN_COOKIE = 'billing_refresh_token'
+AUTH_RATE_LIMITED_MESSAGE = 'Слишком много запросов, повторите через минуту'
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,9 +52,27 @@ async def get_service_credentials(request: Request) -> ServiceCredentials:
     return cast(ServiceCredentials, request.app.state.service_credentials)
 
 
-async def get_purchase_repository(request: Request) -> PurchaseRepository:
+async def get_repositories(request: Request) -> BillingRepositories:
     database = cast(PostgresDatabase, request.app.state.database)
-    return SQLAlchemyPurchaseRepository(database.sessionmaker)
+    return BillingRepositories.sqlalchemy(database.sessionmaker)
+
+
+async def get_admin_queries(
+    repos: BillingRepositories = Depends(get_repositories),
+) -> AdminQueries:
+    return repos.admin_queries
+
+
+async def get_outbox_admin_repository(
+    repos: BillingRepositories = Depends(get_repositories),
+) -> OutboxAdminRepository:
+    return repos.outbox_admin
+
+
+async def get_metrics_repository(
+    repos: BillingRepositories = Depends(get_repositories),
+) -> OperationalMetricsRepository:
+    return repos.metrics
 
 
 async def require_internal_service(
@@ -81,14 +104,14 @@ async def get_payment_providers(request: Request) -> PaymentProviderRegistry:
 
 
 async def get_outbox_dispatcher(
-    repo: PurchaseRepository = Depends(get_purchase_repository),
+    repos: BillingRepositories = Depends(get_repositories),
     auth_gateway: AuthGateway = Depends(get_auth_gateway),
     notifications_gateway: NotificationsGateway | None = Depends(
         get_notifications_gateway
     ),
 ) -> OutboxDispatcher:
     return OutboxDispatcher(
-        repository=repo,
+        repository=repos.outbox,
         auth_gateway=auth_gateway,
         notifications_gateway=notifications_gateway,
         max_attempts=settings.worker.billing_outbox_max_attempts,
@@ -96,12 +119,13 @@ async def get_outbox_dispatcher(
 
 
 async def get_payment_reconciler(
-    repo: PurchaseRepository = Depends(get_purchase_repository),
+    repos: BillingRepositories = Depends(get_repositories),
     payment_providers: PaymentProviderRegistry = Depends(get_payment_providers),
     outbox_dispatcher: OutboxDispatcher = Depends(get_outbox_dispatcher),
 ) -> PaymentReconciler:
     return PaymentReconciler(
-        repository=repo,
+        payments=repos.payments,
+        refunds=repos.refunds,
         payment_providers=payment_providers,
         public_base_url=str(settings.worker.billing_public_base_url),
         outbox_dispatcher=outbox_dispatcher,
@@ -109,14 +133,13 @@ async def get_payment_reconciler(
 
 
 async def get_purchase_service(
-    request: Request,
+    repos: BillingRepositories = Depends(get_repositories),
     payment_providers: PaymentProviderRegistry = Depends(get_payment_providers),
     reconciler: PaymentReconciler = Depends(get_payment_reconciler),
 ) -> PurchaseService:
-    database = cast(PostgresDatabase, request.app.state.database)
-    repo = SQLAlchemyPurchaseRepository(database.sessionmaker)
     return PurchaseService(
-        repository=repo,
+        payments=repos.payments,
+        user_views=repos.user_views,
         payment_providers=payment_providers,
         public_base_url=str(settings.worker.billing_public_base_url),
         reconciler=reconciler,
@@ -150,6 +173,12 @@ async def require_ui_user(
         )
     except AuthInvalidCredentialsError as exc:
         raise UILoginRedirectError() from exc
+    except AuthRateLimitExceededError as exc:
+        raise UIErrorScreenException(
+            status_code=429,
+            message=AUTH_RATE_LIMITED_MESSAGE,
+            title='Слишком много запросов',
+        ) from exc
     except AuthServiceUnavailableError as exc:
         raise UIErrorScreenException(
             status_code=503,
@@ -185,6 +214,12 @@ async def require_api_user(
             'Access token is invalid or expired',
             error_code='unauthenticated',
             status_code=401,
+        ) from exc
+    except AuthRateLimitExceededError as exc:
+        raise BillingDomainError(
+            AUTH_RATE_LIMITED_MESSAGE,
+            error_code='auth_rate_limited',
+            status_code=429,
         ) from exc
     except AuthServiceUnavailableError as exc:
         raise BillingDomainError(

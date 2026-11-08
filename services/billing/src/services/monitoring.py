@@ -1,23 +1,14 @@
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
 
 import sentry_sdk
 from opentelemetry import trace
 
 from core.observability import correlation_request_id
-from repositories.purchase import OperationalMetricsSnapshot
+from repositories.metrics import OperationalMetricsRepository
+from repositories.read_models import OperationalMetricsSnapshot
 
 logger = logging.getLogger(__name__)
-
-
-class OperationalMetricsRepositoryProtocol(Protocol):
-    async def get_operational_metrics(
-        self,
-        *,
-        stuck_threshold_seconds: int = 600,
-        now_utc: datetime | None = None,
-    ) -> OperationalMetricsSnapshot: ...
 
 
 class OperationalMonitor:
@@ -26,7 +17,7 @@ class OperationalMonitor:
     def __init__(
         self,
         *,
-        repository: OperationalMetricsRepositoryProtocol,
+        repository: OperationalMetricsRepository,
         stuck_threshold_seconds: int = 600,
         alert_cooldown_seconds: float = 300.0,
     ) -> None:

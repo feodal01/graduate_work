@@ -221,7 +221,8 @@ async def test_payment_succeeded_and_failed_emails_dispatched_and_isolated() -> 
             notifications_gateway=ntf_gateway,
         )
         reconciler = PaymentReconciler(
-            repository=repo,
+            payments=repo,
+            refunds=repo,
             payment_providers=PaymentProviderRegistry.single(provider),
             public_base_url='http://localhost',
             outbox_dispatcher=dispatcher,

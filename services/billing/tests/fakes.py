@@ -4,7 +4,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from api.errors import BillingDomainError
 from clients.auth import (
     AuthInvalidCredentialsError,
     AuthPermanentDeliveryError,
@@ -19,6 +18,7 @@ from clients.payment_provider import (
 )
 from core.observability import correlation_request_id
 from db.sql.errors import DatabaseUnavailableError
+from domain.errors import EntityNotFoundError, RuleConflictError
 from domain.subscription import (
     ReconcileSource,
     build_cancel_expiration_email_payload,
@@ -28,8 +28,13 @@ from domain.subscription import (
     build_subscription_expiration_email_payload,
     compute_subscription_state,
 )
-from repositories.purchase import (
+from repositories.bundle import BillingRepositories
+from repositories.outbox import (
     DeliveryOutcome,
+    OutboxDeliverFn,
+    compute_outbox_backoff_seconds,
+)
+from repositories.read_models import (
     InternalAdminActionFilter,
     InternalAdminActionItemData,
     InternalOperationEventItemData,
@@ -43,10 +48,8 @@ from repositories.purchase import (
     InternalSubscriptionItemData,
     LocalPaymentResultData,
     OperationalMetricsSnapshot,
-    OutboxDeliverFn,
     UserBillingOverviewData,
     UserPaymentHistoryItemData,
-    compute_outbox_backoff_seconds,
 )
 
 
@@ -392,15 +395,13 @@ class InMemoryPurchaseRepository:
         allowed, block_code = await self.check_purchase_allowed(user_id)
         if not allowed:
             if block_code == 'subscription_already_active':
-                raise BillingDomainError(
+                raise RuleConflictError(
                     'Подписка уже активна',
                     error_code='subscription_already_active',
-                    status_code=409,
                 )
-            raise BillingDomainError(
+            raise RuleConflictError(
                 'Нельзя оформить новую подписку, пока возврат находится в обработке',
                 error_code='refund_in_processing',
-                status_code=409,
             )
         for payment in self.payments.values():
             if payment.user_id == user_id and payment.status == 'pending':
@@ -1199,16 +1200,14 @@ class InMemoryPurchaseRepository:
             raise DatabaseUnavailableError('billing-db is down')
         found = next((t for t in self.outbox_tasks.values() if t.id == task_id), None)
         if found is None:
-            raise BillingDomainError(
+            raise EntityNotFoundError(
                 'Outbox task not found',
                 error_code='outbox_task_not_found',
-                status_code=404,
             )
         if found.status in ('completed', 'closed'):
-            raise BillingDomainError(
+            raise RuleConflictError(
                 'Задача уже завершена или закрыта',
                 error_code='outbox_task_not_retryable',
-                status_code=409,
             )
         now = now_utc or datetime.now(UTC)
         cleaned_reason = (
@@ -1246,16 +1245,14 @@ class InMemoryPurchaseRepository:
             raise DatabaseUnavailableError('billing-db is down')
         found = next((t for t in self.outbox_tasks.values() if t.id == task_id), None)
         if found is None:
-            raise BillingDomainError(
+            raise EntityNotFoundError(
                 'Outbox task not found',
                 error_code='outbox_task_not_found',
-                status_code=404,
             )
         if found.status != 'requires_intervention':
-            raise BillingDomainError(
+            raise RuleConflictError(
                 'Закрытие доступно только для задачи в состоянии requires_intervention',
                 error_code='outbox_task_not_requires_intervention',
-                status_code=409,
             )
         now = now_utc or datetime.now(UTC)
         cleaned_reason = reason.strip()
@@ -1457,10 +1454,9 @@ class InMemoryPurchaseRepository:
             raise DatabaseUnavailableError('billing-db is down')
         pay = self.payments.get(payment_id)
         if pay is None:
-            raise BillingDomainError(
+            raise EntityNotFoundError(
                 'Payment not found',
                 error_code='payment_not_found',
-                status_code=404,
             )
         now = now_utc or datetime.now(UTC)
         cleaned_reason = reason.strip()
@@ -1472,17 +1468,15 @@ class InMemoryPurchaseRepository:
             ):
                 if existing.status == 'processing':
                     return existing, False
-                raise BillingDomainError(
+                raise RuleConflictError(
                     'Возврат по данному платежу уже выполнен',
                     error_code='refund_already_succeeded',
-                    status_code=409,
                 )
 
         if pay.status != 'succeeded':
-            raise BillingDomainError(
+            raise RuleConflictError(
                 'Возврат возможен только для оплаченного платежа активной подписки',
                 error_code='refund_not_allowed',
-                status_code=409,
             )
         sub = next(
             (s for s in self.subscriptions.values() if s.payment_id == payment_id),
@@ -1497,10 +1491,9 @@ class InMemoryPurchaseRepository:
             )
             != 'active'
         ):
-            raise BillingDomainError(
+            raise RuleConflictError(
                 'Возврат возможен только для платежа текущей активной подписки',
                 error_code='refund_not_allowed',
-                status_code=409,
             )
 
         refund_id = uuid4()
@@ -1939,3 +1932,16 @@ class ConfigurableAuthGateway:
             applied=True,
             current_version=version,
         )
+
+
+def in_memory_repositories(repo: InMemoryPurchaseRepository) -> BillingRepositories:
+    """Один in-memory стор во всех ролях: состояние общее, как у общей БД."""
+    return BillingRepositories(
+        payments=repo,
+        refunds=repo,
+        outbox=repo,
+        outbox_admin=repo,
+        user_views=repo,
+        admin_queries=repo,
+        metrics=repo,
+    )

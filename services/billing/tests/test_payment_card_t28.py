@@ -4,7 +4,7 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from dependencies import get_purchase_repository, get_service_credentials
+from dependencies import get_repositories, get_service_credentials
 from main import create_app
 from security.service_credentials import ServiceCredentials
 from tests.fakes import (
@@ -13,6 +13,7 @@ from tests.fakes import (
     FakeRefundRow,
     FakeSubscriptionRow,
     InMemoryPurchaseRepository,
+    in_memory_repositories,
 )
 
 SERVICE_KEY = 'billing-internal-card-service-key-long-enough'
@@ -35,7 +36,7 @@ async def test_payment_card_auth_and_not_found_step(
     """T-28 (BIL-API-08, BIL-NFR-SEC-03): проверка ключа и 404 на неизвестный платёж."""
     repo = InMemoryPurchaseRepository()
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_purchase_repository] = lambda: repo
+    app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(repo)
     app.dependency_overrides[get_service_credentials] = lambda: ServiceCredentials(
         SERVICE_KEY
     )
@@ -155,7 +156,7 @@ async def test_payment_card_full_chronology_can_refund_rules_and_unhappy_paths()
     )
 
     app = create_app(app_lifespan=None)
-    app.dependency_overrides[get_purchase_repository] = lambda: repo
+    app.dependency_overrides[get_repositories] = lambda: in_memory_repositories(repo)
     app.dependency_overrides[get_service_credentials] = lambda: ServiceCredentials(
         SERVICE_KEY
     )
