@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from clients.payment_provider import ProviderTransientError
+from clients.payment_provider_registry import PaymentProviderRegistry
 from dependencies import (
     get_payment_reconciler,
     get_purchase_repository,
@@ -43,7 +44,9 @@ async def test_manual_reconcile_auth_and_not_found_step(
     """T-34 (BIL-API-10, BIL-NFR-SEC-03): проверка сервисного ключа и 404."""
     repo = InMemoryPurchaseRepository()
     provider = FakeProviderGateway()
-    reconciler = PaymentReconciler(repository=repo, payment_provider=provider)
+    reconciler = PaymentReconciler(
+        repository=repo, payment_providers=PaymentProviderRegistry.single(provider)
+    )
 
     app = create_app(app_lifespan=None)
     app.dependency_overrides[get_purchase_repository] = lambda: repo
@@ -73,7 +76,9 @@ async def test_manual_reconcile_payment_and_refund_bypass_throttle() -> None:
     """T-34 (BIL-FR-15, BIL-API-10, US-A-06): сверка без лимита 5 с и источник admin."""
     repo = InMemoryPurchaseRepository()
     provider = FakeProviderGateway()
-    reconciler = PaymentReconciler(repository=repo, payment_provider=provider)
+    reconciler = PaymentReconciler(
+        repository=repo, payment_providers=PaymentProviderRegistry.single(provider)
+    )
 
     now_utc = datetime.now(UTC)
     user_id = uuid4()

@@ -9,6 +9,7 @@ from clients.notifications import (
     NotificationsPermanentError,
     NotificationsTransientError,
 )
+from clients.payment_provider_registry import PaymentProviderRegistry
 from domain.subscription import (
     build_payment_failed_email_payload,
     build_payment_succeeded_email_payload,
@@ -221,7 +222,7 @@ async def test_payment_succeeded_and_failed_emails_dispatched_and_isolated() -> 
         )
         reconciler = PaymentReconciler(
             repository=repo,
-            payment_provider=provider,
+            payment_providers=PaymentProviderRegistry.single(provider),
             public_base_url='http://localhost',
             outbox_dispatcher=dispatcher,
         )

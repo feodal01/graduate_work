@@ -11,6 +11,7 @@ from clients.payment_provider import (
     ProviderReconciliationError,
     ProviderTransientError,
 )
+from clients.payment_provider_registry import PaymentProviderRegistry
 from domain.subscription import (
     SubscriptionState,
     compute_subscription_state,
@@ -157,7 +158,7 @@ async def test_reconciler_succeeded_creates_subscription_version_and_outbox() ->
 
     reconciler = PaymentReconciler(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
     )
     outcome: ReconcileOutcome = await reconciler.reconcile_payment(
@@ -222,7 +223,7 @@ async def test_reconciler_failed_marks_payment_failed_and_enqueues_failure_email
 
     reconciler = PaymentReconciler(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
     )
     outcome = await reconciler.reconcile_payment(
@@ -272,13 +273,14 @@ async def test_reconciler_pending_snapshot_and_lookup_branches() -> None:
 
     reconciler = PaymentReconciler(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
     )
 
     # 1. Сверка по provider_payment_id обновляет last_checked_at и confirmation_url
     outcome = await reconciler.reconcile_by_provider_payment_id(
         'yk-pay-101',
+        provider_code='yookassa',
         source='webhook',
         respect_throttle=False,
     )
@@ -291,6 +293,7 @@ async def test_reconciler_pending_snapshot_and_lookup_branches() -> None:
     # 2. Неизвестный внешний provider_payment_id возвращает None
     unknown_by_provider = await reconciler.reconcile_by_provider_payment_id(
         'yk-nonexistent',
+        provider_code='yookassa',
         source='webhook',
     )
     assert unknown_by_provider is None
@@ -340,7 +343,7 @@ async def test_reconciler_throttle_for_continue_and_bypass_for_admin() -> None:
 
     reconciler = PaymentReconciler(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
     )
 
@@ -388,7 +391,7 @@ async def test_reconciler_unhappy_provider_errors_never_corrupt_pending_payment(
 
     reconciler = PaymentReconciler(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
     )
     with pytest.raises(type(provider_error)):

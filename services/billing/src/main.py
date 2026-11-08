@@ -13,7 +13,7 @@ from api.request_id import require_request_id
 from api.v1 import health, internal, payments, webhooks
 from clients.auth import HttpAuthGateway
 from clients.notifications import HttpNotificationsGateway
-from clients.payment_provider import YooKassaProviderAdapter
+from clients.payment_provider_registry import build_payment_provider_registry
 from core.config import ServiceSettings, TokenSettings, settings
 from core.logger import LOGGING, add_logstash_handler
 from core.observability import bind_request_id, init_sentry
@@ -69,9 +69,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     notifications_http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(settings.notifications_client.timeout_seconds)
     )
-    yookassa_http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(settings.yookassa.timeout_seconds)
-    )
     app.state.auth_gateway = HttpAuthGateway(
         http_client=auth_http_client,
         base_url=str(settings.auth_client.service_url),
@@ -83,18 +80,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         base_url=str(settings.notifications_client.campaign_url),
         api_key=settings.notifications_client.campaign_api_key.get_secret_value(),
     )
-    app.state.payment_provider = YooKassaProviderAdapter(
-        http_client=yookassa_http_client,
-        shop_id=settings.yookassa.shop_id,
-        secret_key=settings.yookassa.secret_key.get_secret_value(),
-        base_url=str(settings.yookassa.api_base_url),
-    )
+    payment_providers = build_payment_provider_registry(settings.payment_providers)
+    app.state.payment_providers = payment_providers
 
     try:
         yield
     finally:
         try:
-            await yookassa_http_client.aclose()
+            await payment_providers.aclose()
         finally:
             try:
                 await notifications_http_client.aclose()

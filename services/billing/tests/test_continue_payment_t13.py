@@ -7,9 +7,10 @@ import pytest
 from fastapi import FastAPI
 
 from clients.payment_provider import ProviderTransientError
+from clients.payment_provider_registry import PaymentProviderRegistry
 from dependencies import (
     get_auth_gateway,
-    get_payment_provider,
+    get_payment_providers,
     get_purchase_service,
 )
 from main import create_app
@@ -41,13 +42,15 @@ async def continue_test_env() -> AsyncGenerator[
     auth = ConfigurableAuthGateway(user_id=user_id)
     service = PurchaseService(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
     )
 
     app = create_app(app_lifespan=None)
     app.dependency_overrides[get_auth_gateway] = lambda: auth
-    app.dependency_overrides[get_payment_provider] = lambda: provider
+    app.dependency_overrides[get_payment_providers] = lambda: (
+        PaymentProviderRegistry.single(provider)
+    )
     app.dependency_overrides[get_purchase_service] = lambda: service
 
     transport = httpx.ASGITransport(app=app)

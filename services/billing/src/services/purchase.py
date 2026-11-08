@@ -5,9 +5,9 @@ from api.errors import BillingDomainError
 from clients.payment_provider import (
     CreateProviderPaymentRequest,
     PaymentProviderError,
-    PaymentProviderGateway,
     ProviderPermanentError,
 )
+from clients.payment_provider_registry import PaymentProviderRegistry
 from domain.subscription import (
     MySubscriptionActionType,
     MySubscriptionStatusKey,
@@ -85,21 +85,26 @@ class PurchaseService:
         self,
         *,
         repository: PurchaseRepository,
-        payment_provider: PaymentProviderGateway,
+        payment_providers: PaymentProviderRegistry,
         public_base_url: str,
         reconciler: PaymentReconciler | None = None,
     ) -> None:
         self._repo = repository
-        self._provider = payment_provider
+        self._providers = payment_providers
         self._public_base_url = public_base_url.rstrip('/')
         self._reconciler = reconciler or PaymentReconciler(
             repository=repository,
-            payment_provider=payment_provider,
+            payment_providers=payment_providers,
             public_base_url=self._public_base_url,
         )
 
     async def start_or_continue_purchase(self, user_id: UUID) -> PurchaseOutcome:
-        payment, is_new = await self._repo.get_or_create_pending_payment(user_id)
+        # Новый платёж закрепляется за активным провайдером из конфигурации;
+        # уже созданный продолжает идти через свой provider_code.
+        payment, is_new = await self._repo.get_or_create_pending_payment(
+            user_id,
+            provider_code=self._providers.active_code,
+        )
         if not is_new:
             return await self._resolve_pending_payment(user_id, payment)
         return await self._create_in_provider(user_id, payment)
@@ -313,7 +318,7 @@ class PurchaseService:
     ) -> PurchaseOutcome:
         return_url = f'{self._public_base_url}/billing/payments/{payment.id}'
         try:
-            snapshot = await self._provider.create_payment(
+            snapshot = await self._providers.get(payment.provider_code).create_payment(
                 CreateProviderPaymentRequest(
                     payment_id=payment.id,
                     idempotency_key=payment.idempotency_key,

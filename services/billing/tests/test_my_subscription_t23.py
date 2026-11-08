@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from clients.payment_provider_registry import PaymentProviderRegistry
 from dependencies import (
     ACCESS_TOKEN_COOKIE,
     get_auth_gateway,
@@ -31,7 +32,7 @@ def _build_t23_app(
     app = create_app(app_lifespan=None)
     service = PurchaseService(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
     )
     app.dependency_overrides[get_purchase_service] = lambda: service

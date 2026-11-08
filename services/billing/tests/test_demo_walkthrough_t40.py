@@ -7,11 +7,12 @@ import httpx
 
 from clients.auth import SubscriptionAccessSyncResult
 from clients.notifications import NotificationsTransientError
+from clients.payment_provider_registry import PaymentProviderRegistry
 from dependencies import (
     get_auth_gateway,
     get_notifications_gateway,
     get_outbox_dispatcher,
-    get_payment_provider,
+    get_payment_providers,
     get_payment_reconciler,
     get_purchase_repository,
     get_purchase_service,
@@ -180,20 +181,22 @@ async def test_defense_presentation_and_full_demo_walkthrough_section_9_2() -> N
     )
     reconciler = PaymentReconciler(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
         outbox_dispatcher=dispatcher,
     )
     purchase_svc = PurchaseService(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         reconciler=reconciler,
         public_base_url='http://localhost',
     )
 
     app = create_app(app_lifespan=None)
     app.dependency_overrides[get_purchase_repository] = lambda: repo
-    app.dependency_overrides[get_payment_provider] = lambda: provider
+    app.dependency_overrides[get_payment_providers] = lambda: (
+        PaymentProviderRegistry.single(provider)
+    )
     app.dependency_overrides[get_auth_gateway] = lambda: auth_sim
     app.dependency_overrides[get_notifications_gateway] = lambda: ntf_sim
     app.dependency_overrides[get_outbox_dispatcher] = lambda: dispatcher

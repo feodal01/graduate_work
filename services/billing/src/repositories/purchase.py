@@ -441,6 +441,8 @@ class PurchaseRepository(Protocol):
     async def get_or_create_pending_payment(
         self,
         user_id: UUID,
+        *,
+        provider_code: str = DEFAULT_PROVIDER_CODE,
     ) -> tuple[PaymentRecordProtocol, bool]: ...
 
     async def save_provider_payment_created(
@@ -1884,8 +1886,15 @@ class SQLAlchemyPurchaseRepository:
     async def get_or_create_pending_payment(
         self,
         user_id: UUID,
+        *,
+        provider_code: str = DEFAULT_PROVIDER_CODE,
     ) -> tuple[Payment, bool]:
-        """Возвращает существующий pending-платёж или создаёт новый (инвариант 1)."""
+        """Возвращает существующий pending-платёж или создаёт новый (инвариант 1).
+
+        Новый платёж закрепляется за `provider_code` — активным провайдером
+        из конфигурации. Код должен быть в справочнике `payment_providers`
+        с `is_active=true`, иначе это ошибка конфигурации (BIL-NFR-S-02).
+        """
         try:
             async with self._session_factory() as session:
                 await self._acquire_user_lock(session, user_id)
@@ -1929,12 +1938,15 @@ class SQLAlchemyPurchaseRepository:
 
                 provider = await session.scalar(
                     select(PaymentProvider).where(
+                        PaymentProvider.code == provider_code,
                         PaymentProvider.is_active.is_(True),
                     )
                 )
-                provider_code = (
-                    provider.code if provider is not None else DEFAULT_PROVIDER_CODE
-                )
+                if provider is None:
+                    raise RuntimeError(
+                        f'Payment provider {provider_code!r} is not active '
+                        'in payment_providers table'
+                    )
 
                 payment_id = uuid4()
                 payment = Payment(

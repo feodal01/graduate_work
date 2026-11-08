@@ -9,12 +9,13 @@ import pytest
 from clients.auth import SubscriptionAccessSyncResult
 from clients.notifications import NotificationsTransientError
 from clients.payment_provider import YooKassaProviderAdapter
+from clients.payment_provider_registry import PaymentProviderRegistry
 from core.config import settings
 from dependencies import (
     get_auth_gateway,
     get_notifications_gateway,
     get_outbox_dispatcher,
-    get_payment_provider,
+    get_payment_providers,
     get_payment_reconciler,
     get_purchase_repository,
     get_purchase_service,
@@ -147,20 +148,22 @@ async def test_e2e_acceptance_criteria_task_1_to_6_and_link_navigation() -> None
     )
     reconciler = PaymentReconciler(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
         outbox_dispatcher=dispatcher,
     )
     purchase_svc = PurchaseService(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         reconciler=reconciler,
         public_base_url='http://localhost',
     )
 
     app = create_app(app_lifespan=None)
     app.dependency_overrides[get_purchase_repository] = lambda: repo
-    app.dependency_overrides[get_payment_provider] = lambda: provider
+    app.dependency_overrides[get_payment_providers] = lambda: (
+        PaymentProviderRegistry.single(provider)
+    )
     app.dependency_overrides[get_auth_gateway] = lambda: auth_gw
     app.dependency_overrides[get_notifications_gateway] = lambda: ntf_gw
     app.dependency_overrides[get_outbox_dispatcher] = lambda: dispatcher
@@ -504,8 +507,10 @@ async def test_e2e_acceptance_criteria_task_1_to_6_and_link_navigation() -> None
 @pytest.mark.integration
 async def test_live_yookassa_test_shop_sandbox_e2e() -> None:
     """T-36 (6.4, 9.1): сквозной проход приложения с тестовым магазином ЮKassa."""
-    shop_id = settings.yookassa.shop_id.strip()
-    secret_key = settings.yookassa.secret_key.get_secret_value().strip()
+    shop_id = settings.payment_providers.yookassa.shop_id.strip()
+    secret_key = (
+        settings.payment_providers.yookassa.secret_key.get_secret_value().strip()
+    )
     if shop_id in PLACEHOLDER_SHOP_IDS or secret_key in PLACEHOLDER_SECRETS:
         pytest.skip('Live YooKassa test shop credentials are not configured')
 
@@ -518,7 +523,7 @@ async def test_live_yookassa_test_shop_sandbox_e2e() -> None:
             http_client=yk_http,
             shop_id=shop_id,
             secret_key=secret_key,
-            base_url=str(settings.yookassa.api_base_url),
+            base_url=str(settings.payment_providers.yookassa.api_base_url),
         )
         dispatcher = OutboxDispatcher(
             repository=repo,
@@ -527,20 +532,22 @@ async def test_live_yookassa_test_shop_sandbox_e2e() -> None:
         )
         reconciler = PaymentReconciler(
             repository=repo,
-            payment_provider=adapter,
+            payment_providers=PaymentProviderRegistry.single(adapter),
             public_base_url='http://localhost',
             outbox_dispatcher=dispatcher,
         )
         purchase_svc = PurchaseService(
             repository=repo,
-            payment_provider=adapter,
+            payment_providers=PaymentProviderRegistry.single(adapter),
             reconciler=reconciler,
             public_base_url='http://localhost',
         )
 
         app = create_app(app_lifespan=None)
         app.dependency_overrides[get_purchase_repository] = lambda: repo
-        app.dependency_overrides[get_payment_provider] = lambda: adapter
+        app.dependency_overrides[get_payment_providers] = lambda: (
+            PaymentProviderRegistry.single(adapter)
+        )
         app.dependency_overrides[get_auth_gateway] = lambda: auth_gw
         app.dependency_overrides[get_notifications_gateway] = lambda: ntf_gw
         app.dependency_overrides[get_outbox_dispatcher] = lambda: dispatcher

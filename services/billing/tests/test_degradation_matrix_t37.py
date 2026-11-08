@@ -29,6 +29,7 @@ from clients.payment_provider import (
     ProviderTransientError,
     YooKassaProviderAdapter,
 )
+from clients.payment_provider_registry import PaymentProviderRegistry
 from core.config import settings
 from db.health import HealthCheck
 from dependencies import (
@@ -38,7 +39,7 @@ from dependencies import (
     get_database_health,
     get_notifications_gateway,
     get_outbox_dispatcher,
-    get_payment_provider,
+    get_payment_providers,
     get_payment_reconciler,
     get_purchase_repository,
     get_purchase_service,
@@ -296,20 +297,22 @@ async def test_degradation_matrix_rows_1_to_4_yookassa_failures(
     )
     reconciler = PaymentReconciler(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
         outbox_dispatcher=dispatcher,
     )
     purchase_svc = PurchaseService(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         reconciler=reconciler,
         public_base_url='http://localhost',
     )
 
     app = create_app(app_lifespan=None)
     app.dependency_overrides[get_purchase_repository] = lambda: repo
-    app.dependency_overrides[get_payment_provider] = lambda: provider
+    app.dependency_overrides[get_payment_providers] = lambda: (
+        PaymentProviderRegistry.single(provider)
+    )
     app.dependency_overrides[get_auth_gateway] = lambda: auth_gw
     app.dependency_overrides[get_notifications_gateway] = lambda: ntf_gw
     app.dependency_overrides[get_outbox_dispatcher] = lambda: dispatcher
@@ -531,20 +534,22 @@ async def test_degradation_matrix_rows_5_to_9_auth_notifications_and_db_failures
     )
     reconciler = PaymentReconciler(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
         outbox_dispatcher=dispatcher,
     )
     purchase_svc = PurchaseService(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         reconciler=reconciler,
         public_base_url='http://localhost',
     )
 
     app = create_app(app_lifespan=None)
     app.dependency_overrides[get_purchase_repository] = lambda: repo
-    app.dependency_overrides[get_payment_provider] = lambda: provider
+    app.dependency_overrides[get_payment_providers] = lambda: (
+        PaymentProviderRegistry.single(provider)
+    )
     app.dependency_overrides[get_auth_gateway] = lambda: auth_gw
     app.dependency_overrides[get_notifications_gateway] = lambda: ntf_gw
     app.dependency_overrides[get_outbox_dispatcher] = lambda: dispatcher

@@ -14,6 +14,7 @@ from clients.payment_provider import (
     ProviderTransientError,
     YooKassaProviderAdapter,
 )
+from clients.payment_provider_registry import PaymentProviderRegistry
 from dependencies import (
     get_payment_reconciler,
     get_purchase_repository,
@@ -230,7 +231,7 @@ async def test_refund_api_full_lifecycle_consequences_and_unhappy_paths() -> Non
     )
     reconciler = PaymentReconciler(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
         outbox_dispatcher=dispatcher,
     )
@@ -398,7 +399,7 @@ async def test_background_refund_reconcile_24h_metadata_lookup_and_webhook() -> 
     )
     reconciler = PaymentReconciler(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
         outbox_dispatcher=dispatcher,
     )
@@ -483,6 +484,7 @@ async def test_background_refund_reconcile_24h_metadata_lookup_and_webhook() -> 
     provider.next_get_refund_status = 'succeeded'
     wh_outcome = await reconciler.reconcile_by_provider_operation_id(
         'yk_ref_found_by_meta',
+        provider_code='yookassa',
         source='webhook',
     )
     assert wh_outcome is not None

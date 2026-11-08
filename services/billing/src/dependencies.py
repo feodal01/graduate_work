@@ -16,7 +16,7 @@ from clients.auth import (
     AuthServiceUnavailableError,
 )
 from clients.notifications import NotificationsGateway
-from clients.payment_provider import PaymentProviderGateway
+from clients.payment_provider_registry import PaymentProviderRegistry
 from core.config import settings
 from core.observability import get_current_request_id
 from db.health import HealthCheck
@@ -76,8 +76,8 @@ async def get_notifications_gateway(
     )
 
 
-async def get_payment_provider(request: Request) -> PaymentProviderGateway:
-    return cast(PaymentProviderGateway, request.app.state.payment_provider)
+async def get_payment_providers(request: Request) -> PaymentProviderRegistry:
+    return cast(PaymentProviderRegistry, request.app.state.payment_providers)
 
 
 async def get_outbox_dispatcher(
@@ -97,12 +97,12 @@ async def get_outbox_dispatcher(
 
 async def get_payment_reconciler(
     repo: PurchaseRepository = Depends(get_purchase_repository),
-    payment_provider: PaymentProviderGateway = Depends(get_payment_provider),
+    payment_providers: PaymentProviderRegistry = Depends(get_payment_providers),
     outbox_dispatcher: OutboxDispatcher = Depends(get_outbox_dispatcher),
 ) -> PaymentReconciler:
     return PaymentReconciler(
         repository=repo,
-        payment_provider=payment_provider,
+        payment_providers=payment_providers,
         public_base_url=str(settings.worker.billing_public_base_url),
         outbox_dispatcher=outbox_dispatcher,
     )
@@ -110,14 +110,14 @@ async def get_payment_reconciler(
 
 async def get_purchase_service(
     request: Request,
-    payment_provider: PaymentProviderGateway = Depends(get_payment_provider),
+    payment_providers: PaymentProviderRegistry = Depends(get_payment_providers),
     reconciler: PaymentReconciler = Depends(get_payment_reconciler),
 ) -> PurchaseService:
     database = cast(PostgresDatabase, request.app.state.database)
     repo = SQLAlchemyPurchaseRepository(database.sessionmaker)
     return PurchaseService(
         repository=repo,
-        payment_provider=payment_provider,
+        payment_providers=payment_providers,
         public_base_url=str(settings.worker.billing_public_base_url),
         reconciler=reconciler,
     )

@@ -1421,6 +1421,7 @@ services:
       NOTIFICATIONS_CAMPAIGN_API_KEY: ${NOTIFICATIONS_CAMPAIGN_API_KEY}
       AUTH_SERVICE_URL: http://auth:8000
       NOTIFICATIONS_CAMPAIGN_URL: http://notifications-campaign-api:8000
+      PAYMENT_PROVIDER_ACTIVE: ${PAYMENT_PROVIDER_ACTIVE:-yookassa}
       YOOKASSA_SHOP_ID: ${YOOKASSA_SHOP_ID:-replace-with-test-yookassa-shop-id}
       YOOKASSA_SECRET_KEY: ${YOOKASSA_SECRET_KEY:-replace-with-test-yookassa-secret-key}
       YOOKASSA_API_BASE_URL: ${YOOKASSA_API_BASE_URL:-https://api.yookassa.ru/v3}
@@ -1477,6 +1478,7 @@ services:
       NOTIFICATIONS_CAMPAIGN_API_KEY: ${NOTIFICATIONS_CAMPAIGN_API_KEY}
       AUTH_SERVICE_URL: http://auth:8000
       NOTIFICATIONS_CAMPAIGN_URL: http://notifications-campaign-api:8000
+      PAYMENT_PROVIDER_ACTIVE: ${PAYMENT_PROVIDER_ACTIVE:-yookassa}
       YOOKASSA_SHOP_ID: ${YOOKASSA_SHOP_ID:-replace-with-test-yookassa-shop-id}
       YOOKASSA_SECRET_KEY: ${YOOKASSA_SECRET_KEY:-replace-with-test-yookassa-secret-key}
       YOOKASSA_API_BASE_URL: ${YOOKASSA_API_BASE_URL:-https://api.yookassa.ru/v3}

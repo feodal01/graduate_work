@@ -10,7 +10,7 @@ from opentelemetry.sdk.trace import TracerProvider
 
 from clients.auth import HttpAuthGateway
 from clients.notifications import HttpNotificationsGateway
-from clients.payment_provider import YooKassaProviderAdapter
+from clients.payment_provider_registry import build_payment_provider_registry
 from core.config import ServiceSettings, settings
 from core.logger import LOGGING, add_logstash_handler
 from core.observability import init_sentry
@@ -157,9 +157,6 @@ async def main() -> None:
     notifications_http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(settings.notifications_client.timeout_seconds)
     )
-    yookassa_http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(settings.yookassa.timeout_seconds)
-    )
     auth_gateway = HttpAuthGateway(
         http_client=auth_http_client,
         base_url=str(settings.auth_client.service_url),
@@ -171,12 +168,7 @@ async def main() -> None:
         base_url=str(settings.notifications_client.campaign_url),
         api_key=settings.notifications_client.campaign_api_key.get_secret_value(),
     )
-    payment_provider = YooKassaProviderAdapter(
-        http_client=yookassa_http_client,
-        shop_id=settings.yookassa.shop_id,
-        secret_key=settings.yookassa.secret_key.get_secret_value(),
-        base_url=str(settings.yookassa.api_base_url),
-    )
+    payment_providers = build_payment_provider_registry(settings.payment_providers)
     repo = SQLAlchemyPurchaseRepository(database.sessionmaker)
     outbox_dispatcher = OutboxDispatcher(
         repository=repo,
@@ -186,7 +178,7 @@ async def main() -> None:
     )
     reconciler = PaymentReconciler(
         repository=repo,
-        payment_provider=payment_provider,
+        payment_providers=payment_providers,
         public_base_url=str(settings.worker.billing_public_base_url),
         outbox_dispatcher=outbox_dispatcher,
     )
@@ -225,7 +217,7 @@ async def main() -> None:
         await runner.run()
     finally:
         try:
-            await yookassa_http_client.aclose()
+            await payment_providers.aclose()
         finally:
             try:
                 await notifications_http_client.aclose()

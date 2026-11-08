@@ -11,7 +11,8 @@ from clients.payment_provider import (
     ProviderPermanentError,
     ProviderTransientError,
 )
-from dependencies import AuthenticatedUser, get_auth_gateway, get_payment_provider
+from clients.payment_provider_registry import PaymentProviderRegistry
+from dependencies import AuthenticatedUser, get_auth_gateway, get_payment_providers
 from main import create_app
 from tests.fakes import (
     ConfigurableAuthGateway,
@@ -46,7 +47,7 @@ async def purchase_test_env() -> AsyncGenerator[
     provider = FakeProviderGateway()
     service = PurchaseService(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
     )
 
@@ -54,7 +55,9 @@ async def purchase_test_env() -> AsyncGenerator[
     app.dependency_overrides[get_auth_gateway] = lambda: ConfigurableAuthGateway(
         user_id
     )
-    app.dependency_overrides[get_payment_provider] = lambda: provider
+    app.dependency_overrides[get_payment_providers] = lambda: (
+        PaymentProviderRegistry.single(provider)
+    )
     app.dependency_overrides[get_purchase_service] = lambda: service
 
     transport = httpx.ASGITransport(app=app)

@@ -11,9 +11,9 @@ from clients.payment_provider import (
     CreateProviderPaymentRequest,
     CreateProviderRefundRequest,
     PaymentProviderError,
-    PaymentProviderGateway,
     ProviderPermanentError,
 )
+from clients.payment_provider_registry import PaymentProviderRegistry
 from core.observability import correlation_request_id
 from domain.subscription import ReconcileSource
 from repositories.purchase import PaymentRecordProtocol, RefundRecordProtocol
@@ -136,12 +136,12 @@ class PaymentReconciler:
         self,
         *,
         repository: ReconcileRepositoryProtocol,
-        payment_provider: PaymentProviderGateway,
+        payment_providers: PaymentProviderRegistry,
         public_base_url: str = 'http://localhost',
         outbox_dispatcher: OutboxDispatcherProtocol | None = None,
     ) -> None:
         self._repo = repository
-        self._provider = payment_provider
+        self._providers = payment_providers
         self._public_base_url = public_base_url.rstrip('/')
         self._outbox_dispatcher = outbox_dispatcher
 
@@ -171,12 +171,13 @@ class PaymentReconciler:
         self,
         provider_payment_id: str,
         *,
+        provider_code: str,
         source: ReconcileSource = 'webhook',
         respect_throttle: bool = False,
     ) -> ReconcileOutcome | None:
         cleaned_id = provider_payment_id.strip()
         payment = await self._repo.get_payment_by_provider_id(
-            self._provider.provider_code,
+            provider_code,
             cleaned_id,
         )
         if payment is None:
@@ -192,12 +193,15 @@ class PaymentReconciler:
         self,
         provider_operation_id: str,
         *,
+        provider_code: str,
         source: ReconcileSource = 'webhook',
         respect_throttle: bool = False,
     ) -> ReconcileOutcome | RefundReconcileOutcome | None:
+        """Сверяет операцию из вебхука провайдера `provider_code` (BIL-FR-07)."""
         cleaned_id = provider_operation_id.strip()
         pay_outcome = await self.reconcile_by_provider_payment_id(
             cleaned_id,
+            provider_code=provider_code,
             source=source,
             respect_throttle=respect_throttle,
         )
@@ -207,7 +211,7 @@ class PaymentReconciler:
         get_refund_by_prov = getattr(self._repo, 'get_refund_by_provider_id', None)
         if get_refund_by_prov is not None:
             refund = await get_refund_by_prov(
-                self._provider.provider_code,
+                provider_code,
                 cleaned_id,
             )
             if refund is not None:
@@ -316,7 +320,9 @@ class PaymentReconciler:
             # До 24 часов: досоздаём платёж по тому же ключу и проверяем через GET
             return_url = f'{self._public_base_url}/billing/payments/{payment.id}'
             try:
-                created_snapshot = await self._provider.create_payment(
+                created_snapshot = await self._providers.get(
+                    payment.provider_code
+                ).create_payment(
                     CreateProviderPaymentRequest(
                         payment_id=payment.id,
                         idempotency_key=payment.idempotency_key,
@@ -404,7 +410,7 @@ class PaymentReconciler:
                 throttled=True,
             )
 
-        snapshot = await self._provider.get_payment(
+        snapshot = await self._providers.get(payment.provider_code).get_payment(
             payment.provider_payment_id,
             expected_payment_id=payment.id,
             expected_amount_kopeks=payment.amount_kopeks,
@@ -493,7 +499,9 @@ class PaymentReconciler:
                     throttled=False,
                 )
             try:
-                created_snap = await self._provider.create_refund(
+                created_snap = await self._providers.get(
+                    refund.provider_code
+                ).create_refund(
                     CreateProviderRefundRequest(
                         refund_id=refund.id,
                         idempotency_key=refund.idempotency_key,
@@ -650,7 +658,9 @@ class PaymentReconciler:
             # Инвариант 14: после истечения 24 часов ищем возврат в списке возвратов
             # по нашему refund_id в metadata.
             if (now_utc - created_at) >= IDEMPOTENCY_KEY_TTL:
-                found_snap = await self._provider.find_refund_by_metadata(
+                found_snap = await self._providers.get(
+                    refund.provider_code
+                ).find_refund_by_metadata(
                     payment.provider_payment_id,
                     refund_id=refund.id,
                     expected_amount_kopeks=refund.amount_kopeks,
@@ -674,7 +684,9 @@ class PaymentReconciler:
                 )
             else:
                 try:
-                    created_snap = await self._provider.create_refund(
+                    created_snap = await self._providers.get(
+                        refund.provider_code
+                    ).create_refund(
                         CreateProviderRefundRequest(
                             refund_id=refund.id,
                             idempotency_key=refund.idempotency_key,
@@ -769,7 +781,7 @@ class PaymentReconciler:
         finalize_succeeded_fn = getattr(self._repo, 'finalize_refund_succeeded')
         finalize_rejected_fn = getattr(self._repo, 'finalize_refund_rejected')
 
-        snapshot = await self._provider.get_refund(
+        snapshot = await self._providers.get(refund.provider_code).get_refund(
             refund.provider_refund_id,
             expected_refund_id=refund.id,
             expected_amount_kopeks=refund.amount_kopeks,

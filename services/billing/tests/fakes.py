@@ -385,6 +385,8 @@ class InMemoryPurchaseRepository:
     async def get_or_create_pending_payment(
         self,
         user_id: UUID,
+        *,
+        provider_code: str = 'yookassa',
     ) -> tuple[FakePaymentRow, bool]:
         """Возвращает существующий или создаёт новый pending-платёж."""
         allowed, block_code = await self.check_purchase_allowed(user_id)
@@ -408,7 +410,7 @@ class InMemoryPurchaseRepository:
             id=pid,
             user_id=user_id,
             tariff_id=UUID('00000000-0000-0000-0000-000000000001'),
-            provider_code='yookassa',
+            provider_code=provider_code,
             amount_kopeks=29_900,
             currency='RUB',
             status='pending',

@@ -123,6 +123,26 @@ class YooKassaSettings(BaseSettings):
     timeout_seconds: float = Field(default=5.0, gt=0, le=5.0)
 
 
+class PaymentProvidersSettings(BaseSettings):
+    """Платёжные провайдеры: активный для новых платежей и реквизиты каждого.
+
+    Реквизиты у провайдеров разные, поэтому у каждого свой вложенный класс
+    со своим префиксом переменных окружения (`YOOKASSA_*`, ...). Новый провайдер
+    добавляется полем здесь и адаптером в реестре (BIL-NFR-S-02).
+    """
+
+    model_config = SettingsConfigDict(
+        hide_input_in_errors=True,
+        env_file=_ENV_FILE,
+        env_file_encoding='utf-8',
+        env_prefix='PAYMENT_PROVIDER_',
+        extra='ignore',
+    )
+
+    active: str = Field(default='yookassa', min_length=1, max_length=32)
+    yookassa: YooKassaSettings = Field(default_factory=YooKassaSettings)
+
+
 class WorkerSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=_ENV_FILE,
@@ -193,7 +213,7 @@ class Settings(BaseSettings):
     postgres: PostgresSettings
     auth_client: AuthClientSettings
     notifications_client: NotificationsClientSettings
-    yookassa: YooKassaSettings
+    payment_providers: PaymentProvidersSettings
     worker: WorkerSettings
     tracing: TracingSettings
     sentry: SentrySettings = Field(default_factory=SentrySettings)
@@ -204,7 +224,7 @@ settings = Settings(
     postgres=PostgresSettings(),
     auth_client=AuthClientSettings(),
     notifications_client=NotificationsClientSettings(),
-    yookassa=YooKassaSettings(),
+    payment_providers=PaymentProvidersSettings(),
     worker=WorkerSettings(),
     tracing=TracingSettings(),
 )

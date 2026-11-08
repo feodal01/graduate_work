@@ -10,6 +10,7 @@ from clients.auth import (
     HttpAuthGateway,
     SubscriptionAccessSyncResult,
 )
+from clients.payment_provider_registry import PaymentProviderRegistry
 from services.outbox_dispatcher import OutboxDispatcher
 from services.reconciler import PaymentReconciler
 from tests.fakes import (
@@ -117,7 +118,7 @@ async def test_reconciler_immediately_dispatches_auth_access() -> None:
     )
     reconciler = PaymentReconciler(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
         outbox_dispatcher=dispatcher,
     )
@@ -181,7 +182,7 @@ async def test_immediate_dispatch_handles_auth_outage_and_4xx(
     )
     reconciler = PaymentReconciler(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
         outbox_dispatcher=dispatcher,
     )

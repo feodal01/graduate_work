@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from clients.notifications import HttpNotificationsGateway
+from clients.payment_provider_registry import PaymentProviderRegistry
 from domain.subscription import (
     SubscriptionState,
     compute_subscription_state,
@@ -55,7 +56,7 @@ async def test_subscription_expiration_email_scheduled_on_exact_end_date_t() -> 
         )
         reconciler = PaymentReconciler(
             repository=repo,
-            payment_provider=provider,
+            payment_providers=PaymentProviderRegistry.single(provider),
             public_base_url='https://cinema.example',
             outbox_dispatcher=dispatcher,
         )

@@ -12,10 +12,11 @@ from clients.payment_provider import (
     ProviderReconciliationError,
     ProviderTransientError,
 )
+from clients.payment_provider_registry import PaymentProviderRegistry
 from dependencies import (
     get_auth_gateway,
     get_outbox_dispatcher,
-    get_payment_provider,
+    get_payment_providers,
     get_payment_reconciler,
 )
 from main import create_app
@@ -48,14 +49,16 @@ async def webhook_test_env() -> AsyncGenerator[
     dispatcher = OutboxDispatcher(repository=repo, auth_gateway=auth)
     reconciler = PaymentReconciler(
         repository=repo,
-        payment_provider=provider,
+        payment_providers=PaymentProviderRegistry.single(provider),
         public_base_url='http://localhost',
         outbox_dispatcher=dispatcher,
     )
 
     app = create_app(app_lifespan=None)
     app.dependency_overrides[get_auth_gateway] = lambda: auth
-    app.dependency_overrides[get_payment_provider] = lambda: provider
+    app.dependency_overrides[get_payment_providers] = lambda: (
+        PaymentProviderRegistry.single(provider)
+    )
     app.dependency_overrides[get_outbox_dispatcher] = lambda: dispatcher
     app.dependency_overrides[get_payment_reconciler] = lambda: reconciler
 

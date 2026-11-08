@@ -9,6 +9,7 @@ from clients.payment_provider import (
     PaymentProviderError,
     ProviderIntegrityMismatchError,
     ProviderProtocolAnomalyError,
+    YooKassaProviderAdapter,
 )
 from dependencies import get_payment_reconciler
 from services.reconciler import PaymentReconciler
@@ -57,13 +58,9 @@ async def handle_yookassa_webhook(
 ) -> YooKassaWebhookResponse:
     """Обработчик входящих уведомлений ЮKassa (BIL-FR-07, BIL-API-05, US-S-01)."""
     try:
-        reconcile_fn = getattr(
-            reconciler,
-            'reconcile_by_provider_operation_id',
-            reconciler.reconcile_by_provider_payment_id,
-        )
-        await reconcile_fn(
+        await reconciler.reconcile_by_provider_operation_id(
             payload.object.id,
+            provider_code=YooKassaProviderAdapter.provider_code,
             source='webhook',
             respect_throttle=False,
         )
