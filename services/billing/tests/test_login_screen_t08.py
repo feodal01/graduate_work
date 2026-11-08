@@ -303,6 +303,54 @@ async def test_post_logout_clears_cookies_and_redirects_to_login(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('cookies', 'expected_call'),
+    [
+        ({'billing_access_token': 'only-access'}, ('only-access', '')),
+        ({'billing_refresh_token': 'only-refresh'}, ('', 'only-refresh')),
+    ],
+)
+async def test_post_logout_calls_auth_with_any_single_cookie(
+    login_client: tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],
+    cookies: dict[str, str],
+    expected_call: tuple[str, str],
+) -> None:
+    """BIL-NFR-SEC-05: Auth вызывается, даже если пришёл только один токен."""
+    client, _, fake_auth = login_client
+    for name, value in cookies.items():
+        client.cookies.set(name, value)
+
+    response = await client.post('/billing/logout')
+
+    assert response.status_code == 303
+    assert fake_auth.logout_called_with == expected_call
+
+
+@pytest.mark.asyncio
+async def test_post_logout_clears_cookies_even_if_gateway_crashes(
+    login_client: tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BIL-API-01: дефект в gateway не мешает выйти — всегда 303 и очистка cookie."""
+    client, _, fake_auth = login_client
+
+    async def crash(*_: object, **__: object) -> None:
+        raise RuntimeError('unexpected gateway bug')
+
+    monkeypatch.setattr(fake_auth, 'logout', crash)
+    client.cookies.set('billing_access_token', 'valid-access-token')
+    client.cookies.set('billing_refresh_token', 'valid-refresh-token')
+
+    response = await client.post('/billing/logout')
+
+    assert response.status_code == 303
+    assert response.headers['location'] == '/billing/login'
+    cleared = ' '.join(response.headers.get_list('set-cookie'))
+    assert 'billing_access_token=""' in cleared
+    assert 'billing_refresh_token=""' in cleared
+
+
+@pytest.mark.asyncio
 async def test_ui_and_api_user_authentication_redirects_or_returns_401_and_503(
     login_client: tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],
 ) -> None:

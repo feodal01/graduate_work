@@ -655,6 +655,51 @@ async def test_logout_returns_empty_204_and_revokes_both_tokens(
     assert revoked_refresh.json() == {'detail': 'Invalid refresh token'}
 
 
+@pytest.mark.asyncio
+async def test_logout_without_refresh_token_revokes_access_only(
+    client: httpx.AsyncClient,
+) -> None:
+    """Logout без refresh_token отзывает access, а чужой refresh не трогает."""
+    await signup(client)
+    pair = await login(client)
+
+    response = await client.post(
+        '/api/v1/auth/logout',
+        json={},
+        headers=bearer(pair['access_token']),
+    )
+    revoked_access = await client.get(
+        '/api/v1/auth/login-history',
+        headers=bearer(pair['access_token']),
+    )
+    still_valid_refresh = await client.post(
+        '/api/v1/auth/refresh',
+        json={'refresh_token': pair['refresh_token']},
+    )
+
+    assert response.status_code == 204
+    assert revoked_access.status_code == 401
+    assert revoked_access.json() == {'detail': 'Token revoked'}
+    assert still_valid_refresh.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_logout_rejects_empty_refresh_token_string(
+    client: httpx.AsyncClient,
+) -> None:
+    """Пустая строка в refresh_token остаётся ошибкой валидации."""
+    await signup(client)
+    pair = await login(client)
+
+    response = await client.post(
+        '/api/v1/auth/logout',
+        json={'refresh_token': ''},
+        headers=bearer(pair['access_token']),
+    )
+
+    assert response.status_code == 422
+
+
 async def test_contact_profile_and_delete_api(client: httpx.AsyncClient) -> None:
     """Contact PATCH distinguishes null and omitted fields; DELETE revokes sessions."""
     response = await client.post(

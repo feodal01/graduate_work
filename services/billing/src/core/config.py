@@ -98,6 +98,8 @@ class AuthClientSettings(BaseSettings):
 
     service_url: AnyHttpUrl = AnyHttpUrl('http://auth:8000')
     timeout_seconds: float = Field(default=3.0, gt=0)
+    # Общий лимит на весь выход, включая обходной refresh (BIL-NFR-SEC-05).
+    logout_timeout_seconds: float = Field(default=1.5, gt=0, le=5.0)
 
 
 class YooKassaSettings(BaseSettings):

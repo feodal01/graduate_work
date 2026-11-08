@@ -47,7 +47,9 @@ class RefreshRequest(BaseModel):
 
 
 class LogoutRequest(BaseModel):
-    refresh_token: str = Field(min_length=1)
+    # Необязателен: клиент, у которого остался только access, всё равно
+    # должен иметь возможность отозвать его (BIL-NFR-SEC-05).
+    refresh_token: str | None = Field(default=None, min_length=1)
 
 
 class ProfileUpdateRequest(ContactProfile):

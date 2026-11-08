@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -10,6 +12,7 @@ from clients.auth import (
     AuthInvalidCredentialsError,
     AuthPermanentDeliveryError,
     AuthServiceUnavailableError,
+    HttpAuthGateway,
     SubscriptionAccessSyncResult,
 )
 from clients.notifications import (
@@ -30,6 +33,7 @@ from core.config import settings
 from db.health import HealthCheck
 from dependencies import (
     ACCESS_TOKEN_COOKIE,
+    REFRESH_TOKEN_COOKIE,
     get_auth_gateway,
     get_database_health,
     get_notifications_gateway,
@@ -780,3 +784,52 @@ async def test_degradation_matrix_rows_5_to_9_auth_notifications_and_db_failures
         repo.payments[pay_3_id].last_checked_at = None
         await reconciler.reconcile_due_pending_payments(min_age_seconds=0.0)
         assert repo.payments[pay_3_id].status == 'succeeded'
+
+
+@pytest.mark.parametrize('failure', ['network', 'http_503', 'timeout'])
+async def test_degradation_matrix_auth_unavailable_on_logout(
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+) -> None:
+    """6.3, Billing → Auth (выход): Auth недоступен — всё равно выходим.
+
+    Cookie очищаются, редирект на экран входа, WARNING в лог (не сигнал
+    в GlitchTip); неотозванные токены истекают по TTL (BIL-NFR-SEC-05).
+    """
+
+    async def unavailable_auth(request: httpx.Request) -> httpx.Response:
+        if failure == 'network':
+            raise httpx.ConnectError('Auth unreachable', request=request)
+        if failure == 'timeout':
+            await asyncio.sleep(5)
+        return httpx.Response(503, json={'detail': 'Service unavailable'})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(unavailable_auth)
+    ) as auth_http:
+        gateway = HttpAuthGateway(
+            http_client=auth_http,
+            base_url='http://auth:8000',
+            logout_timeout_seconds=0.05,
+        )
+        app = create_app(app_lifespan=None)
+        app.dependency_overrides[get_auth_gateway] = lambda: gateway
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url='http://testserver',
+            follow_redirects=False,
+        ) as client:
+            client.cookies.set(ACCESS_TOKEN_COOKIE, 'matrix-jwt-access')
+            client.cookies.set(REFRESH_TOKEN_COOKIE, 'matrix-jwt-ref')
+            with caplog.at_level(logging.WARNING):
+                response = await client.post(
+                    '/billing/logout', headers={'X-Request-Id': 't37-logout'}
+                )
+
+    assert response.status_code == 303
+    assert response.headers['location'] == '/billing/login'
+    cleared = ' '.join(response.headers.get_list('set-cookie'))
+    assert f'{ACCESS_TOKEN_COOKIE}=""' in cleared
+    assert f'{REFRESH_TOKEN_COOKIE}=""' in cleared
+    assert 'revocation on logout failed' in caplog.text
+    assert not any(record.levelno >= logging.ERROR for record in caplog.records)

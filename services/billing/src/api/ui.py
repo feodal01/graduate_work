@@ -1,3 +1,4 @@
+import logging
 from typing import Annotated
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -23,6 +24,8 @@ from dependencies import (
     require_ui_user,
 )
 from services.purchase import PurchaseService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=['billing-ui'])
 
@@ -177,15 +180,23 @@ async def submit_logout(
     request: Request,
     auth_gateway: Annotated[AuthGateway, Depends(get_auth_gateway)],
 ) -> RedirectResponse:
-    """Выход пользователя с очисткой HttpOnly-cookie и редиректом на экран входа."""
+    """Выход: отзыв сессии в Auth по возможности, затем очистка cookie (BIL-API-01).
+
+    Ответ всегда `303` на экран входа: недоступность Auth не мешает выйти,
+    неотозванные токены истекают по TTL (BIL-NFR-SEC-05, матрица 6.3).
+    """
     access_token = request.cookies.get(ACCESS_TOKEN_COOKIE, '')
     refresh_token = request.cookies.get(REFRESH_TOKEN_COOKIE, '')
-    if access_token and refresh_token:
-        await auth_gateway.logout(
-            access_token,
-            refresh_token,
-            request_id=get_current_request_id(),
-        )
+    if access_token or refresh_token:
+        try:
+            await auth_gateway.logout(
+                access_token,
+                refresh_token,
+                request_id=get_current_request_id(),
+            )
+        except Exception:
+            # Gateway сам глушит ошибки Auth; сюда попадает только дефект кода.
+            logger.exception('Unexpected error while revoking Auth session')
     secure_cookie = _is_secure_request(request)
     redirect = RedirectResponse(
         url='/billing/login',

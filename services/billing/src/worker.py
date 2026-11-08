@@ -164,6 +164,7 @@ async def main() -> None:
         http_client=auth_http_client,
         base_url=str(settings.auth_client.service_url),
         service_api_key=service_settings.api_key.get_secret_value(),
+        logout_timeout_seconds=settings.auth_client.logout_timeout_seconds,
     )
     notifications_gateway = HttpNotificationsGateway(
         http_client=notifications_http_client,

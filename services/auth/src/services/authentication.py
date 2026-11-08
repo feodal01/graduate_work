@@ -265,18 +265,19 @@ class AuthenticationService:
     async def logout(
         self,
         current_user: CurrentUser,
-        refresh_token: str,
+        refresh_token: str | None,
     ) -> None:
         refresh_token_id = None
-        try:
-            refresh_claims = self._token_service.decode(
-                refresh_token,
-                'refresh',
-            )
-            if refresh_claims.user_id == current_user.user_id:
-                refresh_token_id = refresh_claims.token_id
-        except (TokenExpiredError, InvalidTokenError):
-            pass
+        if refresh_token:
+            try:
+                refresh_claims = self._token_service.decode(
+                    refresh_token,
+                    'refresh',
+                )
+                if refresh_claims.user_id == current_user.user_id:
+                    refresh_token_id = refresh_claims.token_id
+            except (TokenExpiredError, InvalidTokenError):
+                pass
 
         await self._token_sessions.revoke_session(
             user_id=current_user.user_id,
