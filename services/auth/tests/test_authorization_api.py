@@ -168,7 +168,7 @@ async def test_service_rate_limit_runs_only_after_service_authentication(
 
     assert valid.status_code == 200
     assert [(call[0].name, call[1]) for call in context.rate_limiter.calls] == [
-        ('service', 'movies-api')
+        ('service', 'internal-service:permission-check')
     ]
 
 
@@ -535,3 +535,39 @@ async def test_role_assignment_reports_unavailable_cache(
     assert response.status_code == 503
     assert response.json() == {'detail': 'Cache is unavailable'}
     assert (target.id, role.id) not in context.roles.assignments
+
+
+@pytest.mark.asyncio
+async def test_internal_endpoints_spend_separate_service_buckets(
+    context: ApiContext,
+) -> None:
+    """Проверки прав от movies-api не тратят квоту доставки доступа из Billing.
+
+    Регрессия: все внутренние вызовы делили одну корзину `movies-api`, и при
+    потоке просмотров фильмов Billing получал 429 на AUTH-API-01.
+    """
+    user, _ = await create_user(context, login='BucketUser')
+    context.roles.users.add(user.id)
+    await context.roles.create(
+        name='subscriber',
+        permission_codes={FILM_EARLY_ACCESS_READ},
+    )
+
+    check = await context.client.post(
+        '/api/v1/auth/permissions/check',
+        json=film_request('2020-01-01'),
+        headers=service_headers(),
+    )
+    access = await context.client.put(
+        f'/api/v1/internal/users/{user.id}/subscription-access',
+        json={'version': 1, 'expires_at': None},
+        headers=service_headers(),
+    )
+
+    assert check.status_code == 200
+    assert access.status_code == 200, access.text
+    identities = [identity for _, identity in context.rate_limiter.calls]
+    assert identities == [
+        'internal-service:permission-check',
+        'internal-service:subscription-access',
+    ]

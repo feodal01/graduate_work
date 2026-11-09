@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.v1.authorization import enforce_service_rate_limit
+from api.v1.authorization import service_rate_limit
 from db.sql.postgres import get_session
 from repositories.notification_contacts import read_notification_contacts
 from schemas.notification_contacts import (
@@ -25,7 +25,7 @@ router = APIRouter(tags=['internal-notification-contacts'])
 )
 async def notification_contacts(
     payload: NotificationContactsRequest,
-    _rate_limit: Annotated[None, Depends(enforce_service_rate_limit)],
+    _rate_limit: Annotated[None, Depends(service_rate_limit('notification-contacts'))],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> NotificationContactsResponse:
     contacts = await read_notification_contacts(session, payload.user_ids)

@@ -1,4 +1,5 @@
-from typing import Annotated
+from collections.abc import Callable, Coroutine
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, Response, status
@@ -27,17 +28,31 @@ from services.types import CurrentUser
 router = APIRouter(tags=['authorization'])
 
 
-async def enforce_service_rate_limit(
-    request: Request,
-    service_identity: Annotated[str, Depends(require_internal_service)],
-    limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
-) -> None:
-    await enforce_rate_limit(
-        request=request,
-        limiter=limiter,
-        policy=policy('service', settings.rate_limit),
-        identity=service_identity,
-    )
+def service_rate_limit(
+    purpose: str,
+) -> Callable[..., Coroutine[Any, Any, None]]:
+    """Сервисная квота отдельно для каждого назначения внутреннего API.
+
+    Все внутренние сервисы предъявляют один ключ, поэтому раньше у них была
+    одна общая квота: поток проверок прав от movies-api (на каждую карточку
+    фильма) выбирал её, и доставка доступа из Billing получала 429. Теперь
+    проверка прав, доставка доступа, контакты и поиск пользователей считаются
+    в разных корзинах.
+    """
+
+    async def enforce(
+        request: Request,
+        service_identity: Annotated[str, Depends(require_internal_service)],
+        limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
+    ) -> None:
+        await enforce_rate_limit(
+            request=request,
+            limiter=limiter,
+            policy=policy('service', settings.rate_limit),
+            identity=f'{service_identity}:{purpose}',
+        )
+
+    return enforce
 
 
 @router.get(
@@ -209,7 +224,7 @@ async def revoke_role(
 )
 async def check_permission(
     payload: PermissionCheckRequest,
-    _rate_limit: Annotated[None, Depends(enforce_service_rate_limit)],
+    _rate_limit: Annotated[None, Depends(service_rate_limit('permission-check'))],
     current_user: Annotated[
         CurrentUser | None,
         Depends(get_optional_current_user),

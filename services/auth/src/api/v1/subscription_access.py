@@ -3,7 +3,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends
 
-from api.v1.authorization import enforce_service_rate_limit
+from api.v1.authorization import service_rate_limit
 from dependencies import get_authorization_service
 from schemas.subscription_access import (
     SubscriptionAccessPutRequest,
@@ -27,7 +27,7 @@ router = APIRouter(tags=['internal-subscription-access'])
 async def put_subscription_access(
     user_id: UUID,
     payload: SubscriptionAccessPutRequest,
-    _rate_limit: Annotated[None, Depends(enforce_service_rate_limit)],
+    _rate_limit: Annotated[None, Depends(service_rate_limit('subscription-access'))],
     service: Annotated[
         AuthorizationService,
         Depends(get_authorization_service),

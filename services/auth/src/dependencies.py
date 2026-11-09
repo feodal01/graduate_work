@@ -244,4 +244,6 @@ async def require_internal_service(
     provided_key = service_api_key if service_api_key is not None else service_key
     if not credentials.verify(provided_key):
         raise InvalidServiceCredentialsError
-    return 'movies-api'
+    # Ключ общий для всех внутренних сервисов, поэтому вызывающего различить
+    # нельзя. Отдельные квоты задаёт назначение эндпоинта (`service_rate_limit`).
+    return 'internal-service'

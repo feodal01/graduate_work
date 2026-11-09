@@ -119,4 +119,4 @@ async def test_introspection_has_separate_service_rate_bucket(
         PATH, headers={'X-Service-Key': SERVICE_KEY}, json={'token': 'invalid'}
     )
     assert result.status_code == 200
-    assert rate_limiter.calls[-1][1] == 'movies-api:token-introspection'
+    assert rate_limiter.calls[-1][1] == 'internal-service:token-introspection'

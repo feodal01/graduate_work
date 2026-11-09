@@ -201,7 +201,7 @@ async def test_service_rate_limit_rejects_before_contact_query(
     )
     assert response.status_code == 429
     assert response.headers['Retry-After'] == '12'
-    assert calls == [('service', 'movies-api')]
+    assert calls == [('service', 'internal-service:notification-contacts')]
 
 
 async def test_deleted_and_unrequested_profiles_never_reveal_contacts(

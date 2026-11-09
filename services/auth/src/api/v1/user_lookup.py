@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.v1.authorization import enforce_service_rate_limit
+from api.v1.authorization import service_rate_limit
 from db.sql.postgres import get_session
 from repositories.user_lookup import lookup_users
 from schemas.user_lookup import UsersLookupRequest, UsersLookupResponse
@@ -22,7 +22,7 @@ router = APIRouter(tags=['internal-user-lookup'])
 )
 async def post_users_lookup(
     payload: UsersLookupRequest,
-    _rate_limit: Annotated[None, Depends(enforce_service_rate_limit)],
+    _rate_limit: Annotated[None, Depends(service_rate_limit('user-lookup'))],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> UsersLookupResponse:
     items = await lookup_users(
