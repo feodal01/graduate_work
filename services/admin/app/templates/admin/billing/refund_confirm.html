@@ -63,6 +63,7 @@
 {% if card.can_refund %}
 <form method="post" action="{% url 'admin:billing_payment_refund' payment_id %}">
   {% csrf_token %}
+  <input type="hidden" name="refund_id" value="{{ refund_attempt_id }}">
   <div style="margin-bottom: 12px;">
     <label for="id_reason"><strong>Причина возврата (обязательно для журнала действий поддержки):</strong></label><br>
     <textarea id="id_reason" name="reason" rows="3" cols="60" placeholder="Укажите причину возврата средств">{{ reason }}</textarea>

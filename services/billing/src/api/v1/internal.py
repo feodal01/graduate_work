@@ -187,6 +187,8 @@ class CreateRefundRequest(BaseModel):
 
     admin_user_id: UUID
     reason: str
+    # UUID попытки из формы админки: повтор той же формы идемпотентен.
+    refund_id: UUID | None = None
 
     @field_validator('reason')
     @classmethod
@@ -565,6 +567,7 @@ async def post_internal_payment_refund(
         payment_id,
         admin_user_id=payload.admin_user_id,
         reason=payload.reason,
+        refund_id=payload.refund_id,
     )
     r_status: Literal['processing', 'succeeded', 'rejected'] = (
         'succeeded'

@@ -1215,9 +1215,11 @@ class InMemoryPurchaseRepository:
                 'Outbox task not found',
                 error_code='outbox_task_not_found',
             )
-        if found.status in ('completed', 'closed'):
+        if found.status != 'requires_intervention':
             raise RuleConflictError(
-                'Задача уже завершена или закрыта',
+                'Повтор доступен только для задачи в состоянии '
+                'requires_intervention: pending-задачу уже повторяет воркер, '
+                'а завершённую или закрытую повторять нельзя',
                 error_code='outbox_task_not_retryable',
             )
         now = now_utc or datetime.now(UTC)
@@ -1458,6 +1460,7 @@ class InMemoryPurchaseRepository:
         *,
         admin_user_id: UUID,
         reason: str,
+        refund_id: UUID | None = None,
         now_utc: datetime | None = None,
     ) -> tuple[FakeRefundRow, bool]:
         """Создаёт или возвращает существующий возврат в обработке (T-29, инв. 4, 5)."""
@@ -1472,17 +1475,20 @@ class InMemoryPurchaseRepository:
         now = now_utc or datetime.now(UTC)
         cleaned_reason = reason.strip()
 
+        same_attempt = self.refunds.get(refund_id) if refund_id else None
+        if same_attempt is not None:
+            if same_attempt.payment_id != payment_id:
+                raise RuleConflictError(
+                    'UUID попытки возврата принадлежит другому платежу',
+                    error_code='refund_id_conflict',
+                )
+            return same_attempt, False
         for existing in self.refunds.values():
             if existing.payment_id == payment_id and existing.status in (
                 'processing',
                 'succeeded',
             ):
-                if existing.status == 'processing':
-                    return existing, False
-                raise RuleConflictError(
-                    'Возврат по данному платежу уже выполнен',
-                    error_code='refund_already_succeeded',
-                )
+                return existing, False
 
         if pay.status != 'succeeded':
             raise RuleConflictError(
@@ -1507,7 +1513,7 @@ class InMemoryPurchaseRepository:
                 error_code='refund_not_allowed',
             )
 
-        refund_id = uuid4()
+        refund_id = refund_id or uuid4()
         refund = FakeRefundRow(
             id=refund_id,
             payment_id=payment_id,

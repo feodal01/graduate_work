@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime, timezone
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -164,6 +166,7 @@ class RefundConfirmationT30Tests(TestCase):
                 admin_user_id: UUID,
                 reason: str,
                 request_id: str,
+                refund_id: UUID | None = None,
             ) -> BillingRefundItem:
                 self.create_refund_calls.append(
                     {
@@ -171,6 +174,7 @@ class RefundConfirmationT30Tests(TestCase):
                         'admin_user_id': admin_user_id,
                         'reason': reason,
                         'request_id': request_id,
+                        'refund_id': refund_id,
                     }
                 )
                 return BillingRefundItem(
@@ -214,6 +218,11 @@ class RefundConfirmationT30Tests(TestCase):
         self.assertContains(get_res, '05.11.2026 10:00 UTC')
         self.assertContains(get_res, '05.11.2026 15:00 (Asia/Yekaterinburg)')
         self.assertContains(get_res, 'доступ к новинкам закроется')
+        attempt_match = re.search(
+            r'name="refund_id" value="([0-9a-f-]{36})"', get_res.content.decode()
+        )
+        assert attempt_match is not None, 'форма не несёт UUID попытки возврата'
+        attempt_id = UUID(attempt_match[1])
 
         # 2. Unhappy: POST с пустой причиной -> ошибка формы и 0 вызовов Billing
         for blank in ('', '   '):
@@ -236,7 +245,10 @@ class RefundConfirmationT30Tests(TestCase):
         ok_post = self._request(
             'post',
             url,
-            data={'reason': '  Ошибочное списание по обращению #104  '},
+            data={
+                'reason': '  Ошибочное списание по обращению #104  ',
+                'refund_id': str(attempt_id),
+            },
             billing_client=bil,
             lookup_client=lkp,
         )
@@ -253,8 +265,20 @@ class RefundConfirmationT30Tests(TestCase):
                 'admin_user_id': self.admin_auth_uuid,
                 'reason': 'Ошибочное списание по обращению #104',
                 'request_id': 't30-refund-req',
+                'refund_id': attempt_id,
             },
         )
+
+        # 4. Повторная отправка той же формы (F5, двойной клик) несёт тот же
+        #    UUID попытки: Биллинг вернёт существующий возврат (BIL-NFR-R-02)
+        self._request(
+            'post',
+            url,
+            data={'reason': 'Ошибочное списание', 'refund_id': str(attempt_id)},
+            billing_client=bil,
+            lookup_client=lkp,
+        )
+        self.assertEqual(bil.create_refund_calls[-1]['refund_id'], attempt_id)
 
     def test_refund_confirm_unhappy_conflict_auth_down_and_billing_down(self) -> None:
         """T-30 (ADM-FR-05, ADM-NFR-R-01, ADM-NFR-R-02): 409, отказ Auth и отказ Billing."""
@@ -422,7 +446,10 @@ class RefundConfirmationT30Tests(TestCase):
         aid = UUID('44444444-4444-4444-8444-444444444444')
         mode = 'ok'
 
+        sent_bodies: list[dict[str, object]] = []
+
         def handler(request: httpx.Request) -> httpx.Response:
+            sent_bodies.append(json.loads(request.content))
             if mode == 'ok':
                 return httpx.Response(
                     200,
@@ -465,7 +492,9 @@ class RefundConfirmationT30Tests(TestCase):
             admin_user_id=aid,
             reason='Причина',
             request_id='req-1',
+            refund_id=rid,
         )
+        self.assertEqual(sent_bodies[-1]['refund_id'], str(rid))
         self.assertEqual(ref.id, rid)
         self.assertEqual(ref.status, 'succeeded')
 

@@ -637,13 +637,19 @@ class BillingAdminClient:
         admin_user_id: UUID,
         reason: str,
         request_id: str,
+        refund_id: UUID | None = None,
     ) -> BillingRefundItem:
+        json_body = {
+            'admin_user_id': str(admin_user_id),
+            'reason': reason,
+        }
+        if refund_id is not None:
+            # UUID попытки из формы: повтор той же формы не создаёт вторую
+            # попытку возврата (BIL-NFR-R-02).
+            json_body['refund_id'] = str(refund_id)
         body = self._post_json(
             f'/payments/{payment_id}/refunds',
-            json_body={
-                'admin_user_id': str(admin_user_id),
-                'reason': reason,
-            },
+            json_body=json_body,
             request_id=request_id,
         )
         try:

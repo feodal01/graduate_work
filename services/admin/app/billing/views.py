@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from uuid import NAMESPACE_DNS, UUID, uuid5
+from uuid import NAMESPACE_DNS, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.contrib import messages
@@ -788,8 +788,12 @@ def payment_refund_confirm(request: HttpRequest, payment_id: UUID) -> HttpRespon
     reason_value = ''
     form_error: str | None = None
     status_code = 200
+    # UUID попытки возврата создаётся при показе формы и уходит в Биллинг:
+    # двойной клик или F5 повторяет ту же попытку, а не создаёт новую.
+    refund_attempt_id = uuid4()
 
     if request.method == 'POST':
+        refund_attempt_id = _parse_refund_attempt_id(request.POST.get('refund_id'))
         reason_value = (request.POST.get('reason') or '').strip()
         if not reason_value:
             form_error = 'Укажите причину возврата'
@@ -802,6 +806,7 @@ def payment_refund_confirm(request: HttpRequest, payment_id: UUID) -> HttpRespon
                     admin_user_id=admin_uuid,
                     reason=reason_value,
                     request_id=request_id,
+                    refund_id=refund_attempt_id,
                 )
                 if created_refund.status == 'succeeded':
                     messages.success(
@@ -842,11 +847,20 @@ def payment_refund_confirm(request: HttpRequest, payment_id: UUID) -> HttpRespon
             'amount_display': format_amount_rub(card.amount_kopeks, card.currency),
             'subscription': sub_view,
             'reason': reason_value,
+            'refund_attempt_id': refund_attempt_id,
             'form_error': form_error,
             'auth_warning': auth_warning,
         },
         status=status_code,
     )
+
+
+def _parse_refund_attempt_id(raw: str | None) -> UUID:
+    """UUID попытки из формы; без него (старая вкладка) — новая попытка."""
+    try:
+        return UUID(raw or '')
+    except ValueError:
+        return uuid4()
 
 
 def outbox_task_retry(request: HttpRequest, task_id: UUID) -> HttpResponse:

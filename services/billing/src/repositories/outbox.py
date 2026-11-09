@@ -411,9 +411,11 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
                         'Outbox task not found',
                         error_code='outbox_task_not_found',
                     )
-                if task.status in ('completed', 'closed'):
+                if task.status != 'requires_intervention':
                     raise RuleConflictError(
-                        'Задача уже завершена или закрыта',
+                        'Повтор доступен только для задачи в состоянии '
+                        'requires_intervention: pending-задачу уже повторяет воркер, '
+                        'а завершённую или закрытую повторять нельзя',
                         error_code='outbox_task_not_retryable',
                     )
                 task.status = 'pending'

@@ -373,15 +373,16 @@ async def test_e2e_acceptance_criteria_task_1_to_6_and_link_navigation() -> None
         assert len(ntf_gw.sent_batches) == 4
         assert 'Возврат средств' in ntf_gw.sent_batches[-1]['subject']
 
-        # Повторная попытка возврата уже возвращённого платежа -> 409 (TASK-5, NFR-U-02)
+        # Повторная отправка формы возврата уже возвращённого платежа возвращает
+        # существующую запись, второй возврат не создаётся (TASK-5, BIL-NFR-R-02)
         r_ref_dup = await client.post(
             f'/api/v1/internal/billing/payments/{payment_id}/refunds',
             json={'admin_user_id': str(admin_id), 'reason': 'Повтор'},
             headers=svc_headers,
         )
-        assert r_ref_dup.status_code == 409
-        assert r_ref_dup.json()['error_code'] == 'refund_already_succeeded'
-        assert isinstance(r_ref_dup.json()['detail'], str)
+        assert r_ref_dup.status_code == 200
+        assert r_ref_dup.json()['status'] == 'succeeded'
+        assert r_ref_dup.json()['reason'] != 'Повтор'
         assert len(provider.create_refund_calls) == 1
 
         # Список подписок и платежей в админке после возврата (TASK-3)

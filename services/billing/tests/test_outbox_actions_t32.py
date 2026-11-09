@@ -307,3 +307,36 @@ async def test_outbox_retry_and_close_happy_and_unhappy_paths() -> None:
         )
         assert r_db_err.status_code == 503
         assert r_db_err.json()['error_code'] == 'database_unavailable'
+
+
+@pytest.mark.parametrize('status', ['pending', 'completed', 'closed'])
+async def test_retry_is_only_for_requires_intervention(status: str) -> None:
+    """«Повторить» доступен только в «Требует вмешательства» (US-A-02, BIL-API-12).
+
+    Регрессия: retry pending-задачи обнулял attempts и next_retry_at, обходя
+    backoff и лимит попыток, и писал лишнее действие в журнал.
+    """
+    from domain.errors import RuleConflictError
+
+    repo = InMemoryPurchaseRepository()
+    payment_id = uuid4()
+    task = FakeOutboxTaskRow(
+        id=uuid4(),
+        dedup_key=f'retry_guard:{payment_id}',
+        target_service='notifications',
+        task_type='payment_succeeded_email',
+        payment_id=payment_id,
+        user_id=uuid4(),
+        access_version=None,
+        payload={},
+        status=status,
+        attempts=3,
+    )
+    repo.outbox_tasks[task.dedup_key] = task
+
+    with pytest.raises(RuleConflictError) as exc_info:
+        await repo.retry_outbox_task_by_admin(
+            task.id, admin_user_id=uuid4(), reason='Повтор'
+        )
+    assert exc_info.value.error_code == 'outbox_task_not_retryable'
+    assert task.attempts == 3

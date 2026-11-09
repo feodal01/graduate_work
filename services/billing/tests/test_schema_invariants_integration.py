@@ -1333,16 +1333,15 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
         )
         assert len(actions) == 2
 
-    # 4. Повторный возврат после succeeded запрещён с 409 (инв. 4, 5),
-    #    а для несуществующего payment_id возвращается 404 payment_not_found
-    with pytest.raises(RuleConflictError) as exc_info:
-        await repos.refunds.get_or_create_processing_refund(
-            payment.id,
-            admin_user_id=admin_id,
-            reason='Третья попытка',
-        )
-
-    assert exc_info.value.error_code == 'refund_already_succeeded'
+    # 4. Повтор после succeeded возвращает выполненный возврат без новой
+    #    попытки (инв. 4, BIL-NFR-R-02), а для несуществующего payment_id
+    #    возвращается 404 payment_not_found
+    again, created_again = await repos.refunds.get_or_create_processing_refund(
+        payment.id,
+        admin_user_id=admin_id,
+        reason='Третья попытка',
+    )
+    assert (again.id, again.status, created_again) == (ref_2.id, 'succeeded', False)
     with pytest.raises(EntityNotFoundError) as not_found_exc:
         await repos.refunds.get_or_create_processing_refund(
             uuid4(),
@@ -1613,3 +1612,12 @@ async def test_sql_outbox_keeps_retrying_access_sync_after_attempt_limit(
         assert row.status == 'pending'
         assert row.attempts == 2
         assert row.next_retry_at > datetime.now(UTC)
+
+    # «Повторить» для pending-задачи запрещён: её уже повторяет воркер.
+    from domain.errors import RuleConflictError
+
+    with pytest.raises(RuleConflictError) as exc_info:
+        await repos.outbox_admin.retry_outbox_task_by_admin(
+            task_id, admin_user_id=uuid4(), reason='Повтор'
+        )
+    assert exc_info.value.error_code == 'outbox_task_not_retryable'

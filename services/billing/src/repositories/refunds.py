@@ -55,6 +55,7 @@ class RefundRepository(Protocol):
         *,
         admin_user_id: UUID,
         reason: str,
+        refund_id: UUID | None = None,
         now_utc: datetime | None = None,
     ) -> tuple[RefundRecordProtocol, bool]: ...
 
@@ -169,13 +170,31 @@ class SQLAlchemyRefundRepository(SQLAlchemyRepository):
         *,
         admin_user_id: UUID,
         reason: str,
+        refund_id: UUID | None = None,
         now_utc: datetime | None = None,
     ) -> tuple[Refund, bool]:
+        """Создаёт попытку возврата или возвращает уже существующую (инв. 4).
+
+        `refund_id` — UUID попытки, который форма админки создаёт при показе.
+        Повтор той же формы (двойной клик, F5) находит попытку по этому UUID
+        в любом статусе, поэтому после отказа новая попытка появляется только
+        из новой формы (BIL-NFR-R-02). Выполненный возврат тоже возвращается
+        как есть, а не ошибкой 409.
+        """
         now = now_utc or datetime.now(UTC)
         cleaned_reason = reason.strip()
         try:
             async with self._session_factory() as session:
                 payment = await self._lock_user_and_payment(session, payment_id)
+                if refund_id is not None:
+                    same_attempt = await session.get(Refund, refund_id)
+                    if same_attempt is not None:
+                        if same_attempt.payment_id != payment_id:
+                            raise RuleConflictError(
+                                'UUID попытки возврата принадлежит другому платежу',
+                                error_code='refund_id_conflict',
+                            )
+                        return same_attempt, False
                 existing_active = await session.scalar(
                     select(Refund).where(
                         Refund.payment_id == payment_id,
@@ -183,12 +202,7 @@ class SQLAlchemyRefundRepository(SQLAlchemyRepository):
                     )
                 )
                 if existing_active is not None:
-                    if existing_active.status == 'processing':
-                        return existing_active, False
-                    raise RuleConflictError(
-                        'Возврат по данному платежу уже выполнен',
-                        error_code='refund_already_succeeded',
-                    )
+                    return existing_active, False
 
                 if payment.status != 'succeeded':
                     raise RuleConflictError(
@@ -214,7 +228,7 @@ class SQLAlchemyRefundRepository(SQLAlchemyRepository):
                         error_code='refund_not_allowed',
                     )
 
-                refund_id = uuid4()
+                refund_id = refund_id or uuid4()
                 refund = Refund(
                     id=refund_id,
                     payment_id=payment.id,
@@ -256,7 +270,7 @@ class SQLAlchemyRefundRepository(SQLAlchemyRepository):
                 concurrent = await session.scalar(
                     select(Refund).where(
                         Refund.payment_id == payment_id,
-                        Refund.status == 'processing',
+                        Refund.status.in_(('processing', 'succeeded')),
                     )
                 )
                 if concurrent is None:

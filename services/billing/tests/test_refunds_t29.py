@@ -381,13 +381,16 @@ async def test_refund_api_full_lifecycle_consequences_and_unhappy_paths() -> Non
         assert len(ntf_gw.batches) == 1
         assert '299 ₽' in ntf_gw.batches[0]['text']
 
-        # 6. Unhappy: повторный запрос возврата после succeeded -> 409 (инв. 4, 5)
+        # 6. Повтор после succeeded: вторая попытка не создаётся, возвращается
+        #    выполненный возврат (инв. 4, BIL-NFR-R-02)
         r_already = await client.post(
             f'/api/v1/internal/billing/payments/{pay_id}/refunds',
             headers=auth_headers,
             json={'admin_user_id': str(admin_id), 'reason': 'Третья попытка'},
         )
-        assert r_already.status_code == 409
+        assert r_already.status_code == 200
+        assert r_already.json()['status'] == 'succeeded'
+        assert r_already.json()['reason'] != 'Третья попытка'
 
 
 async def test_background_refund_reconcile_24h_metadata_lookup_and_webhook() -> None:

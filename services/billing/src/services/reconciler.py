@@ -410,6 +410,7 @@ class PaymentReconciler:
         *,
         admin_user_id: UUID,
         reason: str,
+        refund_id: UUID | None = None,
     ) -> RefundReconcileOutcome:
         """Создаёт или повторяет полный возврат и запускает сверку GET (BIL-FR-10)."""
 
@@ -417,7 +418,16 @@ class PaymentReconciler:
             payment_id,
             admin_user_id=admin_user_id,
             reason=reason,
+            refund_id=refund_id,
         )
+        if refund.status != 'processing':
+            # Повтор формы для уже выполненной или отклонённой попытки:
+            # возвращаем её итог без новых запросов в ЮKassa.
+            return self._build_refund_outcome(
+                refund,
+                transitioned=False,
+                throttled=False,
+            )
         if not refund.provider_refund_id:
             payment = await self._payments.get_payment(refund.payment_id)
             if payment is None or not payment.provider_payment_id:
