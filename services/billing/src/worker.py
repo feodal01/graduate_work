@@ -11,7 +11,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from clients.auth import HttpAuthGateway
 from clients.notifications import HttpNotificationsGateway
 from clients.payment_provider_registry import build_payment_provider_registry
-from core.config import ServiceSettings, settings
+from core.config import NotificationsClientSettings, ServiceSettings, settings
 from core.logger import LOGGING, add_logstash_handler
 from core.observability import init_sentry
 from core.tracing import create_tracer_provider
@@ -151,11 +151,12 @@ async def main() -> None:
         statement_timeout_ms=settings.postgres.statement_timeout_ms,
     )
     service_settings = ServiceSettings()  # pyright: ignore[reportCallIssue]
+    notifications_settings = NotificationsClientSettings()  # pyright: ignore[reportCallIssue]
     auth_http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(settings.auth_client.timeout_seconds)
     )
     notifications_http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(settings.notifications_client.timeout_seconds)
+        timeout=httpx.Timeout(notifications_settings.timeout_seconds)
     )
     auth_gateway = HttpAuthGateway(
         http_client=auth_http_client,
@@ -165,8 +166,8 @@ async def main() -> None:
     )
     notifications_gateway = HttpNotificationsGateway(
         http_client=notifications_http_client,
-        base_url=str(settings.notifications_client.campaign_url),
-        api_key=settings.notifications_client.campaign_api_key.get_secret_value(),
+        base_url=str(notifications_settings.campaign_url),
+        api_key=notifications_settings.campaign_api_key.get_secret_value(),
     )
     payment_providers = build_payment_provider_registry(settings.payment_providers)
     repos = BillingRepositories.sqlalchemy(database.sessionmaker)

@@ -212,7 +212,6 @@ class Settings(BaseSettings):
 
     postgres: PostgresSettings
     auth_client: AuthClientSettings
-    notifications_client: NotificationsClientSettings
     payment_providers: PaymentProvidersSettings
     worker: WorkerSettings
     tracing: TracingSettings
@@ -223,8 +222,6 @@ class Settings(BaseSettings):
 settings = Settings(
     postgres=PostgresSettings(),
     auth_client=AuthClientSettings(),
-    # Ключ обязателен и берётся из окружения, pyright этого не видит.
-    notifications_client=NotificationsClientSettings(),  # pyright: ignore[reportCallIssue]
     payment_providers=PaymentProvidersSettings(),
     worker=WorkerSettings(),
     tracing=TracingSettings(),

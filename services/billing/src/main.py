@@ -14,7 +14,12 @@ from api.v1 import health, internal, payments, webhooks
 from clients.auth import HttpAuthGateway
 from clients.notifications import HttpNotificationsGateway
 from clients.payment_provider_registry import build_payment_provider_registry
-from core.config import ServiceSettings, TokenSettings, settings
+from core.config import (
+    NotificationsClientSettings,
+    ServiceSettings,
+    TokenSettings,
+    settings,
+)
 from core.logger import LOGGING, add_logstash_handler
 from core.observability import bind_request_id, init_sentry
 from core.tracing import create_tracer_provider, instrument_fastapi
@@ -49,6 +54,7 @@ class UTF8JSONResponse(JSONResponse):
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     token_settings = TokenSettings()  # pyright: ignore[reportCallIssue]
     service_settings = ServiceSettings()  # pyright: ignore[reportCallIssue]
+    notifications_settings = NotificationsClientSettings()  # pyright: ignore[reportCallIssue]
     database = PostgresDatabase(
         settings.postgres.dsn,
         connect_timeout_seconds=settings.postgres.connect_timeout_seconds,
@@ -67,7 +73,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         timeout=httpx.Timeout(settings.auth_client.timeout_seconds)
     )
     notifications_http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(settings.notifications_client.timeout_seconds)
+        timeout=httpx.Timeout(notifications_settings.timeout_seconds)
     )
     app.state.auth_gateway = HttpAuthGateway(
         http_client=auth_http_client,
@@ -77,8 +83,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     app.state.notifications_gateway = HttpNotificationsGateway(
         http_client=notifications_http_client,
-        base_url=str(settings.notifications_client.campaign_url),
-        api_key=settings.notifications_client.campaign_api_key.get_secret_value(),
+        base_url=str(notifications_settings.campaign_url),
+        api_key=notifications_settings.campaign_api_key.get_secret_value(),
     )
     payment_providers = build_payment_provider_registry(settings.payment_providers)
     app.state.payment_providers = payment_providers
