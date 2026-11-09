@@ -5,7 +5,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 
-from clients.auth import SubscriptionAccessSyncResult
+from clients.auth import LogoutOutcome, SubscriptionAccessSyncResult
 from clients.payment_provider import (
     CreateProviderRefundRequest,
     ProviderIntegrityMismatchError,
@@ -44,7 +44,7 @@ class _RecordingAuthGateway:
 
     async def logout(
         self, access_token: str, refresh_token: str, *, request_id: str
-    ) -> None:
+    ) -> LogoutOutcome:
         raise NotImplementedError
 
     async def get_current_user(

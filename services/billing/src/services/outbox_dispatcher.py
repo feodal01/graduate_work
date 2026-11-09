@@ -16,6 +16,7 @@ from clients.notifications import (
     NotificationsTransientError,
 )
 from core.observability import correlation_request_id
+from db.sql.errors import DatabaseUnavailableError
 from repositories.outbox import DeliveryOutcome, OutboxRepository
 from repositories.records import OutboxTaskRecordProtocol
 
@@ -70,11 +71,20 @@ class OutboxDispatcher:
                 limit=5,
                 max_attempts=self._max_attempts,
             )
-        except Exception as exc:
+        except DatabaseUnavailableError as exc:
+            # Ожидаемый сбой: задачу доставит фоновый воркер (BIL-NFR-R-04).
             logger.warning(
                 'Immediate outbox dispatch skipped for payment_id=%s: %s',
                 payment_id,
                 exc,
+            )
+            return 0
+        except Exception:
+            # Дефект кода не должен ронять уже зафиксированную операцию, но и
+            # не должен теряться в WARNING: нужен traceback и событие в Sentry.
+            logger.exception(
+                'Unexpected error in immediate outbox dispatch for payment_id=%s',
+                payment_id,
             )
             return 0
 
@@ -88,11 +98,20 @@ class OutboxDispatcher:
                 limit=1,
                 max_attempts=self._max_attempts,
             )
-        except Exception as exc:
+        except DatabaseUnavailableError as exc:
+            # Ожидаемый сбой: задачу доставит фоновый воркер (BIL-NFR-R-04).
             logger.warning(
                 'Immediate outbox dispatch skipped for task_id=%s: %s',
                 task_id,
                 exc,
+            )
+            return 0
+        except Exception:
+            # Дефект кода не должен ронять уже зафиксированную операцию, но и
+            # не должен теряться в WARNING: нужен traceback и событие в Sentry.
+            logger.exception(
+                'Unexpected error in immediate outbox dispatch for task_id=%s',
+                task_id,
             )
             return 0
 

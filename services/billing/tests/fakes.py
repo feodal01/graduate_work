@@ -8,6 +8,7 @@ from clients.auth import (
     AuthInvalidCredentialsError,
     AuthPermanentDeliveryError,
     AuthServiceUnavailableError,
+    LogoutOutcome,
     SubscriptionAccessSyncResult,
 )
 from clients.payment_provider import (
@@ -1909,9 +1910,9 @@ class ConfigurableAuthGateway:
 
     async def logout(
         self, access_token: str, refresh_token: str, *, request_id: str
-    ) -> None:
+    ) -> LogoutOutcome:
         """Эмулирует выход."""
-        return None
+        return LogoutOutcome.REVOKED
 
     async def put_subscription_access(
         self,

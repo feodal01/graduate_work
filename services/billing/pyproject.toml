@@ -45,7 +45,7 @@ markers = [
 
 [tool.mypy]
 mypy_path = "src"
-files = ["src"]
+files = ["src", "tests"]
 explicit_package_bases = true
 plugins = ["pydantic.mypy"]
 warn_return_any = true

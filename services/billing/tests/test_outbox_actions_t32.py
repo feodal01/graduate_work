@@ -5,7 +5,11 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 
-from clients.auth import AuthServiceUnavailableError, SubscriptionAccessSyncResult
+from clients.auth import (
+    AuthServiceUnavailableError,
+    LogoutOutcome,
+    SubscriptionAccessSyncResult,
+)
 from dependencies import (
     get_outbox_dispatcher,
     get_repositories,
@@ -35,7 +39,7 @@ class _StubAuthGateway:
 
     async def logout(
         self, access_token: str, refresh_token: str, *, request_id: str
-    ) -> None:
+    ) -> LogoutOutcome:
         raise NotImplementedError
 
     async def get_current_user(

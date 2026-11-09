@@ -5,7 +5,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
-from clients.auth import SubscriptionAccessSyncResult
+from clients.auth import LogoutOutcome, SubscriptionAccessSyncResult
 from clients.notifications import NotificationsTransientError
 from clients.payment_provider_registry import PaymentProviderRegistry
 from dependencies import (
@@ -66,8 +66,8 @@ class _DemoAuthAndMoviesSimulator:
 
     async def logout(
         self, access_token: str, refresh_token: str, *, request_id: str
-    ) -> None:
-        return None
+    ) -> LogoutOutcome:
+        return LogoutOutcome.REVOKED
 
     async def get_current_user(
         self, access_token: str, *, request_id: str

@@ -13,6 +13,7 @@ from clients.auth import (
     AuthPermanentDeliveryError,
     AuthServiceUnavailableError,
     HttpAuthGateway,
+    LogoutOutcome,
     SubscriptionAccessSyncResult,
 )
 from clients.notifications import (
@@ -89,9 +90,11 @@ class _DegradableAuthGateway:
 
     async def logout(
         self, access_token: str, refresh_token: str, *, request_id: str
-    ) -> None:
+    ) -> LogoutOutcome:
         if self.ui_mode == 'down':
-            raise AuthServiceUnavailableError('Auth unavailable on logout')
+            # Настоящий шлюз не бросает исключений, а сообщает об отказе.
+            return LogoutOutcome.FAILED
+        return LogoutOutcome.REVOKED
 
     async def get_current_user(
         self, access_token: str, *, request_id: str

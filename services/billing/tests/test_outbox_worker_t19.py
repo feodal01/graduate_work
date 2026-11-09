@@ -1,8 +1,11 @@
+import logging
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 
+from db.sql.errors import DatabaseUnavailableError
 from repositories.outbox import compute_outbox_backoff_seconds
 from services.outbox_dispatcher import (
     NotificationsGateway,
@@ -412,3 +415,44 @@ async def test_outbox_worker_handles_unexpected_exception_and_malformed_tasks() 
     assert await dispatcher.try_deliver_task(bad_ntf_payload.id) == 1
     assert bad_ntf_payload.status == 'requires_intervention'
     assert 'Malformed notifications payload' in (bad_ntf_payload.last_error or '')
+
+
+class _BrokenOutboxRepo:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def process_due_outbox_tasks(self, *args: Any, **kwargs: Any) -> int:
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    ('error', 'level', 'has_traceback'),
+    [
+        (DatabaseUnavailableError(), logging.WARNING, False),
+        (AttributeError('code defect'), logging.ERROR, True),
+    ],
+    ids=['db_unavailable', 'code_defect'],
+)
+async def test_immediate_dispatch_logs_code_defects_with_traceback(
+    caplog: pytest.LogCaptureFixture,
+    error: Exception,
+    level: int,
+    has_traceback: bool,
+) -> None:
+    """Немедленная отправка best-effort, но дефект кода не прячется в WARNING."""
+    dispatcher = OutboxDispatcher(
+        repository=_BrokenOutboxRepo(error),  # type: ignore[arg-type]
+        auth_gateway=ConfigurableAuthGateway(uuid4()),
+    )
+    with caplog.at_level(logging.WARNING, logger='services.outbox_dispatcher'):
+        assert await dispatcher.try_deliver_payment_tasks(uuid4()) == 0
+        assert await dispatcher.try_deliver_task(uuid4()) == 0
+
+    records = [
+        r
+        for r in caplog.records
+        if 'Immediate' in r.getMessage() or 'immediate' in r.getMessage()
+    ]
+    assert len(records) == 2
+    assert {r.levelno for r in records} == {level}
+    assert all((r.exc_info is not None) is has_traceback for r in records)

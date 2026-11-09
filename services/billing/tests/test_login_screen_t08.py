@@ -9,6 +9,7 @@ from clients.auth import (
     AuthInvalidCredentialsError,
     AuthRateLimitExceededError,
     AuthServiceUnavailableError,
+    LogoutOutcome,
     SubscriptionAccessSyncResult,
 )
 from dependencies import (
@@ -77,10 +78,11 @@ class FakeAuthGateway:
         refresh_token: str,
         *,
         request_id: str,
-    ) -> None:
+    ) -> LogoutOutcome:
         """Эмулирует выход пользователя в Auth."""
         self.last_request_id = request_id
         self.logout_called_with = (access_token, refresh_token)
+        return LogoutOutcome.REVOKED
 
     async def put_subscription_access(
         self,

@@ -251,7 +251,7 @@ def test_orm_models_satisfy_record_protocols(model: type, protocol: type) -> Non
     pyright не сверяет `Mapped[T]` с протоколом, поэтому в `bundle.py` и
     `outbox.py` его проверка отключена; этот тест закрывает пробел.
     """
-    columns = sa_inspect(model).columns
+    columns: Any = sa_inspect(model).columns
     model_hints = get_type_hints(model)
     for name, annotation in get_type_hints(protocol).items():
         assert name in columns, f'{model.__name__} lacks column {name}'
