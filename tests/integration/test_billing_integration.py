@@ -1706,7 +1706,7 @@ class BillingIntegrationCheck:
             'from clients.auth import HttpAuthGateway\n'
             'from clients.notifications import HttpNotificationsGateway\n'
             'from clients.payment_provider import ProviderPaymentSnapshot\n'
-            'from core.config import ServiceSettings, settings\n'
+            'from core.config import NotificationsClientSettings, ServiceSettings, settings\n'
             'from db.sql.postgres import PostgresDatabase\n'
             'from models import (\n'
             '    OperationEvent,\n'
@@ -1740,7 +1740,7 @@ class BillingIntegrationCheck:
             '        )\n'
             'async def run_t22():\n'
             '    auth_url = str(settings.auth_client.service_url).rstrip("/")\n'
-            '    ntf_cfg = settings.notifications_client\n'
+            '    ntf_cfg = NotificationsClientSettings()\n'
             '    ntf_url = str(ntf_cfg.campaign_url).rstrip("/")\n'
             '    ntf_key = ntf_cfg.campaign_api_key.get_secret_value()\n'
             '    svc_key = ServiceSettings().api_key.get_secret_value()\n'
@@ -1949,7 +1949,8 @@ class BillingIntegrationCheck:
             f"'{pid}', now(), now() + interval '30 days'); "
             f'INSERT INTO outbox_tasks (id, dedup_key, target_service, task_type, '
             f'payment_id, user_id, access_version, payload, status) VALUES '
-            f"('{tid}', 't23:{pid}', 'auth', 'sync_access', '{pid}', '{uid}', "
+            f"('{tid}', 'payment_succeeded:{pid}:auth_access', 'auth', "
+            f"'sync_access', '{pid}', '{uid}', "
             f"1, '{{}}'::jsonb, 'completed');"
         )
         assert self._psql(sql).returncode == 0
@@ -2042,11 +2043,11 @@ class BillingIntegrationCheck:
             'from uuid import UUID, uuid4\n'
             'from clients.notifications import (\n'
             '    HttpNotificationsGateway,\n'
-            '    NotificationsPermanentError,\n'
+            '    NotificationsTransientError,\n'
             ')\n'
-            'from core.config import settings\n'
+            'from core.config import NotificationsClientSettings, settings\n'
             'async def check_t24():\n'
-            '    cfg = settings.notifications_client\n'
+            '    cfg = NotificationsClientSettings()\n'
             '    url = str(cfg.campaign_url).rstrip("/")\n'
             '    key = cfg.campaign_api_key.get_secret_value()\n'
             f'    uid = UUID("{uid}")\n'
@@ -2083,15 +2084,15 @@ class BillingIntegrationCheck:
             '            available_at="2099-01-01T12:00:00Z",\n'
             '            request_id="t24-send-before",\n'
             '        )\n'
-            '        # 3. Unhappy path: invalid API key -> 401\n'
+            '        # 3. Invalid API key -> 401, retried as a config error\n'
             '        bad_gw = HttpNotificationsGateway(\n'
             '            http_client=hc, base_url=url, api_key="wrong-key"\n'
             '        )\n'
             '        try:\n'
             '            await bad_gw.cancel_campaign(c_after, request_id="t24-401")\n'
             '            raise AssertionError("Expected 401")\n'
-            '        except NotificationsPermanentError as exc:\n'
-            '            assert exc.status_code == 401\n'
+            '        except NotificationsTransientError as exc:\n'
+            '            assert "401" in str(exc) and "service key" in str(exc)\n'
             '    print(f"c_after={c_after}\\nc_before={c_before}")\n'
             'asyncio.run(check_t24())\n'
         )
@@ -2843,7 +2844,7 @@ class BillingIntegrationCheck:
         code = (
             'import asyncio, httpx\n'
             'from uuid import UUID, uuid4\n'
-            'from core.config import ServiceSettings, settings\n'
+            'from core.config import NotificationsClientSettings, ServiceSettings, settings\n'
             'from db.sql.postgres import PostgresDatabase\n'
             'from repositories.bundle import BillingRepositories\n'
             'from clients.auth import HttpAuthGateway\n'
@@ -2907,7 +2908,7 @@ class BillingIntegrationCheck:
             '        statement_timeout_ms=pg.statement_timeout_ms,\n'
             '    )\n'
             '    key = ServiceSettings().api_key.get_secret_value()\n'
-            '    ntf_cfg = settings.notifications_client\n'
+            '    ntf_cfg = NotificationsClientSettings()\n'
             '    ntf_key = ntf_cfg.campaign_api_key.get_secret_value()\n'
             '    async with httpx.AsyncClient() as hc:\n'
             '        auth_gw = HttpAuthGateway(\n'
@@ -2917,7 +2918,7 @@ class BillingIntegrationCheck:
             '        )\n'
             '        ntf_gw = HttpNotificationsGateway(\n'
             '            http_client=hc,\n'
-            '            base_url=str(settings.notifications_client.campaign_url),\n'
+            '            base_url=str(NotificationsClientSettings().campaign_url),\n'
             '            api_key=ntf_key,\n'
             '        )\n'
             '        repos = BillingRepositories.sqlalchemy(db.sessionmaker)\n'
@@ -3146,7 +3147,11 @@ class BillingIntegrationCheck:
                 '            _RecProv()\n'
                 '        ),\n'
                 '    )\n'
-                '    await rec.reconcile_due_pending_payments(min_age_seconds=0.0)\n'
+                # Сверяем этот платёж напрямую: только что запущенный воркер
+                # мог уже взять его (сверка с песочницей ЮKassa) и занять окно
+                # или backoff, и выборка «очередного» платежа его пропустила бы.
+                f'    await rec.reconcile_payment(UUID("{pid_t37}"), source="reconcile", '
+                'respect_throttle=False)\n'
                 f'    p = await repos.payments.get_payment(UUID("{pid_t37}"))\n'
                 '    assert p is not None and p.status == "succeeded"\n'
                 '    await db.close()\n'
