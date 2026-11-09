@@ -17,6 +17,7 @@ class PaymentRecordProtocol(Protocol):
     failure_reason: str | None
     provider_details: dict[str, Any] | None
     last_checked_at: datetime | None
+    next_reconcile_at: datetime | None
     created_at: datetime
     updated_at: datetime
 

@@ -240,12 +240,24 @@ async def test_background_reconcile_handles_4xx_and_anomalies() -> None:
     first_checked = repo.payments[p_backoff.id].last_checked_at
     assert first_checked is not None
 
-    # Сдвигаем last_checked_at назад, чтобы имитировать наступление 2-й попытки
+    first_retry_at = repo.payments[p_backoff.id].next_reconcile_at
+    assert first_retry_at is not None and first_retry_at > datetime.now(UTC)
+    # Пока backoff не истёк, фоновая сверка платёж не берёт
     repo.payments[p_backoff.id].last_checked_at = now - timedelta(seconds=10)
+    await reconciler.reconcile_due_pending_payments(min_age_seconds=5.0)
+    assert (repo.payments[p_backoff.id].provider_details or {}).get(
+        '_reconcile_errors'
+    ) == 1
+
+    # Имитируем наступление 2-й попытки
+    repo.payments[p_backoff.id].next_reconcile_at = now - timedelta(seconds=1)
     await reconciler.reconcile_due_pending_payments(min_age_seconds=5.0)
     second_checked = repo.payments[p_backoff.id].last_checked_at
     assert second_checked is not None
-    # На 2-й ошибке backoff = 10s -> last_checked_at сдвинут вперёд в будущее
-    assert second_checked > datetime.now(UTC)
+    # Backoff живёт в next_reconcile_at, а last_checked_at — время проверки,
+    # не в будущем: иначе 5-секундный лимит /continue блокировался бы backoff-ом
+    assert second_checked <= datetime.now(UTC)
+    second_retry_at = repo.payments[p_backoff.id].next_reconcile_at
+    assert second_retry_at is not None and second_retry_at > datetime.now(UTC)
     details = repo.payments[p_backoff.id].provider_details
     assert details is not None and details.get('_reconcile_errors') == 2

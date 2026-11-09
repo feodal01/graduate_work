@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from db.sql.errors import DatabaseUnavailableError
@@ -85,6 +85,13 @@ class PaymentRepository(Protocol):
         *,
         error_message: str,
     ) -> PaymentRecordProtocol: ...
+
+    async def claim_payment_check(
+        self,
+        payment_id: UUID,
+        *,
+        throttle_seconds: float,
+    ) -> bool: ...
 
     async def get_or_create_pending_payment(
         self,
@@ -205,6 +212,10 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
                             Payment.last_checked_at.is_(None),
                             Payment.last_checked_at <= checked_cutoff,
                         ),
+                        or_(
+                            Payment.next_reconcile_at.is_(None),
+                            Payment.next_reconcile_at <= now_utc,
+                        ),
                     )
                     .order_by(
                         Payment.last_checked_at.asc().nulls_first(),
@@ -236,6 +247,10 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
                         or_(
                             Payment.last_checked_at.is_(None),
                             Payment.last_checked_at <= checked_cutoff,
+                        ),
+                        or_(
+                            Payment.next_reconcile_at.is_(None),
+                            Payment.next_reconcile_at <= now_utc,
                         ),
                     )
                     .order_by(
@@ -275,16 +290,49 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
                         else 1
                     )
                     backoff_sec = min(300, 5 * (2 ** min(err_count - 1, 6)))
-                    next_eligible_at = now_utc + timedelta(
-                        seconds=max(0, backoff_sec - 5)
-                    )
                     details['_reconcile_errors'] = err_count
                     details['_last_reconcile_error'] = error_message[:250]
                     payment.provider_details = details
-                    payment.last_checked_at = next_eligible_at
+                    payment.last_checked_at = now_utc
+                    payment.next_reconcile_at = now_utc + timedelta(seconds=backoff_sec)
                     payment.updated_at = now_utc
                     await session.commit()
                 return payment
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def claim_payment_check(
+        self,
+        payment_id: UUID,
+        *,
+        throttle_seconds: float,
+    ) -> bool:
+        """Атомарно занимает право проверить платёж в ЮKassa (BIL-NFR-R-06).
+
+        Один `UPDATE ... WHERE last_checked_at <= now - окно` на строку:
+        из параллельных `/continue` проходит ровно один, остальные получают
+        False и отдают сохранённую ссылку. Отметка ставится до GET, поэтому
+        во время сбоя ЮKassa клики тоже не чаще одного раза в окно.
+        """
+        now_utc = datetime.now(UTC)
+        cutoff = now_utc - timedelta(seconds=throttle_seconds)
+        try:
+            async with self._session_factory() as session:
+                claimed = await session.scalar(
+                    update(Payment)
+                    .where(
+                        Payment.id == payment_id,
+                        Payment.status == 'pending',
+                        or_(
+                            Payment.last_checked_at.is_(None),
+                            Payment.last_checked_at <= cutoff,
+                        ),
+                    )
+                    .values(last_checked_at=now_utc, updated_at=now_utc)
+                    .returning(Payment.id)
+                )
+                await session.commit()
+                return claimed is not None
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 
@@ -432,6 +480,7 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
                     if provider_details is not None:
                         payment.provider_details = provider_details
                     payment.last_checked_at = now_utc
+                    payment.next_reconcile_at = None
                     payment.updated_at = now_utc
                     await session.commit()
                 return payment

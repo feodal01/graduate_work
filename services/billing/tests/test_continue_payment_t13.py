@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
@@ -335,3 +336,92 @@ async def test_continue_unhappy_foreign_unknown_invalid_uuid_provider_down_and_4
     resp_auth = await client.get(f'/billing/payments/{own_pending.id}/continue')
     assert resp_auth.status_code == 503
     assert 'Сервис авторизации временно недоступен' in resp_auth.text
+
+
+async def test_parallel_continue_calls_make_exactly_one_yookassa_get(
+    continue_test_env: tuple[
+        httpx.AsyncClient,
+        FastAPI,
+        InMemoryPurchaseRepository,
+        FakeProviderGateway,
+        ConfigurableAuthGateway,
+        UUID,
+    ],
+) -> None:
+    """BIL-NFR-R-06 при параллельных кликах: окно проверки занимается атомарно.
+
+    Регрессия: время последней проверки читалось без блокировки и писалось
+    только после GET, поэтому 10 одновременных /continue давали 10 запросов.
+    """
+    client, _, repo, provider, _, user_id = continue_test_env
+    payment = _seed_payment(repo, user_id=user_id, status='pending')
+    original_get = provider.get_payment
+
+    async def slow_get(*args: object, **kwargs: object) -> object:
+        await asyncio.sleep(0.05)  # ответ ЮKassa идёт дольше, чем клики
+        return await original_get(*args, **kwargs)  # type: ignore[arg-type]
+
+    provider.get_payment = slow_get  # type: ignore[method-assign,assignment]
+
+    responses = await asyncio.gather(
+        *(client.get(f'/billing/payments/{payment.id}/continue') for _ in range(10))
+    )
+
+    assert all(r.status_code == 303 for r in responses)
+    assert len(provider.get_calls) == 1
+
+
+async def test_clicks_during_provider_outage_do_not_hammer_yookassa(
+    continue_test_env: tuple[
+        httpx.AsyncClient,
+        FastAPI,
+        InMemoryPurchaseRepository,
+        FakeProviderGateway,
+        ConfigurableAuthGateway,
+        UUID,
+    ],
+) -> None:
+    """При сбое ЮKassa повторные клики в окне 5 с не идут в ЮKassa снова."""
+    client, _, repo, provider, _, user_id = continue_test_env
+    payment = _seed_payment(repo, user_id=user_id, status='pending')
+    provider.get_error = ProviderTransientError('YooKassa 503')
+
+    first = await client.get(f'/billing/payments/{payment.id}/continue')
+    for _ in range(4):
+        await client.get(f'/billing/payments/{payment.id}/continue')
+
+    assert first.status_code == 503
+    assert len(provider.get_calls) == 1
+
+
+async def test_background_backoff_does_not_block_user_check(
+    continue_test_env: tuple[
+        httpx.AsyncClient,
+        FastAPI,
+        InMemoryPurchaseRepository,
+        FakeProviderGateway,
+        ConfigurableAuthGateway,
+        UUID,
+    ],
+) -> None:
+    """Backoff фоновой сверки не отключает проверку в /continue.
+
+    Регрессия: backoff писался в last_checked_at как время в будущем, и до
+    ~5 минут /continue отдавал сохранённую ссылку без GET — в том числе на
+    уже отменённый в ЮKassa платёж.
+    """
+    client, _, repo, provider, _, user_id = continue_test_env
+    payment = _seed_payment(
+        repo,
+        user_id=user_id,
+        status='pending',
+        last_checked_at=datetime.now(UTC) - timedelta(seconds=30),
+    )
+    payment.next_reconcile_at = datetime.now(UTC) + timedelta(minutes=4)
+    provider.get_status = 'canceled'
+
+    resp = await client.get(f'/billing/payments/{payment.id}/continue')
+
+    assert len(provider.get_calls) == 1
+    assert repo.payments[payment.id].status == 'failed'
+    assert resp.headers['location'] != payment.confirmation_url

@@ -178,6 +178,13 @@ class Payment(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    # Backoff фоновой сверки после ошибок провайдера. Отдельно от
+    # last_checked_at, по которому считается 5-секундный лимит для
+    # пользователя: иначе backoff блокировал проверку в /continue.
+    next_reconcile_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=_utc_now,

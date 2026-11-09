@@ -859,8 +859,8 @@ async def test_t12_t13_t16_and_t17_repository_queries_and_skip_locked(
     )
     assert err_2.provider_details is not None
     assert err_2.provider_details['_reconcile_errors'] == 2
-    assert err_2.last_checked_at is not None
-    assert err_2.last_checked_at > datetime.now(UTC)
+    assert err_2.next_reconcile_at is not None
+    assert err_2.next_reconcile_at > datetime.now(UTC)
 
 
 async def test_t19_outbox_worker_skip_locked_backoff_intervention_and_stale_versions(
@@ -1621,3 +1621,36 @@ async def test_sql_outbox_keeps_retrying_access_sync_after_attempt_limit(
             task_id, admin_user_id=uuid4(), reason='Повтор'
         )
     assert exc_info.value.error_code == 'outbox_task_not_retryable'
+
+
+async def test_claim_payment_check_is_atomic_and_backoff_has_own_column(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """BIL-NFR-R-06 в PostgreSQL: из 10 параллельных проверок проходит одна.
+
+    Backoff фоновой сверки пишется в next_reconcile_at, а не в будущее
+    время last_checked_at, поэтому не блокирует пользовательскую проверку.
+    """
+    from repositories.bundle import BillingRepositories
+
+    repos = BillingRepositories.sqlalchemy(migrated_billing_db)
+    payment, _ = await repos.payments.get_or_create_pending_payment(uuid4())
+
+    claims = await asyncio.gather(
+        *(
+            repos.payments.claim_payment_check(payment.id, throttle_seconds=5)
+            for _ in range(10)
+        )
+    )
+    assert claims.count(True) == 1
+
+    await repos.payments.record_payment_reconcile_error(
+        payment.id, error_message='YooKassa 503'
+    )
+    async with migrated_billing_db() as session:
+        row = await session.get(Payment, payment.id)
+        assert row is not None
+        assert row.next_reconcile_at is not None
+        assert row.next_reconcile_at > datetime.now(UTC)
+        assert row.last_checked_at is not None
+        assert row.last_checked_at <= datetime.now(UTC)

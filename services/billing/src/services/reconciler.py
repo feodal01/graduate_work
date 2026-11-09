@@ -325,20 +325,21 @@ class PaymentReconciler:
                 throttled=False,
             )
 
-        now_utc = datetime.now(UTC)
-        if (
-            respect_throttle
-            and payment.last_checked_at is not None
-            and (now_utc - payment.last_checked_at) < CHECK_THROTTLE_WINDOW
+        if respect_throttle and not await self._payments.claim_payment_check(
+            payment.id,
+            throttle_seconds=CHECK_THROTTLE_WINDOW.total_seconds(),
         ):
+            # Окно занято другим запросом (или платёж только что завершился):
+            # отдаём актуальное состояние из БД без запроса в ЮKassa.
+            current = await self._payments.get_payment(payment.id) or payment
             return ReconcileOutcome(
-                payment_id=payment.id,
-                user_id=payment.user_id,
-                status='pending',
-                confirmation_url=payment.confirmation_url,
-                failure_reason=None,
+                payment_id=current.id,
+                user_id=current.user_id,
+                status=current.status,
+                confirmation_url=current.confirmation_url,
+                failure_reason=current.failure_reason,
                 transitioned=False,
-                throttled=True,
+                throttled=current.status == 'pending',
             )
 
         snapshot = await self._providers.get(payment.provider_code).get_payment(

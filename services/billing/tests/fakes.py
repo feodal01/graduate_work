@@ -70,6 +70,7 @@ class FakePaymentRow:
     failure_reason: str | None = None
     provider_details: dict[str, Any] | None = None
     last_checked_at: datetime | None = None
+    next_reconcile_at: datetime | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
@@ -333,6 +334,7 @@ class InMemoryPurchaseRepository:
             if p.status == 'pending'
             and p.created_at <= created_cutoff
             and (p.last_checked_at is None or p.last_checked_at <= checked_cutoff)
+            and (p.next_reconcile_at is None or p.next_reconcile_at <= now_utc)
         ]
         candidates.sort(
             key=lambda p: (
@@ -379,11 +381,11 @@ class InMemoryPurchaseRepository:
                 int(prev_errors) + 1 if isinstance(prev_errors, (int, str)) else 1
             )
             backoff_sec = min(300, 5 * (2 ** min(err_count - 1, 6)))
-            next_eligible_at = now_utc + timedelta(seconds=max(0, backoff_sec - 5))
             details['_reconcile_errors'] = err_count
             details['_last_reconcile_error'] = error_message[:250]
             payment.provider_details = details
-            payment.last_checked_at = next_eligible_at
+            payment.last_checked_at = now_utc
+            payment.next_reconcile_at = now_utc + timedelta(seconds=backoff_sec)
             payment.updated_at = now_utc
         return payment
 
@@ -457,8 +459,31 @@ class InMemoryPurchaseRepository:
             if provider_details is not None:
                 row.provider_details = provider_details
             row.last_checked_at = datetime.now(UTC)
+            row.next_reconcile_at = None
             row.updated_at = row.last_checked_at
         return row
+
+    async def claim_payment_check(
+        self,
+        payment_id: UUID,
+        *,
+        throttle_seconds: float,
+    ) -> bool:
+        """Атомарно занимает окно проверки: как UPDATE ... RETURNING в SQL."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        row = self.payments.get(payment_id)
+        now_utc = datetime.now(UTC)
+        if row is None or row.status != 'pending':
+            return False
+        if (
+            row.last_checked_at is not None
+            and row.last_checked_at > now_utc - timedelta(seconds=throttle_seconds)
+        ):
+            return False
+        row.last_checked_at = now_utc
+        row.updated_at = now_utc
+        return True
 
     async def finalize_payment_succeeded(
         self,
