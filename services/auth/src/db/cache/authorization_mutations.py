@@ -66,8 +66,11 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
     return 1
 end
 
-if redis.call('EXISTS', KEYS[1]) == 0
-    and redis.call('EXISTS', KEYS[2]) == 0 then
+-- Маркер уже не наш: истёк (мутация шла дольше его TTL) или его взял другой
+-- процесс. Снимок, записанный без маркера, мог прочитать PostgreSQL до
+-- нашего коммита, поэтому удаляем его в любом случае.
+redis.call('DEL', KEYS[2])
+if redis.call('EXISTS', KEYS[1]) == 0 then
     return 1
 end
 

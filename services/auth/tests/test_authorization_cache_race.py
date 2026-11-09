@@ -21,7 +21,7 @@ import pytest
 from redis.asyncio import Redis
 
 from core.config import RedisSettings
-from db.cache.authorization import RedisAuthorizationCache
+from db.cache.authorization import AuthorizationSnapshot, RedisAuthorizationCache
 from services.authorization import AuthorizationService
 from services.film_access import FilmAccessContext, create_film_access_policy
 from services.types import CurrentUser
@@ -133,3 +133,38 @@ async def test_snapshot_read_before_access_change_is_not_cached(
         keys = [k async for k in redis.scan_iter(match=f'{{{namespace}}}:*')]
         if keys:
             await redis.unlink(*keys)
+
+
+async def test_snapshot_stored_after_marker_expiry_is_dropped_on_finish(
+    redis_client: Redis,
+) -> None:
+    """Мутация дольше TTL маркера: снимок, записанный без маркера, удаляется.
+
+    Регрессия: finish видел «маркер не наш» и снимок не трогал, поэтому
+    снимок, прочитанный до коммита, жил ещё до 300 с.
+    """
+    namespace = f'authz-race-{uuid4()}'
+    cache = RedisAuthorizationCache(redis_client, ttl_seconds=300, namespace=namespace)
+    user_id = uuid4()
+    snapshot_key = f'{{{namespace}}}:user:{user_id}'
+    try:
+        async with cache.user_mutation(user_id):
+            # Маркер истёк, пока шла долгая операция в PostgreSQL.
+            await redis_client.delete(f'{{{namespace}}}:user-changing:{user_id}')
+            read = await cache.read_snapshot(user_id)
+            await cache.store_snapshot(
+                user_id,
+                AuthorizationSnapshot(
+                    is_superuser=False,
+                    permissions=frozenset({'films.early_access:read'}),
+                ),
+                read.roles_revision_at_read,
+                expected_user_generation=read.user_generation_at_read,
+            )
+            assert await redis_client.exists(snapshot_key) == 1
+
+        assert await redis_client.exists(snapshot_key) == 0
+    finally:
+        keys = [k async for k in redis_client.scan_iter(match=f'{{{namespace}}}:*')]
+        if keys:
+            await redis_client.unlink(*keys)
