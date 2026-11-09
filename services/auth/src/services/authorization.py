@@ -113,6 +113,7 @@ class AuthorizationService:
         # Сначала пробуем взять уже вычисленные права из Redis. Ревизия нужна,
         # чтобы позднее не записать результат, устаревший за время чтения.
         roles_revision_at_read: str | None = None
+        user_generation_at_read = ''
         try:
             cache_read = await self._authorization_cache.read_snapshot(user_id)
         except CacheUnavailableError:
@@ -124,6 +125,7 @@ class AuthorizationService:
             if cache_read.cached_snapshot is not None:
                 return cache_read.cached_snapshot
             roles_revision_at_read = cache_read.roles_revision_at_read
+            user_generation_at_read = cache_read.user_generation_at_read
 
         # Если подходящего снимка нет или Redis недоступен, читаем исходные
         # данные из PostgreSQL. Отсутствующий пользователь означает
@@ -147,13 +149,15 @@ class AuthorizationService:
         )
 
         # Если Redis был доступен, пытаемся сохранить новый снимок. Lua-скрипт
-        # отклонит запись, если во время чтения PostgreSQL права изменились.
+        # отклонит запись, если во время чтения PostgreSQL права изменились:
+        # маркер ещё стоит, ревизия ролей или поколение пользователя выросли.
         if roles_revision_at_read is not None:
             try:
                 await self._authorization_cache.store_snapshot(
                     user_id,
                     snapshot,
                     roles_revision_at_read,
+                    expected_user_generation=user_generation_at_read,
                 )
             except CacheUnavailableError:
                 logger.warning(

@@ -11,10 +11,14 @@
   роли этого пользователя меняются и доверять его снимку нельзя.
 - Маркер изменения ролей — временный ключ Redis. Пока он существует, меняются
   общие ролевые правила и доверять нельзя ни одному снимку.
+- Поколение пользователя — счётчик, который растёт при каждом завершении
+  изменения его прав. Маркер снимается сразу после изменения, поэтому только
+  поколение отличает «права не менялись» от «изменились, маркер уже снят».
 
 Чтение снимка происходит так:
 
-1. Команда ``MGET`` одновременно читает ревизию ролей, оба маркера и снимок.
+1. Команда ``MGET`` одновременно читает ревизию ролей, оба маркера, снимок и
+   поколение пользователя.
 2. Если установлен хотя бы один маркер, метод возвращает результат без снимка.
 3. Если снимка нет, его JSON повреждён или его ревизия не совпадает с текущей,
    метод тоже возвращает результат без снимка.
@@ -23,8 +27,9 @@
 Сохранение снимка происходит так:
 
 1. После результата без снимка сервис вычисляет права по данным PostgreSQL.
-2. Вместе с новым снимком сервис передаёт ревизию, полученную в начале чтения.
-3. Lua-скрипт повторно проверяет ревизию и отсутствие обоих маркеров.
+2. Вместе с новым снимком сервис передаёт ревизию и поколение, полученные в
+   начале чтения.
+3. Lua-скрипт повторно проверяет ревизию, поколение и отсутствие маркеров.
 4. Если за это время права начали меняться, снимок не сохраняется. Иначе он
    записывается в Redis с ограниченным сроком жизни.
 """
@@ -46,14 +51,21 @@ logger = logging.getLogger(__name__)
 # проверкой и записью другой запрос не может изменить проверяемые ключи.
 _SET_SNAPSHOT_SCRIPT = """
 -- KEYS: текущая ревизия, маркер изменения ролей,
--- маркер изменения пользователя, снимок.
--- ARGV: ожидаемая ревизия, JSON снимка, срок жизни снимка.
+-- маркер изменения пользователя, снимок, поколение пользователя.
+-- ARGV: ожидаемая ревизия, JSON снимка, срок жизни снимка,
+-- ожидаемое поколение ('' — ключа поколения не было).
 if redis.call('EXISTS', KEYS[2]) == 1
     or redis.call('EXISTS', KEYS[3]) == 1 then
     return 0
 end
 
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+
+-- Права пользователя изменились после чтения PostgreSQL: маркер уже снят,
+-- но поколение выросло. Такой снимок устарел ещё до записи.
+if (redis.call('GET', KEYS[5]) or '') ~= ARGV[4] then
     return 0
 end
 
@@ -101,6 +113,7 @@ class AuthorizationSnapshotReadResult:
 
     cached_snapshot: AuthorizationSnapshot | None
     roles_revision_at_read: str
+    user_generation_at_read: str = ''
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,15 +145,19 @@ class AuthorizationKeyspace:
     def user_snapshot(self, user_id: UUID) -> str:
         return f'{self.prefix}:user:{user_id}'
 
+    def user_generation(self, user_id: UUID) -> str:
+        return f'{self.prefix}:user-generation:{user_id}'
+
 
 @dataclass(frozen=True, slots=True)
 class _RedisAuthorizationState:
-    """Четыре связанных значения, прочитанные командой Redis ``MGET``."""
+    """Пять связанных значений, прочитанных командой Redis ``MGET``."""
 
     roles_revision: bytes | str | None
     roles_mutation_marker: bytes | str | None
     user_mutation_marker: bytes | str | None
     snapshot_payload: bytes | str | None
+    user_generation: bytes | str | None
 
     @property
     def mutation_in_progress(self) -> bool:
@@ -194,9 +211,11 @@ class RedisAuthorizationSnapshotStore:
         if current_roles_revision is None:
             raise AuthorizationRevisionUnavailableError
 
+        user_generation = self._decode_redis_text(redis_state.user_generation) or ''
         cache_miss = AuthorizationSnapshotReadResult(
             cached_snapshot=None,
             roles_revision_at_read=current_roles_revision,
+            user_generation_at_read=user_generation,
         )
 
         # Пока права меняются, снимок может уже не соответствовать PostgreSQL.
@@ -241,6 +260,7 @@ class RedisAuthorizationSnapshotStore:
                 nearest_expires_at=nearest_expires_at,
             ),
             roles_revision_at_read=current_roles_revision,
+            user_generation_at_read=user_generation,
         )
 
     @on_redis_exception()
@@ -254,6 +274,7 @@ class RedisAuthorizationSnapshotStore:
             self._keys.roles_mutation_marker,
             self._keys.user_mutation_marker(user_id),
             self._keys.user_snapshot(user_id),
+            self._keys.user_generation(user_id),
         )
         redis_state = self._unpack_redis_state(await self._redis.mget(keys))
         if redis_state.roles_revision is None:
@@ -279,12 +300,14 @@ class RedisAuthorizationSnapshotStore:
             roles_mutation_marker,
             user_mutation_marker,
             snapshot_payload,
+            user_generation,
         ) = values
         return _RedisAuthorizationState(
             roles_revision=roles_revision,
             roles_mutation_marker=roles_mutation_marker,
             user_mutation_marker=user_mutation_marker,
             snapshot_payload=snapshot_payload,
+            user_generation=user_generation,
         )
 
     async def store_snapshot(
@@ -292,6 +315,8 @@ class RedisAuthorizationSnapshotStore:
         user_id: UUID,
         snapshot: AuthorizationSnapshot,
         expected_roles_revision: str,
+        *,
+        expected_user_generation: str,
     ) -> None:
         now_utc = datetime.now(UTC)
         normalized_expiry: datetime | None = None
@@ -320,6 +345,7 @@ class RedisAuthorizationSnapshotStore:
         await self._store_snapshot(
             user_id,
             expected_roles_revision,
+            expected_user_generation,
             snapshot_json,
             effective_ttl,
         )
@@ -329,6 +355,7 @@ class RedisAuthorizationSnapshotStore:
         self,
         user_id: UUID,
         expected_roles_revision: str,
+        expected_user_generation: str,
         snapshot_json: str,
         effective_ttl: int,
     ) -> None:
@@ -338,11 +365,13 @@ class RedisAuthorizationSnapshotStore:
                 self._keys.roles_mutation_marker,
                 self._keys.user_mutation_marker(user_id),
                 self._keys.user_snapshot(user_id),
+                self._keys.user_generation(user_id),
             ),
             args=(
                 expected_roles_revision,
                 snapshot_json,
                 effective_ttl,
+                expected_user_generation,
             ),
         )
 

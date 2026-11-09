@@ -282,6 +282,7 @@ class InMemoryAuthorizationCache:
         self.items: dict[UUID, tuple[str, AuthorizationSnapshot]] = {}
         self.roles_revision = str(uuid4())
         self.user_markers: set[UUID] = set()
+        self.user_generations: dict[UUID, int] = {}
         self.roles_changing = False
         self.fail_reads = False
         self.fail_writes = False
@@ -296,24 +297,34 @@ class InMemoryAuthorizationCache:
         if self.fail_reads:
             raise CacheUnavailableError
         if self.roles_changing or user_id in self.user_markers:
-            return AuthorizationSnapshotReadResult(None, self.roles_revision)
+            return AuthorizationSnapshotReadResult(
+                None, self.roles_revision, self._gen(user_id)
+            )
         item = self.items.get(user_id)
         if item is None or item[0] != self.roles_revision:
-            return AuthorizationSnapshotReadResult(None, self.roles_revision)
+            return AuthorizationSnapshotReadResult(
+                None, self.roles_revision, self._gen(user_id)
+            )
         snapshot = item[1]
         if (
             snapshot.nearest_expires_at is not None
             and snapshot.nearest_expires_at <= datetime.now(UTC)
         ):
             self.items.pop(user_id, None)
-            return AuthorizationSnapshotReadResult(None, self.roles_revision)
-        return AuthorizationSnapshotReadResult(snapshot, self.roles_revision)
+            return AuthorizationSnapshotReadResult(
+                None, self.roles_revision, self._gen(user_id)
+            )
+        return AuthorizationSnapshotReadResult(
+            snapshot, self.roles_revision, self._gen(user_id)
+        )
 
     async def store_snapshot(
         self,
         user_id: UUID,
         snapshot: AuthorizationSnapshot,
         expected_roles_revision: str,
+        *,
+        expected_user_generation: str,
     ) -> None:
         if self.fail_writes:
             raise CacheUnavailableError
@@ -321,6 +332,7 @@ class InMemoryAuthorizationCache:
             not self.roles_changing
             and user_id not in self.user_markers
             and expected_roles_revision == self.roles_revision
+            and expected_user_generation == self._gen(user_id)
         ):
             self.items[user_id] = (expected_roles_revision, snapshot)
 
@@ -334,7 +346,12 @@ class InMemoryAuthorizationCache:
             yield
         finally:
             self.items.pop(user_id, None)
+            self.user_generations[user_id] = self.user_generations.get(user_id, 0) + 1
             self.user_markers.remove(user_id)
+
+    def _gen(self, user_id: UUID) -> str:
+        generation = self.user_generations.get(user_id)
+        return '' if generation is None else str(generation)
 
     @asynccontextmanager
     async def roles_mutation(self) -> AsyncIterator[None]:

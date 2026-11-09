@@ -47,6 +47,7 @@ async def test_snapshot_component_round_trip(redis_client: Redis) -> None:
             user_id,
             snapshot,
             read_result.roles_revision_at_read,
+            expected_user_generation=read_result.user_generation_at_read,
         )
         cached = await store.read_snapshot(user_id)
         assert cached.cached_snapshot == snapshot
@@ -79,6 +80,7 @@ async def test_authorization_snapshot_round_trip(redis_client: Redis) -> None:
             user_id,
             snapshot,
             miss.roles_revision_at_read,
+            expected_user_generation=miss.user_generation_at_read,
         )
 
         hit = await store.read_snapshot(user_id)
@@ -112,7 +114,9 @@ async def test_cache_does_not_use_raw_eval(
 
     try:
         revision = (await store.read_snapshot(user_id)).roles_revision_at_read
-        await store.store_snapshot(user_id, snapshot, revision)
+        await store.store_snapshot(
+            user_id, snapshot, revision, expected_user_generation=''
+        )
         async with store.user_mutation(user_id):
             pass
         async with store.roles_mutation():
@@ -185,8 +189,12 @@ async def test_user_mutation_invalidates_only_target_user(
 
     try:
         revision = (await store.read_snapshot(first_user_id)).roles_revision_at_read
-        await store.store_snapshot(first_user_id, first_snapshot, revision)
-        await store.store_snapshot(second_user_id, second_snapshot, revision)
+        await store.store_snapshot(
+            first_user_id, first_snapshot, revision, expected_user_generation=''
+        )
+        await store.store_snapshot(
+            second_user_id, second_snapshot, revision, expected_user_generation=''
+        )
 
         async with store.user_mutation(first_user_id):
             first_read = await store.read_snapshot(first_user_id)
@@ -224,7 +232,9 @@ async def test_roles_mutation_invalidates_all_snapshots_by_revision(
     try:
         old_revision = (await store.read_snapshot(user_ids[0])).roles_revision_at_read
         for user_id in user_ids:
-            await store.store_snapshot(user_id, snapshot, old_revision)
+            await store.store_snapshot(
+                user_id, snapshot, old_revision, expected_user_generation=''
+            )
 
         async with store.roles_mutation():
             for user_id in user_ids:
@@ -264,7 +274,9 @@ async def test_stale_snapshot_is_not_written_after_roles_revision_changes(
         async with store.roles_mutation():
             pass
 
-        await store.store_snapshot(user_id, snapshot, old_revision)
+        await store.store_snapshot(
+            user_id, snapshot, old_revision, expected_user_generation=''
+        )
 
         read_result = await store.read_snapshot(user_id)
         assert read_result.cached_snapshot is None

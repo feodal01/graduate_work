@@ -155,7 +155,7 @@ async def test_snapshot_store_passes_capped_ttl_to_redis_lua_script() -> None:
         nearest_expires_at=nearest,
     )
 
-    await store.store_snapshot(user_id, snapshot, 'rev-1')
+    await store.store_snapshot(user_id, snapshot, 'rev-1', expected_user_generation='')
 
     fake_script.assert_awaited_once()
     passed_args = fake_script.call_args.kwargs['args']
@@ -207,6 +207,7 @@ async def test_postgresql_and_redis_role_expiration_and_ttl_integration(
                 nearest_expires_at=nearest,
             ),
             read_res.roles_revision_at_read,
+            expected_user_generation=read_res.user_generation_at_read,
         )
         key_ttl = await redis_client.ttl(f'{{{namespace}}}:user:{user_id}')
         assert 1 <= key_ttl <= 13
@@ -221,6 +222,7 @@ async def test_postgresql_and_redis_role_expiration_and_ttl_integration(
                 nearest_expires_at=short_exp,
             ),
             read_res.roles_revision_at_read,
+            expected_user_generation=read_res.user_generation_at_read,
         )
         hit_before = await cache.read_snapshot(user_id)
         assert hit_before.cached_snapshot is not None

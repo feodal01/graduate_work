@@ -16,8 +16,10 @@
 1. ``RedisUserAuthorizationMutation`` устанавливает маркер этого пользователя.
 2. ``yield`` передаёт управление сервису, который меняет назначение роли в
    PostgreSQL.
-3. После возвращения управления Lua-скрипт проверяет идентификатор владельца,
-   удаляет снимок пользователя и его маркер.
+3. После возвращения управления Lua-скрипт увеличивает поколение
+   пользователя, проверяет идентификатор владельца, удаляет снимок
+   пользователя и его маркер. Поколение не даёт запросу, прочитавшему
+   PostgreSQL до коммита, записать устаревший снимок после снятия маркера.
 4. При следующей проверке прав снимок будет построен заново из PostgreSQL.
 
 Изменение общих ролевых правил происходит так:
@@ -44,11 +46,21 @@ from db.cache.authorization_snapshot import AuthorizationKeyspace
 
 logger = logging.getLogger(__name__)
 
+# Поколение должно пережить любой запрос, который успел прочитать его до
+# изменения: иначе после истечения ключа счётчик начнётся заново и может
+# совпасть с прочитанным значением. Неделя заведомо больше любого запроса.
+USER_GENERATION_TTL_SECONDS = 7 * 24 * 60 * 60
+
 # Скрипт одной операцией проверяет владельца маркера, затем удаляет снимок
 # пользователя и принадлежащий этому процессу маркер.
 _FINISH_USER_MUTATION_SCRIPT = """
--- KEYS: маркер пользователя, его снимок.
--- ARGV: идентификатор владельца маркера.
+-- KEYS: маркер пользователя, его снимок, поколение пользователя.
+-- ARGV: идентификатор владельца маркера, срок жизни поколения.
+-- Поколение растёт всегда: права в PostgreSQL могли измениться, и снимок,
+-- вычисленный по данным до этого момента, сохранять уже нельзя.
+redis.call('INCR', KEYS[3])
+redis.call('EXPIRE', KEYS[3], ARGV[2])
+
 if redis.call('GET', KEYS[1]) == ARGV[1] then
     redis.call('DEL', KEYS[2], KEYS[1])
     return 1
@@ -159,6 +171,7 @@ class RedisUserAuthorizationMutation(_RedisAuthorizationMutation):
                 finalized = await self._finish(
                     marker_key,
                     self._keys.user_snapshot(user_id),
+                    self._keys.user_generation(user_id),
                     token,
                 )
                 if not finalized:
@@ -180,11 +193,12 @@ class RedisUserAuthorizationMutation(_RedisAuthorizationMutation):
         self,
         marker_key: str,
         snapshot_key: str,
+        generation_key: str,
         token: str,
     ) -> bool:
         result = await self._finish_script(
-            keys=(marker_key, snapshot_key),
-            args=(token,),
+            keys=(marker_key, snapshot_key, generation_key),
+            args=(token, USER_GENERATION_TTL_SECONDS),
         )
         return bool(result)
 

@@ -56,8 +56,10 @@ class AuthorizationCache(Protocol):
         user_id: UUID,
         snapshot: AuthorizationSnapshot,
         expected_roles_revision: str,
+        *,
+        expected_user_generation: str,
     ) -> None:
-        """Сохранить снимок, если наблюдавшаяся ревизия ещё актуальна."""
+        """Сохранить снимок, если ревизия и поколение с момента чтения те же."""
         ...
 
     def user_mutation(
@@ -125,12 +127,15 @@ class RedisAuthorizationCache:
         user_id: UUID,
         snapshot: AuthorizationSnapshot,
         expected_roles_revision: str,
+        *,
+        expected_user_generation: str,
     ) -> None:
         try:
             await self._snapshots.store_snapshot(
                 user_id,
                 snapshot,
                 expected_roles_revision,
+                expected_user_generation=expected_user_generation,
             )
         except RedisError as exc:
             logger.exception('Error writing authorization cache')
