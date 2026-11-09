@@ -267,6 +267,18 @@ class SQLAlchemyRefundRepository(SQLAlchemyRepository):
                 except IntegrityError:
                     await session.rollback()
 
+                if refund_id is not None:
+                    # Параллельный запрос успел вставить попытку с тем же UUID
+                    # (PK). Для чужого платежа это конфликт UUID, а не «возврат
+                    # уже оформлен».
+                    same_attempt = await session.get(Refund, refund_id)
+                    if same_attempt is not None:
+                        if same_attempt.payment_id != payment_id:
+                            raise RuleConflictError(
+                                'UUID попытки возврата принадлежит другому платежу',
+                                error_code='refund_id_conflict',
+                            )
+                        return same_attempt, False
                 concurrent = await session.scalar(
                     select(Refund).where(
                         Refund.payment_id == payment_id,

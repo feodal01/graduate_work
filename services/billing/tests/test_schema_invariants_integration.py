@@ -4,6 +4,7 @@ import sys
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import asyncpg
@@ -33,6 +34,10 @@ from models import (
     Tariff,
     UserAccessVersion,
 )
+
+if TYPE_CHECKING:
+    from repositories.bundle import BillingRepositories
+    from repositories.records import PaymentRecordProtocol
 
 pytestmark = pytest.mark.integration
 
@@ -1668,3 +1673,79 @@ async def test_claim_payment_check_is_atomic_and_backoff_has_own_column(
         assert row.next_reconcile_at > datetime.now(UTC)
         assert row.last_checked_at is not None
         assert row.last_checked_at <= datetime.now(UTC)
+
+
+async def _paid_payment_with_subscription(
+    repos: 'BillingRepositories',
+) -> 'PaymentRecordProtocol':
+    payment, _ = await repos.payments.get_or_create_pending_payment(uuid4())
+    await repos.payments.save_provider_payment_created(
+        payment.id,
+        provider_payment_id=f'yk_{payment.id.hex[:12]}',
+        confirmation_url='https://yookassa.test/confirm',
+        provider_details={'id': 'x'},
+    )
+    paid, _ = await repos.payments.finalize_payment_succeeded(
+        payment.id, source='webhook'
+    )
+    return paid
+
+
+async def test_refund_attempt_uuid_is_idempotent_in_postgres(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BIL-NFR-R-02 в PostgreSQL: повтор формы находит попытку по её UUID."""
+    from domain.errors import RuleConflictError
+    from repositories.bundle import BillingRepositories
+
+    repos = BillingRepositories.sqlalchemy(migrated_billing_db)
+    first = await _paid_payment_with_subscription(repos)
+    second = await _paid_payment_with_subscription(repos)
+    attempt = uuid4()
+    admin = uuid4()
+
+    created, is_new = await repos.refunds.get_or_create_processing_refund(
+        first.id, admin_user_id=admin, reason='Жалоба', refund_id=attempt
+    )
+    assert (created.id, is_new) == (attempt, True)
+
+    # Отказ ЮKassa: повтор той же формы возвращает отказ, а не новую попытку.
+    await repos.refunds.finalize_refund_rejected(
+        attempt, rejection_reason='rejected_by_provider', source='admin'
+    )
+    again, again_new = await repos.refunds.get_or_create_processing_refund(
+        first.id, admin_user_id=admin, reason='Жалоба', refund_id=attempt
+    )
+    assert (again.id, again.status, again_new) == (attempt, 'rejected', False)
+
+    # Тот же UUID для другого платежа — конфликт, попытка не «угоняется».
+    with pytest.raises(RuleConflictError) as exc_info:
+        await repos.refunds.get_or_create_processing_refund(
+            second.id, admin_user_id=admin, reason='Жалоба', refund_id=attempt
+        )
+    assert exc_info.value.error_code == 'refund_id_conflict'
+
+    # Гонка: попытку с тем же UUID для другого платежа вставили параллельно,
+    # и ранняя проверка её ещё не видела. Вставка падает по PK; это должен
+    # быть refund_id_conflict, а не «возврат уже оформлен».
+    shared = uuid4()
+    third = await _paid_payment_with_subscription(repos)
+    await repos.refunds.get_or_create_processing_refund(
+        second.id, admin_user_id=admin, reason='A', refund_id=shared
+    )
+    original_get = AsyncSession.get
+    hidden = {'left': 1}
+
+    async def get_hiding_first_lookup(self, entity, ident, **kwargs):  # type: ignore[no-untyped-def]
+        if ident == shared and hidden['left']:
+            hidden['left'] -= 1
+            return None
+        return await original_get(self, entity, ident, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, 'get', get_hiding_first_lookup)
+    with pytest.raises(RuleConflictError) as race_exc:
+        await repos.refunds.get_or_create_processing_refund(
+            third.id, admin_user_id=admin, reason='B', refund_id=shared
+        )
+    assert race_exc.value.error_code == 'refund_id_conflict'
