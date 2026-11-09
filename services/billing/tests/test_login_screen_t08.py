@@ -460,8 +460,17 @@ async def test_user_rate_limit_in_auth_shows_429_not_auth_outage(
         {'Origin': 'https://evil.example'},
         {'Origin': 'null'},
         {'Referer': 'https://evil.example/attack.html'},
+        # Другая страница на том же хосте (Jaeger, Kibana, dev-сервер) — чужой сайт.
+        {'Origin': 'http://testserver:16686'},
+        {'Origin': 'https://localhost'},
     ],
-    ids=['foreign-origin', 'null-origin', 'foreign-referer'],
+    ids=[
+        'foreign-origin',
+        'null-origin',
+        'foreign-referer',
+        'same-host-other-port',
+        'other-scheme',
+    ],
 )
 async def test_cross_site_login_form_is_rejected(
     login_client: tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],
@@ -491,10 +500,23 @@ async def test_cross_site_login_form_is_rejected(
     [
         {},
         {'Origin': 'http://testserver'},
-        {'Origin': 'http://testserver:18081'},  # шлюз отдаёт Host без порта
+        {'Referer': 'http://testserver/billing/login'},
+        # Через шлюз: Host без порта, полный адрес в X-Forwarded-Host.
+        {
+            'Origin': 'http://localhost:18081',
+            'Host': 'localhost',
+            'X-Forwarded-Host': 'localhost:18081',
+            'X-Forwarded-Proto': 'http',
+        },
         {'Origin': 'http://localhost'},  # BILLING_PUBLIC_BASE_URL
     ],
-    ids=['no-origin', 'same-host', 'same-host-other-port', 'public-base-url'],
+    ids=[
+        'no-origin',
+        'same-origin',
+        'same-origin-referer',
+        'gateway-with-port',
+        'public-base-url',
+    ],
 )
 async def test_same_site_login_form_is_accepted(
     login_client: tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],

@@ -31,6 +31,36 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=['billing-ui'])
 
 
+_DEFAULT_PORTS = {'http': 80, 'https': 443}
+
+
+def _origin_of(url: str) -> tuple[str, str, int] | None:
+    """Схема, хост и порт адреса; None, если это не http(s)-адрес."""
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in _DEFAULT_PORTS or not parts.hostname:
+        return None
+    try:
+        port = parts.port or _DEFAULT_PORTS[scheme]
+    except ValueError:
+        return None
+    return scheme, parts.hostname.lower(), port
+
+
+def _own_origin(request: Request) -> tuple[str, str, int] | None:
+    """Origin, по которому браузер открыл Биллинг.
+
+    Шлюз передаёт `Host` без порта, поэтому берём `X-Forwarded-Host`
+    (`$http_host` с портом) и `X-Forwarded-Proto`. Форма с чужого сайта эти
+    заголовки задать не может, а шлюз перезаписывает их на каждом запросе.
+    """
+    host = request.headers.get('x-forwarded-host') or request.headers.get('host')
+    scheme = request.headers.get('x-forwarded-proto') or request.url.scheme
+    if not host:
+        return None
+    return _origin_of(f'{scheme}://{host.split(",")[0].strip()}')
+
+
 def require_same_site_form(request: Request) -> None:
     """Отклоняет POST экранов Биллинга, отправленный с чужого сайта (CSRF).
 
@@ -39,17 +69,17 @@ def require_same_site_form(request: Request) -> None:
     подписку. SameSite=Lax этого не ловит: ответ навигации верхнего уровня
     ставит cookie. Браузеры шлют Origin на каждый POST (Referer — запасной
     вариант); запрос без обоих заголовков — не браузерный и пропускается.
-    Сравниваются имена хостов: шлюз передаёт Host без порта.
+    Сравнивается полный origin (схема, хост, порт): другая страница на том же
+    хосте, но другом порту — уже другой сайт.
     """
     source = request.headers.get('origin') or request.headers.get('referer')
     if source is None:
         return
-    source_host = urlsplit(source).hostname
-    allowed_hosts = {
-        request.url.hostname,
-        urlsplit(str(settings.worker.billing_public_base_url)).hostname,
-    }
-    if source_host is None or source_host not in allowed_hosts:
+    allowed = {
+        _own_origin(request),
+        _origin_of(str(settings.worker.billing_public_base_url)),
+    } - {None}
+    if _origin_of(source) not in allowed:
         logger.warning('Rejected cross-site billing form POST from %s', source)
         raise UIErrorScreenException(
             status_code=status.HTTP_403_FORBIDDEN,

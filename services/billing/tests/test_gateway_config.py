@@ -46,3 +46,16 @@ def test_billing_unavailable_location_answers_503_json() -> None:
     block = re.search(r'location @billing_unavailable \{(.*?)\n    \}', text, re.S)
     assert block, 'missing @billing_unavailable'
     assert re.search(r"return 503 '\{\"error_code\":\"billing_unavailable\"", block[1])
+
+
+@pytest.mark.skipif(not GATEWAY_CONF.exists(), reason='gateway config not present')
+def test_gateway_forwards_host_with_port_for_csrf_check() -> None:
+    """BIL-NFR-SEC-06: Биллинг сравнивает полный origin формы с адресом шлюза.
+
+    `Host` уходит в upstream без порта (`$host`), поэтому шлюз обязан
+    передать `$http_host` в `X-Forwarded-Host`, иначе вход через порт шлюза
+    (например, 18081) отклонялся бы как межсайтовый.
+    """
+    nginx_conf = (GATEWAY_CONF.parents[1] / 'nginx.conf').read_text()
+    assert re.search(r'proxy_set_header\s+X-Forwarded-Host\s+\$http_host;', nginx_conf)
+    assert re.search(r'proxy_set_header\s+X-Forwarded-Proto\s+\$scheme;', nginx_conf)
