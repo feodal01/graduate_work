@@ -15,7 +15,7 @@ from clients.payment_provider import (
 )
 from clients.payment_provider_registry import PaymentProviderRegistry
 from core.observability import correlation_request_id
-from domain.subscription import ReconcileSource
+from domain.subscription import ReconcileSource, ensure_utc
 from repositories.payments import PaymentRepository
 from repositories.records import PaymentRecordProtocol, RefundRecordProtocol
 from repositories.refunds import RefundRepository
@@ -24,6 +24,20 @@ logger = logging.getLogger(__name__)
 
 CHECK_THROTTLE_WINDOW = timedelta(seconds=5)
 IDEMPOTENCY_KEY_TTL = timedelta(hours=24)
+
+
+def idempotency_key_expired(
+    created_at: datetime,
+    *,
+    now_utc: datetime | None = None,
+) -> bool:
+    """Истёк ли 24-часовой срок ключа идемпотентности ЮKassa (инв. 13, 14).
+
+    Единая проверка для фоновой сверки, «Продолжить оплату» и повтора
+    возврата; naive-время считается UTC.
+    """
+    now = now_utc or datetime.now(UTC)
+    return now - ensure_utc(created_at) >= IDEMPOTENCY_KEY_TTL
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,15 +235,9 @@ class PaymentReconciler:
             )
 
         if not payment.provider_payment_id:
-            now_utc = datetime.now(UTC)
-            created_at = (
-                payment.created_at
-                if payment.created_at.tzinfo is not None
-                else payment.created_at.replace(tzinfo=UTC)
-            )
             # Инвариант 13: если за 24 часа жизни ключа номер ЮKassa не получен,
             # переводим платёж в Не оплачен (средства не списаны).
-            if (now_utc - created_at) >= IDEMPOTENCY_KEY_TTL:
+            if idempotency_key_expired(payment.created_at):
                 updated, transitioned = await self._payments.finalize_payment_failed(
                     payment.id,
                     failure_reason='idempotency_key_expired',
@@ -429,10 +437,7 @@ class PaymentReconciler:
                 transitioned=False,
                 throttled=False,
             )
-        if (
-            not refund.provider_refund_id
-            and datetime.now(UTC) - refund.created_at >= IDEMPOTENCY_KEY_TTL
-        ):
+        if not refund.provider_refund_id and idempotency_key_expired(refund.created_at):
             # Инв. 14: ключ в ЮKassa истёк, повторный POST мог бы создать
             # второй возврат (и получить 400 «сумма больше остатка», после чего
             # уже выполненный возврат считался бы отклонённым). Ищем попытку
@@ -600,15 +605,9 @@ class PaymentReconciler:
                     transitioned=False,
                     throttled=False,
                 )
-            now_utc = datetime.now(UTC)
-            created_at = (
-                refund.created_at
-                if refund.created_at.tzinfo is not None
-                else refund.created_at.replace(tzinfo=UTC)
-            )
             # Инвариант 14: после истечения 24 часов ищем возврат в списке возвратов
             # по нашему refund_id в metadata.
-            if (now_utc - created_at) >= IDEMPOTENCY_KEY_TTL:
+            if idempotency_key_expired(refund.created_at):
                 found_snap = await self._providers.get(
                     refund.provider_code
                 ).find_refund_by_metadata(

@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from uuid import UUID
 
 from clients.payment_provider import (
@@ -25,8 +24,8 @@ from repositories.records import PaymentRecordProtocol
 from repositories.user_views import UserBillingViews
 from services.reconciler import (
     CHECK_THROTTLE_WINDOW,
-    IDEMPOTENCY_KEY_TTL,
     PaymentReconciler,
+    idempotency_key_expired,
 )
 
 __all__ = [
@@ -317,7 +316,7 @@ class PurchaseService:
         user_id: UUID,
         payment: PaymentRecordProtocol,
     ) -> PurchaseOutcome:
-        if datetime.now(UTC) - payment.created_at >= IDEMPOTENCY_KEY_TTL:
+        if idempotency_key_expired(payment.created_at):
             # Инв. 13: ключ идемпотентности в ЮKassa жив 24 ч. POST с истёкшим
             # ключом создал бы в ЮKassa второй платёж. Номера нет, значит
             # пользователь не платил: закрываем платёж и начинаем новый.

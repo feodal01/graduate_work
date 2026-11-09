@@ -82,7 +82,8 @@ def resolve_user_zoneinfo(tz_name: str | None) -> ZoneInfo:
         return UTC_TZ
 
 
-def _ensure_utc(dt: datetime) -> datetime:
+def ensure_utc(dt: datetime) -> datetime:
+    """Naive-время из БД или тестов считается UTC."""
     if dt.tzinfo is None:
         return dt.replace(tzinfo=UTC)
     return dt
@@ -91,13 +92,13 @@ def _ensure_utc(dt: datetime) -> datetime:
 def format_user_datetime(dt: datetime, tz_name: str | None) -> str:
     """Форматирует дату в поясе пользователя для экранов (BIL-NFR-U-01, NFR-U-03)."""
     zone = resolve_user_zoneinfo(tz_name)
-    localized = _ensure_utc(dt).astimezone(zone)
+    localized = ensure_utc(dt).astimezone(zone)
     return localized.strftime('%d.%m.%Y %H:%M')
 
 
 def format_msk_datetime(dt: datetime) -> str:
     """Форматирует время по Москве с пометкой МСК для писем (2.2 п. 12, 4.4)."""
-    msk = _ensure_utc(dt).astimezone(MSK_TZ)
+    msk = ensure_utc(dt).astimezone(MSK_TZ)
     return f'{msk.strftime("%d.%m.%Y %H:%M")} МСК'
 
 
@@ -152,7 +153,7 @@ def build_payment_succeeded_email_payload(
         ),
         'available_at': None,
         'subscription_id': str(subscription_id),
-        'ends_at': _ensure_utc(ends_at).isoformat(),
+        'ends_at': ensure_utc(ends_at).isoformat(),
     }
 
 
@@ -180,7 +181,7 @@ def build_subscription_expiration_email_payload(
             f'({ends_msk}). Вы можете оформить новую подписку '
             f'на странице: {my_sub_url}'
         ),
-        'available_at': _ensure_utc(ends_at).isoformat(),
+        'available_at': ensure_utc(ends_at).isoformat(),
         'subscription_id': str(subscription_id),
     }
 

@@ -1749,3 +1749,58 @@ async def test_refund_attempt_uuid_is_idempotent_in_postgres(
             third.id, admin_user_id=admin, reason='B', refund_id=shared
         )
     assert race_exc.value.error_code == 'refund_id_conflict'
+
+
+async def test_next_reconcile_at_migration_moves_backoff_both_ways(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """Миграция 20261109_0002 переносит backoff на непустых данных.
+
+    До неё backoff хранился как будущее время `last_checked_at`. Upgrade
+    переносит такое значение в `next_reconcile_at`, а обычную отметку проверки
+    не трогает; downgrade возвращает backoff обратно.
+    """
+    engine = migrated_billing_db.kw['bind']
+    database = engine.url.database
+    backoff_pid, checked_pid = uuid4(), uuid4()
+
+    await _run_alembic(database, 'downgrade', '20261103_0001')
+    async with engine.begin() as conn:
+        for pid, checked in (
+            (backoff_pid, "now() + interval '4 minutes'"),
+            (checked_pid, "now() - interval '1 minute'"),
+        ):
+            await conn.execute(
+                text(
+                    'INSERT INTO payments (id, user_id, tariff_id, provider_code, '
+                    'amount_kopeks, currency, status, idempotency_key, '
+                    f'last_checked_at) VALUES (:id, :uid, '
+                    "'00000000-0000-0000-0000-000000000001', 'yookassa', 29900, "
+                    f"'RUB', 'pending', :id, {checked})"
+                ),
+                {'id': pid, 'uid': uuid4()},
+            )
+
+    await _run_alembic(database, 'upgrade', 'head')
+    async with engine.connect() as conn:
+        rows = {
+            r.id: r
+            for r in await conn.execute(
+                text(
+                    'SELECT id, last_checked_at <= now() AS checked_not_future, '
+                    'next_reconcile_at > now() AS backoff_future, '
+                    'next_reconcile_at IS NULL AS no_backoff FROM payments'
+                )
+            )
+        }
+    assert rows[backoff_pid].checked_not_future and rows[backoff_pid].backoff_future
+    assert rows[checked_pid].checked_not_future and rows[checked_pid].no_backoff
+
+    await _run_alembic(database, 'downgrade', '20261103_0001')
+    async with engine.connect() as conn:
+        restored = await conn.scalar(
+            text('SELECT last_checked_at > now() FROM payments WHERE id = :id'),
+            {'id': backoff_pid},
+        )
+    assert restored is True
+    await _run_alembic(database, 'upgrade', 'head')

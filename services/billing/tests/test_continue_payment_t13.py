@@ -510,3 +510,16 @@ async def test_user_is_not_sent_to_payment_page_whose_number_was_not_saved(
     assert resp.headers.get('location') != orphan_url
     saved_urls = {p.confirmation_url for p in repo.payments.values()}
     assert resp.headers['location'] in saved_urls
+
+
+def test_idempotency_key_expiry_accepts_naive_and_aware_times() -> None:
+    """Одна проверка срока ключа для всех путей; naive-время считается UTC."""
+    from services.reconciler import idempotency_key_expired
+
+    now = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
+    old_aware = now - timedelta(hours=24)
+    fresh_naive = (now - timedelta(hours=23, minutes=59)).replace(tzinfo=None)
+
+    assert idempotency_key_expired(old_aware, now_utc=now) is True
+    assert idempotency_key_expired(fresh_naive, now_utc=now) is False
+    assert idempotency_key_expired(old_aware.replace(tzinfo=None), now_utc=now)
