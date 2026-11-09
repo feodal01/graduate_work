@@ -1518,3 +1518,52 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
         metrics_snap.outbox_requires_intervention_count
         + metrics_snap.outbox_stuck_pending_count
     )
+
+
+async def test_payment_result_and_overview_survive_refund_access_task(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """После возврата у платежа две задачи sync_access; экраны не падают в 503.
+
+    Регрессия: JOIN по payment_id находил обе задачи, `.one_or_none()` бросал
+    MultipleResultsFound, и страница результата оплаты отвечала 503.
+    """
+    from repositories.bundle import BillingRepositories
+
+    repos = BillingRepositories.sqlalchemy(migrated_billing_db)
+    user_id = uuid4()
+    payment, _ = await repos.payments.get_or_create_pending_payment(user_id)
+    await repos.payments.save_provider_payment_created(
+        payment.id,
+        provider_payment_id='yk_refund_view_pay',
+        confirmation_url='https://yookassa.test/confirm',
+        provider_details={'id': 'yk_refund_view_pay'},
+    )
+    await repos.payments.finalize_payment_succeeded(payment.id, source='webhook')
+    async with migrated_billing_db() as session:
+        task = await session.scalar(
+            select(OutboxTask).where(
+                OutboxTask.payment_id == payment.id,
+                OutboxTask.task_type == 'sync_access',
+            )
+        )
+        assert task is not None
+        task.status = 'completed'
+        await session.commit()
+
+    refund, _ = await repos.refunds.get_or_create_processing_refund(
+        payment.id,
+        admin_user_id=uuid4(),
+        reason='Проверка экранов после возврата',
+    )
+    await repos.refunds.finalize_refund_succeeded(refund.id, source='admin')
+
+    result = await repos.user_views.get_local_payment_result_for_user(
+        payment.id, user_id
+    )
+    overview = await repos.user_views.get_user_billing_overview(user_id)
+
+    assert result is not None
+    # Флаг описывает задачу оплаты, а не pending-задачу закрытия доступа.
+    assert result.auth_access_delivered is True
+    assert overview.latest_subscription_auth_delivered is True

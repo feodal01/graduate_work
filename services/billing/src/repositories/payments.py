@@ -30,6 +30,15 @@ from repositories.records import (
 )
 
 
+def payment_access_task_key(payment_id: UUID) -> str:
+    """Ключ задачи «открыть доступ» после оплаты; у платежа она ровно одна.
+
+    После возврата у того же платежа появляется вторая задача `sync_access`
+    (закрыть доступ), поэтому экраны ищут задачу оплаты по этому ключу.
+    """
+    return f'payment_succeeded:{payment_id}:auth_access'
+
+
 class PaymentRepository(Protocol):
     """Платежи: создание, сверка и атомарная фиксация итога (T-10, T-11, T-17)."""
 
@@ -487,7 +496,7 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
                 session.add_all(
                     [
                         OutboxTask(
-                            dedup_key=f'payment_succeeded:{payment.id}:auth_access',
+                            dedup_key=payment_access_task_key(payment.id),
                             target_service='auth',
                             task_type='sync_access',
                             payment_id=payment.id,

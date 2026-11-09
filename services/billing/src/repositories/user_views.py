@@ -16,6 +16,7 @@ from models import (
     Tariff,
 )
 from repositories._sqlalchemy import SQLAlchemyRepository
+from repositories.payments import payment_access_task_key
 from repositories.read_models import (
     LocalPaymentResultData,
     UserBillingOverviewData,
@@ -68,11 +69,7 @@ class SQLAlchemyUserBillingViews(SQLAlchemyRepository):
                     )
                     .outerjoin(
                         OutboxTask,
-                        and_(
-                            OutboxTask.payment_id == Payment.id,
-                            OutboxTask.target_service == 'auth',
-                            OutboxTask.task_type == 'sync_access',
-                        ),
+                        OutboxTask.dedup_key == payment_access_task_key(payment_id),
                     )
                     .where(
                         Payment.id == payment_id,
@@ -148,13 +145,10 @@ class SQLAlchemyUserBillingViews(SQLAlchemyRepository):
                 if latest_sub_row is not None:
                     latest_sub_payment_id, latest_ends_at = latest_sub_row
                     auth_task_status = await session.scalar(
-                        select(OutboxTask.status)
-                        .where(
-                            OutboxTask.payment_id == latest_sub_payment_id,
-                            OutboxTask.target_service == 'auth',
-                            OutboxTask.task_type == 'sync_access',
+                        select(OutboxTask.status).where(
+                            OutboxTask.dedup_key
+                            == payment_access_task_key(latest_sub_payment_id)
                         )
-                        .limit(1)
                     )
                     auth_delivered = auth_task_status == 'completed'
 
