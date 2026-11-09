@@ -1622,6 +1622,20 @@ async def test_sql_outbox_keeps_retrying_access_sync_after_attempt_limit(
         )
     assert exc_info.value.error_code == 'outbox_task_not_retryable'
 
+    # После лимита бессрочную задачу администратор может закрыть (6.3).
+    from core.config import settings
+
+    async with migrated_billing_db() as session:
+        row = await session.get(OutboxTask, task_id)
+        assert row is not None
+        row.attempts = settings.worker.billing_outbox_max_attempts
+        await session.commit()
+    closed = await repos.outbox_admin.close_outbox_task_by_admin(
+        task_id, admin_user_id=uuid4(), reason='Получатель удалён'
+    )
+    assert closed.status == 'closed'
+    assert closed.can_retry_or_close is False
+
 
 async def test_claim_payment_check_is_atomic_and_backoff_has_own_column(
     migrated_billing_db: async_sessionmaker[AsyncSession],

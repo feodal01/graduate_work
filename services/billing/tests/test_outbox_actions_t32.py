@@ -340,3 +340,55 @@ async def test_retry_is_only_for_requires_intervention(status: str) -> None:
         )
     assert exc_info.value.error_code == 'outbox_task_not_retryable'
     assert task.attempts == 3
+
+
+@pytest.mark.parametrize('task_type', ['sync_access', 'cancel_expiration_email'])
+async def test_retry_and_close_work_for_endless_task_past_the_limit(
+    task_type: str,
+) -> None:
+    """Бессрочная задача после лимита доступна для «Повторить» и «Закрыть».
+
+    Такая задача не уходит в requires_intervention и висит в pending. Без этого
+    правила администратор не мог ни ускорить повтор, ни закрыть задачу,
+    которую получатель отвергает всегда (матрица 6.3, BIL-API-12/13).
+    """
+    repo = InMemoryPurchaseRepository()
+
+    def _task(attempts: int) -> FakeOutboxTaskRow:
+        payment_id = uuid4()
+        row = FakeOutboxTaskRow(
+            id=uuid4(),
+            dedup_key=f'endless:{payment_id}',
+            target_service='auth' if task_type == 'sync_access' else 'notifications',
+            task_type=task_type,
+            payment_id=payment_id,
+            user_id=uuid4(),
+            access_version=1 if task_type == 'sync_access' else None,
+            payload={},
+            status='pending',
+            attempts=attempts,
+        )
+        repo.outbox_tasks[row.dedup_key] = row
+        return row
+
+    from core.config import settings
+    from domain.errors import RuleConflictError
+
+    limit = settings.worker.billing_outbox_max_attempts
+    young = _task(limit - 1)
+    stuck_retry = _task(limit + 3)
+    stuck_close = _task(limit)
+
+    with pytest.raises(RuleConflictError):
+        await repo.close_outbox_task_by_admin(
+            young.id, admin_user_id=uuid4(), reason='Рано'
+        )
+    retried = await repo.retry_outbox_task_by_admin(
+        stuck_retry.id, admin_user_id=uuid4(), reason='Ключ починили'
+    )
+    closed = await repo.close_outbox_task_by_admin(
+        stuck_close.id, admin_user_id=uuid4(), reason='Пользователь удалён в Auth'
+    )
+
+    assert (retried.status, stuck_retry.attempts) == ('pending', 0)
+    assert closed.status == 'closed'

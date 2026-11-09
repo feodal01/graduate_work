@@ -8,6 +8,7 @@ import sentry_sdk
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
+from core.config import settings
 from core.observability import correlation_request_id
 from db.sql.errors import DatabaseUnavailableError
 from domain.errors import EntityNotFoundError, RuleConflictError
@@ -43,6 +44,23 @@ OutboxDeliverFn = Callable[
 # момента T, иначе пользователь с возвращёнными деньгами получит письмо
 # «срок подписки закончился» (ТЗ 6.3: «повторяется до восстановления»).
 RETRY_UNTIL_DELIVERED_TASK_TYPES = frozenset({'sync_access', 'cancel_expiration_email'})
+
+
+def admin_can_retry_or_close(status: str, task_type: str, attempts: int) -> bool:
+    """Доступны ли «Повторить» и «Закрыть с причиной» (US-A-02, BIL-API-12/13).
+
+    Обычная задача — только в `requires_intervention`. Бессрочная задача
+    (`RETRY_UNTIL_DELIVERED_TASK_TYPES`) туда по лимиту не попадает и после
+    лимита остаётся `pending` с повторами: без этого администратор не смог бы
+    ни ускорить повтор, ни закрыть задачу, которую получатель отвергает всегда.
+    """
+    if status == 'requires_intervention':
+        return True
+    return (
+        status == 'pending'
+        and task_type in RETRY_UNTIL_DELIVERED_TASK_TYPES
+        and attempts >= settings.worker.billing_outbox_max_attempts
+    )
 
 
 def transient_failure_transition(
@@ -367,7 +385,9 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
                             last_error=t.last_error,
                             created_at=t.created_at,
                             updated_at=t.updated_at,
-                            can_retry_or_close=(t_status == 'requires_intervention'),
+                            can_retry_or_close=admin_can_retry_or_close(
+                                t.status, t.task_type, t.attempts
+                            ),
                             payment_id=t.payment_id,
                             user_id=t.user_id,
                         )
@@ -411,10 +431,12 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
                         'Outbox task not found',
                         error_code='outbox_task_not_found',
                     )
-                if task.status != 'requires_intervention':
+                if not admin_can_retry_or_close(
+                    task.status, task.task_type, task.attempts
+                ):
                     raise RuleConflictError(
-                        'Повтор доступен только для задачи в состоянии '
-                        'requires_intervention: pending-задачу уже повторяет воркер, '
+                        'Повтор доступен только для задачи, требующей вмешательства: '
+                        'pending-задачу до лимита уже повторяет воркер, '
                         'а завершённую или закрытую повторять нельзя',
                         error_code='outbox_task_not_retryable',
                     )
@@ -454,10 +476,11 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
                         'Outbox task not found',
                         error_code='outbox_task_not_found',
                     )
-                if task.status != 'requires_intervention':
+                if not admin_can_retry_or_close(
+                    task.status, task.task_type, task.attempts
+                ):
                     raise RuleConflictError(
-                        'Закрытие доступно только для задачи в состоянии '
-                        'requires_intervention',
+                        'Закрытие доступно только для задачи, требующей вмешательства',
                         error_code='outbox_task_not_requires_intervention',
                     )
                 task.status = 'closed'
@@ -499,7 +522,9 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
             last_error=t.last_error,
             created_at=t.created_at,
             updated_at=t.updated_at,
-            can_retry_or_close=(t_status == 'requires_intervention'),
+            can_retry_or_close=admin_can_retry_or_close(
+                t.status, t.task_type, t.attempts
+            ),
             payment_id=t.payment_id,
             user_id=t.user_id,
         )

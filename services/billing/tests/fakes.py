@@ -33,6 +33,7 @@ from repositories.bundle import BillingRepositories
 from repositories.outbox import (
     DeliveryOutcome,
     OutboxDeliverFn,
+    admin_can_retry_or_close,
     compute_outbox_backoff_seconds,
     transient_failure_transition,
 )
@@ -1062,7 +1063,9 @@ class InMemoryPurchaseRepository:
                     last_error=t.last_error,
                     created_at=t.created_at,
                     updated_at=t.updated_at,
-                    can_retry_or_close=(t_status == 'requires_intervention'),
+                    can_retry_or_close=admin_can_retry_or_close(
+                        t.status, t.task_type, t.attempts
+                    ),
                     payment_id=t.payment_id,
                     user_id=t.user_id,
                 )
@@ -1175,7 +1178,9 @@ class InMemoryPurchaseRepository:
                     last_error=t.last_error,
                     created_at=t.created_at,
                     updated_at=t.updated_at,
-                    can_retry_or_close=(t_status == 'requires_intervention'),
+                    can_retry_or_close=admin_can_retry_or_close(
+                        t.status, t.task_type, t.attempts
+                    ),
                     payment_id=t.payment_id,
                     user_id=t.user_id,
                 )
@@ -1206,7 +1211,9 @@ class InMemoryPurchaseRepository:
             last_error=t.last_error,
             created_at=t.created_at,
             updated_at=t.updated_at,
-            can_retry_or_close=(t_status == 'requires_intervention'),
+            can_retry_or_close=admin_can_retry_or_close(
+                t.status, t.task_type, t.attempts
+            ),
             payment_id=t.payment_id,
             user_id=t.user_id,
         )
@@ -1240,7 +1247,7 @@ class InMemoryPurchaseRepository:
                 'Outbox task not found',
                 error_code='outbox_task_not_found',
             )
-        if found.status != 'requires_intervention':
+        if not admin_can_retry_or_close(found.status, found.task_type, found.attempts):
             raise RuleConflictError(
                 'Повтор доступен только для задачи в состоянии '
                 'requires_intervention: pending-задачу уже повторяет воркер, '
@@ -1287,7 +1294,7 @@ class InMemoryPurchaseRepository:
                 'Outbox task not found',
                 error_code='outbox_task_not_found',
             )
-        if found.status != 'requires_intervention':
+        if not admin_can_retry_or_close(found.status, found.task_type, found.attempts):
             raise RuleConflictError(
                 'Закрытие доступно только для задачи в состоянии requires_intervention',
                 error_code='outbox_task_not_requires_intervention',

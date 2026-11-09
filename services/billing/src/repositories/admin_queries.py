@@ -19,6 +19,7 @@ from models import (
     Tariff,
 )
 from repositories._sqlalchemy import SQLAlchemyRepository
+from repositories.outbox import admin_can_retry_or_close
 from repositories.read_models import (
     InternalAdminActionFilter,
     InternalAdminActionItemData,
@@ -517,7 +518,9 @@ class SQLAlchemyAdminQueries(SQLAlchemyRepository):
                             last_error=t.last_error,
                             created_at=t.created_at,
                             updated_at=t.updated_at,
-                            can_retry_or_close=(t_status == 'requires_intervention'),
+                            can_retry_or_close=admin_can_retry_or_close(
+                                t.status, t.task_type, t.attempts
+                            ),
                             payment_id=t.payment_id,
                             user_id=t.user_id,
                         )
