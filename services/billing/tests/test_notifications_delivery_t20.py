@@ -152,8 +152,8 @@ async def test_http_notifications_gateway_batch_and_cancel_contract() -> None:
                     request_id='req-ntf-temp',
                 )
 
-        # 5. 401, 413, 422 -> NotificationsPermanentError
-        for code in (401, 413, 422):
+        # 5. 413, 422 -> NotificationsPermanentError
+        for code in (413, 422):
             next_status = code
             next_body = {'error_code': 'validation_error', 'detail': 'Invalid'}
             with pytest.raises(NotificationsPermanentError) as perm_exc:
@@ -169,7 +169,23 @@ async def test_http_notifications_gateway_batch_and_cancel_contract() -> None:
                 )
             assert perm_exc.value.status_code == code
 
-        # 6. Отмена кампании (cancel_campaign) -> 200 OK, 503 transient, 401 permanent
+        # 5a. 401/403 — отклонён сервисный ключ: ошибка конфигурации, повторяем
+        for code in (401, 403):
+            next_status = code
+            next_body = {'detail': 'Invalid API key'}
+            with pytest.raises(NotificationsTransientError, match='service key'):
+                await gateway.send_campaign_batch(
+                    campaign_id=campaign_id,
+                    batch_id=batch_id,
+                    user_id=user_id,
+                    template_id='billing_notification',
+                    subject='Тема',
+                    text='Текст',
+                    available_at=None,
+                    request_id='req-ntf-key',
+                )
+
+        # 6. Отмена кампании: 200 OK, 503 и 401 временные, 404 постоянная
         next_status = 200
         next_body = {'campaign_id': str(campaign_id), 'status': 'cancelled'}
         await gateway.cancel_campaign(campaign_id, request_id='req-cancel-ok')
@@ -184,8 +200,12 @@ async def test_http_notifications_gateway_batch_and_cancel_contract() -> None:
             await gateway.cancel_campaign(campaign_id, request_id='req-cancel-503')
 
         next_status = 401
-        with pytest.raises(NotificationsPermanentError):
+        with pytest.raises(NotificationsTransientError, match='service key'):
             await gateway.cancel_campaign(campaign_id, request_id='req-cancel-401')
+
+        next_status = 404
+        with pytest.raises(NotificationsPermanentError):
+            await gateway.cancel_campaign(campaign_id, request_id='req-cancel-404')
 
 
 @pytest.mark.asyncio

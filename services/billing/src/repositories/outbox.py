@@ -36,6 +36,33 @@ OutboxDeliverFn = Callable[
 ]
 
 
+# Задачи, которые нельзя бросать по лимиту попыток. Доставка доступа в Auth
+# идемпотентна и монотонна по версии: повтор безопасен, а остановка оставляет
+# возвращённую подписку открытой (или оплаченную закрытой) до ручного
+# вмешательства. Отмена письма об окончании после возврата обязана дойти до
+# момента T, иначе пользователь с возвращёнными деньгами получит письмо
+# «срок подписки закончился» (ТЗ 6.3: «повторяется до восстановления»).
+RETRY_UNTIL_DELIVERED_TASK_TYPES = frozenset({'sync_access', 'cancel_expiration_email'})
+
+
+def transient_failure_transition(
+    task_type: str,
+    attempts: int,
+    max_attempts: int,
+) -> tuple[Literal['retry', 'requires_intervention'], bool]:
+    """Решает судьбу задачи после временной ошибки: повтор или вмешательство.
+
+    `attempts` — число попыток уже с учётом текущей. Второй элемент — нужен ли
+    алерт: для бессрочных задач он поднимается один раз, когда лимит пройден,
+    а задача продолжает повторяться с потолком backoff.
+    """
+    if task_type in RETRY_UNTIL_DELIVERED_TASK_TYPES:
+        return 'retry', attempts == max_attempts
+    if attempts >= max_attempts:
+        return 'requires_intervention', True
+    return 'retry', False
+
+
 def compute_outbox_backoff_seconds(attempts: int) -> int:
     """Вычисляет паузу экспоненциального backoff (2^attempt с потолком 300 с)."""
     normalized = max(1, attempts)
@@ -205,7 +232,10 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
                         task.attempts += 1
                         task.last_error = error_msg
                         task.updated_at = now_after
-                        if task.attempts >= max_attempts:
+                        transition, alert = transient_failure_transition(
+                            task.task_type, task.attempts, max_attempts
+                        )
+                        if transition == 'requires_intervention':
                             task.status = 'requires_intervention'
                             alert_msg = (
                                 f'Outbox task {task.id} exhausted {max_attempts} '
@@ -216,6 +246,12 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
                             task.next_retry_at = now_after + timedelta(
                                 seconds=backoff_sec
                             )
+                            if alert:
+                                alert_msg = (
+                                    f'Outbox task {task.id} ({task.task_type}) failed '
+                                    f'{max_attempts} attempts and keeps retrying '
+                                    f'until delivered: {error_msg}'
+                                )
                     await session.commit()
                     if alert_msg is not None:
                         with correlation_request_id(f'outbox-{task.id}'):

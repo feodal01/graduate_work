@@ -34,6 +34,7 @@ from repositories.outbox import (
     DeliveryOutcome,
     OutboxDeliverFn,
     compute_outbox_backoff_seconds,
+    transient_failure_transition,
 )
 from repositories.read_models import (
     InternalAdminActionFilter,
@@ -690,7 +691,10 @@ class InMemoryPurchaseRepository:
             else:
                 task.attempts += 1
                 task.last_error = error_msg
-                if task.attempts >= max_attempts:
+                transition, alert = transient_failure_transition(
+                    task.task_type, task.attempts, max_attempts
+                )
+                if transition == 'requires_intervention':
                     task.status = 'requires_intervention'
                     alert_msg = (
                         f'Outbox task {task.id} exhausted {max_attempts} '
@@ -699,6 +703,12 @@ class InMemoryPurchaseRepository:
                 else:
                     backoff_sec = compute_outbox_backoff_seconds(task.attempts)
                     task.next_retry_at = now_after + timedelta(seconds=backoff_sec)
+                    if alert:
+                        alert_msg = (
+                            f'Outbox task {task.id} ({task.task_type}) failed '
+                            f'{max_attempts} attempts and keeps retrying '
+                            f'until delivered: {error_msg}'
+                        )
             if alert_msg is not None:
                 with correlation_request_id(f'outbox-{task.id}'):
                     logger.error(alert_msg)

@@ -1567,3 +1567,49 @@ async def test_payment_result_and_overview_survive_refund_access_task(
     # Флаг описывает задачу оплаты, а не pending-задачу закрытия доступа.
     assert result.auth_access_delivered is True
     assert overview.latest_subscription_auth_delivered is True
+
+
+async def test_sql_outbox_keeps_retrying_access_sync_after_attempt_limit(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """SQL-outbox: `sync_access` после лимита попыток остаётся в повторе (ТЗ 6.3)."""
+    from repositories.bundle import BillingRepositories
+    from repositories.outbox import DeliveryOutcome
+    from repositories.records import OutboxTaskRecordProtocol
+
+    repos = BillingRepositories.sqlalchemy(migrated_billing_db)
+    payment, _ = await repos.payments.get_or_create_pending_payment(uuid4())
+    task_id = uuid4()
+    async with migrated_billing_db() as session:
+        session.add(
+            OutboxTask(
+                id=task_id,
+                dedup_key=f'retry_forever:{task_id}',
+                target_service='auth',
+                task_type='sync_access',
+                payment_id=payment.id,
+                user_id=payment.user_id,
+                access_version=1,
+                payload={'version': 1, 'expires_at': None},
+                status='pending',
+                attempts=1,
+                next_retry_at=datetime.now(UTC) - timedelta(seconds=1),
+            )
+        )
+        await session.commit()
+
+    async def auth_down(
+        _task: OutboxTaskRecordProtocol,
+    ) -> tuple[DeliveryOutcome, str | None]:
+        return 'transient_error', 'Auth 503'
+
+    await repos.outbox.process_due_outbox_tasks(
+        auth_down, task_id=task_id, max_attempts=2
+    )
+
+    async with migrated_billing_db() as session:
+        row = await session.get(OutboxTask, task_id)
+        assert row is not None
+        assert row.status == 'pending'
+        assert row.attempts == 2
+        assert row.next_retry_at > datetime.now(UTC)

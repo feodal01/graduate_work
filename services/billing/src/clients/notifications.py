@@ -5,7 +5,24 @@ import httpx
 
 
 class NotificationsTransientError(Exception):
-    """Временная ошибка Notifications (5xx, 429, 409 profile_not_ready, сеть)."""
+    """Временная ошибка Notifications (5xx, 429, 409 profile_not_ready, сеть).
+
+    Сюда же относятся 401/403: это отклонённый сервисный ключ, то есть ошибка
+    конфигурации (ключ сменили не одновременно на обеих сторонах). После её
+    исправления письмо должно уйти само, без ручного «Повторить».
+    """
+
+
+def _raise_if_transient(status_code: int, detail: str) -> None:
+    if status_code in (401, 403):
+        raise NotificationsTransientError(
+            f'Notifications rejected the service key ({status_code}): {detail}; '
+            'check NOTIFICATIONS_CAMPAIGN_API_KEY on both sides'
+        )
+    if status_code == 429 or status_code >= 500:
+        raise NotificationsTransientError(
+            f'Notifications returned {status_code}: {detail}'
+        )
 
 
 class NotificationsPermanentError(Exception):
@@ -117,10 +134,7 @@ class HttpNotificationsGateway:
             raise NotificationsTransientError(
                 f'Notifications profile_not_ready (409): {detail}'
             )
-        if response.status_code == 429 or response.status_code >= 500:
-            raise NotificationsTransientError(
-                f'Notifications returned {response.status_code}: {detail}'
-            )
+        _raise_if_transient(response.status_code, detail)
         raise NotificationsPermanentError(response.status_code, detail)
 
     async def cancel_campaign(
@@ -144,8 +158,5 @@ class HttpNotificationsGateway:
             return
 
         _, detail = self._extract_error_code_and_detail(response)
-        if response.status_code == 429 or response.status_code >= 500:
-            raise NotificationsTransientError(
-                f'Notifications returned {response.status_code}: {detail}'
-            )
+        _raise_if_transient(response.status_code, detail)
         raise NotificationsPermanentError(response.status_code, detail)

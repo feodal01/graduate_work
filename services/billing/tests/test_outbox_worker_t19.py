@@ -146,7 +146,7 @@ async def test_outbox_worker_backoff_and_recovery_after_transient_outage() -> No
 async def test_outbox_worker_exhausts_20_attempts_into_requires_intervention(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """T-19 (BIL-FR-14, BIL-NFR-R-04): после 20 сбоев -> requires_intervention."""
+    """T-19 (BIL-FR-14, BIL-NFR-R-04): письмо: 20 сбоев -> requires_intervention."""
     import sentry_sdk
 
     alerts: list[str] = []
@@ -157,27 +157,14 @@ async def test_outbox_worker_exhausts_20_attempts_into_requires_intervention(
     )
 
     repo = InMemoryPurchaseRepository()
-    user_id = uuid4()
-    payment_id = uuid4()
-    auth = ConfigurableAuthGateway(user_id=user_id, unavailable=True)
+    notifications = _UnavailableNotifications()
     dispatcher = OutboxDispatcher(
         repository=repo,
-        auth_gateway=auth,
+        auth_gateway=ConfigurableAuthGateway(user_id=uuid4()),
+        notifications_gateway=notifications,
         max_attempts=20,
     )
-
-    task = FakeOutboxTaskRow(
-        id=uuid4(),
-        dedup_key=f'payment_succeeded:{payment_id}:auth_access',
-        target_service='auth',
-        task_type='sync_access',
-        payment_id=payment_id,
-        user_id=user_id,
-        access_version=1,
-        payload={'user_id': str(user_id), 'version': 1, 'expires_at': None},
-        status='pending',
-        attempts=19,
-    )
+    task = _notification_task('payment_succeeded_email', attempts=19)
     repo.outbox_tasks[task.dedup_key] = task
 
     processed = await dispatcher.process_due_tasks()
@@ -189,9 +176,120 @@ async def test_outbox_worker_exhausts_20_attempts_into_requires_intervention(
 
     # В состоянии requires_intervention автоповторы остановлены
     task.next_retry_at = datetime.now(UTC) - timedelta(seconds=10)
-    auth.unavailable = False
+    notifications.unavailable = False
     assert await dispatcher.process_due_tasks() == 0
     assert task.status == 'requires_intervention'
+
+
+class _UnavailableNotifications:
+    """Notifications, недоступный до переключения флага."""
+
+    def __init__(self) -> None:
+        self.unavailable = True
+        self.cancelled: list[UUID] = []
+
+    async def send_campaign_batch(self, **_: object) -> None:
+        if self.unavailable:
+            raise NotificationsTransientError('Notifications returned 503')
+
+    async def cancel_campaign(self, campaign_id: UUID, *, request_id: str) -> None:
+        if self.unavailable:
+            raise NotificationsTransientError('Notifications returned 503')
+        self.cancelled.append(campaign_id)
+
+
+def _notification_task(task_type: str, *, attempts: int) -> FakeOutboxTaskRow:
+    payment_id = uuid4()
+    return FakeOutboxTaskRow(
+        id=uuid4(),
+        dedup_key=f'{task_type}:{payment_id}',
+        target_service='notifications',
+        task_type=task_type,
+        payment_id=payment_id,
+        user_id=uuid4(),
+        access_version=None,
+        payload={
+            'campaign_id': str(uuid4()),
+            'batch_id': str(uuid4()),
+            'subject': 'Тема',
+            'text': 'Текст',
+            'available_at': None,
+        },
+        status='pending',
+        attempts=attempts,
+    )
+
+
+def _auth_task(*, attempts: int, user_id: UUID) -> FakeOutboxTaskRow:
+    payment_id = uuid4()
+    return FakeOutboxTaskRow(
+        id=uuid4(),
+        dedup_key=f'payment_succeeded:{payment_id}:auth_access',
+        target_service='auth',
+        task_type='sync_access',
+        payment_id=payment_id,
+        user_id=user_id,
+        access_version=1,
+        payload={'user_id': str(user_id), 'version': 1, 'expires_at': None},
+        status='pending',
+        attempts=attempts,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('task_type', ['sync_access', 'cancel_expiration_email'])
+async def test_access_sync_and_cancellation_retry_until_delivered(
+    monkeypatch: pytest.MonkeyPatch,
+    task_type: str,
+) -> None:
+    """Доступ и отмену письма об окончании нельзя бросать по лимиту попыток.
+
+    Регрессия: через 20 попыток (~64 мин) задача уходила в «Требует
+    вмешательства», и после долгого сбоя Auth/Notifications возвращённая
+    подписка оставалась открытой, а пользователь получал письмо об окончании.
+    ТЗ 6.3: задача повторяется до восстановления сервиса.
+    """
+    import sentry_sdk
+
+    alerts: list[str] = []
+    monkeypatch.setattr(
+        sentry_sdk,
+        'capture_message',
+        lambda msg, *, level='info': alerts.append(msg) if level == 'error' else None,
+    )
+    repo = InMemoryPurchaseRepository()
+    user_id = uuid4()
+    auth = ConfigurableAuthGateway(user_id=user_id, unavailable=True)
+    notifications = _UnavailableNotifications()
+    dispatcher = OutboxDispatcher(
+        repository=repo,
+        auth_gateway=auth,
+        notifications_gateway=notifications,
+        max_attempts=20,
+    )
+    task = (
+        _auth_task(attempts=19, user_id=user_id)
+        if task_type == 'sync_access'
+        else _notification_task(task_type, attempts=19)
+    )
+    repo.outbox_tasks[task.dedup_key] = task
+
+    for expected_attempts in (20, 21, 22):
+        task.next_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+        assert await dispatcher.process_due_tasks() == 1
+        assert task.status == 'pending'
+        assert task.attempts == expected_attempts
+        backoff = (task.next_retry_at - datetime.now(UTC)).total_seconds()
+        assert 290 <= backoff <= 300
+
+    # Алерт поднимается один раз, а не на каждой попытке после лимита.
+    assert len([m for m in alerts if 'keeps retrying' in m]) == 1
+
+    auth.unavailable = False
+    notifications.unavailable = False
+    task.next_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+    assert await dispatcher.process_due_tasks() == 1
+    assert task.status == 'completed'
 
 
 @pytest.mark.asyncio

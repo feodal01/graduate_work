@@ -678,8 +678,10 @@ async def test_degradation_matrix_rows_5_to_9_auth_notifications_and_db_failures
         assert len(ntf_gw.cancelled_ids) == 1
         assert len(ntf_gw.sent_batches) == 3
 
-        # --- Строка 6 матрицы 6.3: постоянная ошибка 4xx и исчерпание лимита при 5xx ->
-        #     requires_intervention, сигнал в мониторинг, автоповторы остановлены,
+        # --- Строка 6 матрицы 6.3: постоянная ошибка 4xx -> requires_intervention,
+        #     сигнал в мониторинг, автоповторы остановлены. Доступ в Auth по
+        #     лимиту 5xx не бросается (повтор до восстановления), поэтому
+        #     здесь Auth отвечает постоянной 404,
         #     в админке работают «Повторить» и «Закрыть с причиной» ---
         provider.get_status = 'pending'
         r_buy_2 = await client.post('/api/v1/billing/payments', headers=user_headers)
@@ -687,7 +689,7 @@ async def test_degradation_matrix_rows_5_to_9_auth_notifications_and_db_failures
         yk_2_id = repo.payments[pay_2_id].provider_payment_id
         assert yk_2_id is not None
 
-        auth_gw.sync_mode = 'down'  # будет исчерпан лимит 3 попыток на 5xx
+        auth_gw.sync_mode = 'perm_404'  # постоянная ошибка -> requires_intervention
         ntf_gw.mode = 'perm_422'  # сразу перейдёт в requires_intervention на 422
         captured_sentry.clear()
         provider.get_status = 'succeeded'
@@ -696,8 +698,8 @@ async def test_degradation_matrix_rows_5_to_9_auth_notifications_and_db_failures
             json={'object': {'id': yk_2_id}},
             headers={'X-Request-Id': 't37-wh-row6'},
         )
-        # Задачи Notifications сразу перешли в requires_intervention;
-        # доводим задачу Auth до 3 попыток (max_attempts=3)
+        # Все три задачи сразу перешли в requires_intervention;
+        # прогоны воркера ниже не должны их трогать
         for _ in range(2):
             for t in repo.outbox_tasks.values():
                 if t.status == 'pending':

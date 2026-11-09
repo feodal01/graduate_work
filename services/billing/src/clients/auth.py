@@ -332,6 +332,13 @@ class HttpAuthGateway:
             raise AuthServiceUnavailableError(
                 f'Auth returned temporary HTTP {response.status_code}'
             )
+        if response.status_code in (401, 403):
+            # Сервисный ключ отклонён: ошибка конфигурации, а не данных.
+            # После исправления ключа доступ должен доставиться сам.
+            raise AuthServiceUnavailableError(
+                f'Auth rejected the service key (HTTP {response.status_code}); '
+                'check SERVICE_API_KEY on both sides'
+            )
 
         detail = response.text[:250]
         try:

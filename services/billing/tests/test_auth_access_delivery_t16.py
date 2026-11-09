@@ -90,8 +90,20 @@ async def test_http_auth_gateway_put_subscription_access_mapping() -> None:
                     request_id='req-transient',
                 )
 
-        # 4. Постоянные ошибки клиента 4xx (401, 404, 422) -> AuthPermanentDeliveryError
-        for status_code in (401, 404, 422):
+        # 4. 401/403 — отклонён сервисный ключ: ошибка конфигурации, повтор
+        for status_code in (401, 403):
+            next_status = status_code
+            next_body = {'detail': 'Invalid service credentials'}
+            with pytest.raises(AuthServiceUnavailableError, match='service key'):
+                await gateway.put_subscription_access(
+                    user_id,
+                    version=4,
+                    expires_at=None,
+                    request_id='req-key',
+                )
+
+        # 5. Постоянные ошибки клиента 4xx (404, 422) -> AuthPermanentDeliveryError
+        for status_code in (404, 422):
             next_status = status_code
             next_body = {'detail': f'Client error {status_code}'}
             with pytest.raises(AuthPermanentDeliveryError) as exc_info:
@@ -256,7 +268,7 @@ async def test_immediate_dispatch_handles_auth_outage_and_4xx(
     assert '404' in (task_404.last_error or '')
     assert any(str(task_404.id) in msg for msg in captured_alerts)
 
-    # 4. Исчерпание max_attempts=2 при 503 -> requires_intervention + сигнал
+    # 4. Лимит max_attempts=2 при 503: доступ не бросается, повтор + один сигнал
     pid_3 = uuid4()
     task_exhaust = FakeOutboxTaskRow(
         id=uuid4(),
@@ -274,9 +286,10 @@ async def test_immediate_dispatch_handles_auth_outage_and_4xx(
     auth.permanent_error = None
     auth.unavailable = True
     await dispatcher.process_due_tasks()
-    assert task_exhaust.status == 'requires_intervention'
+    assert task_exhaust.status == 'pending'
     assert task_exhaust.attempts == 2
-    assert any('exhausted 2 attempts' in msg for msg in captured_alerts)
+    assert any('keeps retrying' in msg for msg in captured_alerts)
+    task_exhaust.status = 'closed'  # дальше проверяем другие задачи
 
     # 5. Повреждённый payload (access_version=0) -> requires_intervention
     pid_4 = uuid4()
