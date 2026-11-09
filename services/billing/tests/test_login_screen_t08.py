@@ -451,3 +451,78 @@ async def test_user_rate_limit_in_auth_shows_429_not_auth_outage(
     )
     assert api.status_code == 429
     assert api.json()['error_code'] == 'auth_rate_limited'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'headers',
+    [
+        {'Origin': 'https://evil.example'},
+        {'Origin': 'null'},
+        {'Referer': 'https://evil.example/attack.html'},
+    ],
+    ids=['foreign-origin', 'null-origin', 'foreign-referer'],
+)
+async def test_cross_site_login_form_is_rejected(
+    login_client: tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],
+    headers: dict[str, str],
+) -> None:
+    """Login CSRF: форма входа с чужого сайта не логинит жертву в чужой аккаунт.
+
+    Регрессия: страница атакующего отправляла форму с его логином, жертва
+    оказывалась в его аккаунте и оплачивала подписку на него.
+    """
+    client, _, fake_auth = login_client
+
+    response = await client.post(
+        '/billing/login',
+        data={'login': 'cinema_viewer', 'password': 'secret'},
+        headers=headers,
+    )
+
+    assert response.status_code == 403
+    assert fake_auth.last_request_id is None
+    assert 'billing_access_token' not in response.headers.get('set-cookie', '')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'headers',
+    [
+        {},
+        {'Origin': 'http://testserver'},
+        {'Origin': 'http://testserver:18081'},  # шлюз отдаёт Host без порта
+        {'Origin': 'http://localhost'},  # BILLING_PUBLIC_BASE_URL
+    ],
+    ids=['no-origin', 'same-host', 'same-host-other-port', 'public-base-url'],
+)
+async def test_same_site_login_form_is_accepted(
+    login_client: tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],
+    headers: dict[str, str],
+) -> None:
+    """Свой сайт (и не браузерный клиент без Origin) входит как раньше."""
+    client, _, _ = login_client
+
+    response = await client.post(
+        '/billing/login',
+        data={'login': 'cinema_viewer', 'password': 'secret'},
+        headers=headers,
+    )
+
+    assert response.status_code == 303
+
+
+@pytest.mark.asyncio
+async def test_cross_site_logout_and_subscribe_are_rejected(
+    login_client: tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],
+) -> None:
+    """Остальные POST-формы экранов Биллинга тоже закрыты от CSRF."""
+    client, _, fake_auth = login_client
+    evil = {'Origin': 'https://evil.example'}
+
+    logout = await client.post('/billing/logout', headers=evil)
+    subscribe = await client.post('/billing/subscribe', headers=evil)
+
+    assert logout.status_code == 403
+    assert subscribe.status_code == 403
+    assert fake_auth.logout_called_with is None

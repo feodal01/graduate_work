@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Form, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from api.errors import BillingDomainError
+from api.errors import BillingDomainError, UIErrorScreenException
 from api.templates import render_error_page, templates
 from clients.auth import (
     AuthGateway,
@@ -14,6 +14,7 @@ from clients.auth import (
     AuthRateLimitExceededError,
     AuthServiceUnavailableError,
 )
+from core.config import settings
 from core.observability import get_current_request_id
 from dependencies import (
     ACCESS_TOKEN_COOKIE,
@@ -28,6 +29,33 @@ from services.purchase import PurchaseService
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=['billing-ui'])
+
+
+def require_same_site_form(request: Request) -> None:
+    """Отклоняет POST экранов Биллинга, отправленный с чужого сайта (CSRF).
+
+    Главный сценарий — login CSRF: чужая страница отправляет форму входа с
+    логином атакующего, жертва оказывается в его аккаунте и оплачивает ему
+    подписку. SameSite=Lax этого не ловит: ответ навигации верхнего уровня
+    ставит cookie. Браузеры шлют Origin на каждый POST (Referer — запасной
+    вариант); запрос без обоих заголовков — не браузерный и пропускается.
+    Сравниваются имена хостов: шлюз передаёт Host без порта.
+    """
+    source = request.headers.get('origin') or request.headers.get('referer')
+    if source is None:
+        return
+    source_host = urlsplit(source).hostname
+    allowed_hosts = {
+        request.url.hostname,
+        urlsplit(str(settings.worker.billing_public_base_url)).hostname,
+    }
+    if source_host is None or source_host not in allowed_hosts:
+        logger.warning('Rejected cross-site billing form POST from %s', source)
+        raise UIErrorScreenException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            message='Форма отправлена с другого сайта. Откройте страницу '
+            'Биллинга заново и повторите действие.',
+        )
 
 
 def parse_ui_payment_id(payment_id: str) -> UUID:
@@ -103,7 +131,11 @@ async def get_login_page(
     )
 
 
-@router.post('/login', response_model=None)
+@router.post(
+    '/login',
+    response_model=None,
+    dependencies=[Depends(require_same_site_form)],
+)
 async def submit_login_form(
     request: Request,
     auth_gateway: Annotated[AuthGateway, Depends(get_auth_gateway)],
@@ -175,7 +207,7 @@ async def submit_login_form(
     return redirect
 
 
-@router.post('/logout')
+@router.post('/logout', dependencies=[Depends(require_same_site_form)])
 async def submit_logout(
     request: Request,
     auth_gateway: Annotated[AuthGateway, Depends(get_auth_gateway)],
@@ -219,7 +251,11 @@ async def submit_logout(
     return redirect
 
 
-@router.post('/subscribe', response_model=None)
+@router.post(
+    '/subscribe',
+    response_model=None,
+    dependencies=[Depends(require_same_site_form)],
+)
 async def subscribe(
     user: Annotated[AuthenticatedUser, Depends(require_ui_user)],
     purchase_service: Annotated[PurchaseService, Depends(get_purchase_service)],

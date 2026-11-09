@@ -2,6 +2,9 @@ import os
 
 os.environ.setdefault('JWT_SECRET', 'test-jwt-secret-that-is-long-enough-for-hs256')
 os.environ.setdefault('SERVICE_API_KEY', 'test-service-key-that-is-long-enough')
+os.environ.setdefault(
+    'NOTIFICATIONS_CAMPAIGN_API_KEY', 'test-campaign-key-that-is-long-enough'
+)
 os.environ['SENTRY_DSN'] = ''
 os.environ['LOGSTASH_HOST'] = ''
 os.environ['TRACING_ENABLED'] = 'false'

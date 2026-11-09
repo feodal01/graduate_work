@@ -81,10 +81,10 @@ class NotificationsClientSettings(BaseSettings):
     )
 
     campaign_url: AnyHttpUrl = AnyHttpUrl('http://notifications-campaign-api:8000')
-    campaign_api_key: SecretStr = Field(
-        default=SecretStr('local-demo-campaign-key'),
-        min_length=1,
-    )
+    # Без значения по умолчанию: общеизвестный ключ позволил бы любому
+    # процессу сети Compose слать «транзакционные» письма от имени Биллинга
+    # и отменять их. Длина — как у SERVICE_API_KEY.
+    campaign_api_key: Annotated[SecretStr, Field(min_length=32)]
     timeout_seconds: float = Field(default=5.0, gt=0)
 
 
@@ -223,7 +223,8 @@ class Settings(BaseSettings):
 settings = Settings(
     postgres=PostgresSettings(),
     auth_client=AuthClientSettings(),
-    notifications_client=NotificationsClientSettings(),
+    # Ключ обязателен и берётся из окружения, pyright этого не видит.
+    notifications_client=NotificationsClientSettings(),  # pyright: ignore[reportCallIssue]
     payment_providers=PaymentProvidersSettings(),
     worker=WorkerSettings(),
     tracing=TracingSettings(),
