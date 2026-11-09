@@ -188,11 +188,22 @@ def test_policy_uses_explicit_settings_for_each_route_group() -> None:
         service_rate=6,
         service_window_seconds=16,
         service_capacity=26,
+        permission_check_rate=7,
+        permission_check_window_seconds=17,
+        permission_check_capacity=27,
     )
 
     assert [
         rate_limit_api.policy(name, config)
-        for name in ('login', 'signup', 'refresh', 'user', 'admin', 'service')
+        for name in (
+            'login',
+            'signup',
+            'refresh',
+            'user',
+            'admin',
+            'service',
+            'permission_check',
+        )
     ] == [
         RateLimitPolicy('login', 1, 11, 21),
         RateLimitPolicy('signup', 2, 12, 22),
@@ -200,6 +211,7 @@ def test_policy_uses_explicit_settings_for_each_route_group() -> None:
         RateLimitPolicy('user', 4, 14, 24),
         RateLimitPolicy('admin', 5, 15, 25),
         RateLimitPolicy('service', 6, 16, 26),
+        RateLimitPolicy('permission_check', 7, 17, 27),
     ]
 
 

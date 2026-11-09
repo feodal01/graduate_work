@@ -168,7 +168,7 @@ async def test_service_rate_limit_runs_only_after_service_authentication(
 
     assert valid.status_code == 200
     assert [(call[0].name, call[1]) for call in context.rate_limiter.calls] == [
-        ('service', 'internal-service:permission-check')
+        ('permission_check', 'internal-service:permission-check')
     ]
 
 
@@ -566,8 +566,10 @@ async def test_internal_endpoints_spend_separate_service_buckets(
 
     assert check.status_code == 200
     assert access.status_code == 200, access.text
-    identities = [identity for _, identity in context.rate_limiter.calls]
-    assert identities == [
-        'internal-service:permission-check',
-        'internal-service:subscription-access',
+    buckets = [(p.name, identity) for p, identity in context.rate_limiter.calls]
+    # Проверки прав живут в своей, более высокой квоте: поток просмотров
+    # фильмов не должен упираться в общий сервисный лимит (ТЗ 6.2).
+    assert buckets == [
+        ('permission_check', 'internal-service:permission-check'),
+        ('service', 'internal-service:subscription-access'),
     ]

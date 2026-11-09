@@ -141,6 +141,12 @@ class RateLimitSettings(BaseSettings):
     service_rate: int = Field(default=600, gt=0)
     service_window_seconds: int = Field(default=60, gt=0)
     service_capacity: int = Field(default=50, gt=0)
+    # Проверки прав от movies-api идут на каждую карточку фильма и
+    # обслуживаются из Redis, поэтому квота выше общей сервисной: 100 RPS
+    # в среднем и всплеск 300 (ТЗ 6.2).
+    permission_check_rate: int = Field(default=6000, gt=0)
+    permission_check_window_seconds: int = Field(default=60, gt=0)
+    permission_check_capacity: int = Field(default=300, gt=0)
 
 
 class TracingSettings(BaseSettings):

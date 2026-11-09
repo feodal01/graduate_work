@@ -55,6 +55,13 @@ def policy(name: str, config: RateLimitSettings) -> RateLimitPolicy:
             config.service_window_seconds,
             config.service_capacity,
         )
+    if name == 'permission_check':
+        return RateLimitPolicy(
+            name,
+            config.permission_check_rate,
+            config.permission_check_window_seconds,
+            config.permission_check_capacity,
+        )
     raise ValueError(f'Unknown rate-limit policy: {name}')
 
 

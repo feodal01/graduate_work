@@ -30,6 +30,8 @@ router = APIRouter(tags=['authorization'])
 
 def service_rate_limit(
     purpose: str,
+    *,
+    policy_name: str = 'service',
 ) -> Callable[..., Coroutine[Any, Any, None]]:
     """Сервисная квота отдельно для каждого назначения внутреннего API.
 
@@ -48,7 +50,7 @@ def service_rate_limit(
         await enforce_rate_limit(
             request=request,
             limiter=limiter,
-            policy=policy('service', settings.rate_limit),
+            policy=policy(policy_name, settings.rate_limit),
             identity=f'{service_identity}:{purpose}',
         )
 
@@ -224,7 +226,10 @@ async def revoke_role(
 )
 async def check_permission(
     payload: PermissionCheckRequest,
-    _rate_limit: Annotated[None, Depends(service_rate_limit('permission-check'))],
+    _rate_limit: Annotated[
+        None,
+        Depends(service_rate_limit('permission-check', policy_name='permission_check')),
+    ],
     current_user: Annotated[
         CurrentUser | None,
         Depends(get_optional_current_user),
