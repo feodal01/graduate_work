@@ -429,6 +429,27 @@ class PaymentReconciler:
                 transitioned=False,
                 throttled=False,
             )
+        if (
+            not refund.provider_refund_id
+            and datetime.now(UTC) - refund.created_at >= IDEMPOTENCY_KEY_TTL
+        ):
+            # Инв. 14: ключ в ЮKassa истёк, повторный POST мог бы создать
+            # второй возврат (и получить 400 «сумма больше остатка», после чего
+            # уже выполненный возврат считался бы отклонённым). Ищем попытку
+            # по metadata, как фоновая сверка.
+            try:
+                return await self._reconcile_background_refund(refund, source='admin')
+            except PaymentProviderError as exc:
+                logger.warning(
+                    'Refund lookup by metadata deferred for refund_id=%s: %s',
+                    refund.id,
+                    exc,
+                )
+                return self._build_refund_outcome(
+                    refund,
+                    transitioned=False,
+                    throttled=False,
+                )
         if not refund.provider_refund_id:
             payment = await self._payments.get_payment(refund.payment_id)
             if payment is None or not payment.provider_payment_id:

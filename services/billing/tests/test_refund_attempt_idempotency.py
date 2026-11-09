@@ -126,3 +126,30 @@ async def test_attempt_uuid_of_another_payment_is_rejected() -> None:
             second.id, admin_user_id=uuid4(), reason='Жалоба', refund_id=attempt_id
         )
     assert exc_info.value.error_code == 'refund_id_conflict'
+
+
+async def test_admin_resubmit_after_key_expiry_looks_refund_up_by_metadata() -> None:
+    """Инв. 14: через 24 ч без номера возврата POST со старым ключом не шлётся.
+
+    Регрессия: админский повтор отправлял POST с истёкшим ключом. Если первый
+    POST на самом деле создал возврат, ЮKassa отвечала 400 (сумма больше
+    остатка), и уже выполненный возврат помечался «Отклонён».
+    """
+    reconciler, repo, provider = _reconciler()
+    payment = _paid_subscription(repo)
+    provider.create_refund_error = ProviderPermanentError(400, 'amount exceeds')
+    attempt_id = uuid4()
+    refund, _ = await repo.get_or_create_processing_refund(
+        payment.id, admin_user_id=uuid4(), reason='Жалоба', refund_id=attempt_id
+    )
+    refund.created_at = datetime.now(UTC) - timedelta(hours=25)
+    provider.metadata_refunds[attempt_id] = 'yk-ref-lost-response'
+    provider.next_get_refund_status = 'succeeded'
+
+    outcome = await reconciler.create_or_reconcile_refund(
+        payment.id, admin_user_id=uuid4(), reason='Жалоба', refund_id=attempt_id
+    )
+
+    assert provider.create_refund_calls == []
+    assert outcome.status == 'succeeded'
+    assert repo.refunds[attempt_id].provider_refund_id == 'yk-ref-lost-response'

@@ -425,3 +425,88 @@ async def test_background_backoff_does_not_block_user_check(
     assert len(provider.get_calls) == 1
     assert repo.payments[payment.id].status == 'failed'
     assert resp.headers['location'] != payment.confirmation_url
+
+
+async def test_continue_after_key_expiry_closes_payment_instead_of_stale_post(
+    continue_test_env: tuple[
+        httpx.AsyncClient,
+        FastAPI,
+        InMemoryPurchaseRepository,
+        FakeProviderGateway,
+        ConfigurableAuthGateway,
+        UUID,
+    ],
+) -> None:
+    """Инв. 13: через 24 ч без номера ЮKassa POST со старым ключом не шлётся.
+
+    Регрессия: пользовательский путь не проверял срок ключа и создавал в
+    ЮKassa второй платёж по истёкшему ключу.
+    """
+    client, _, repo, provider, _, user_id = continue_test_env
+    payment = _seed_payment(
+        repo,
+        user_id=user_id,
+        status='pending',
+        provider_payment_id=None,
+        confirmation_url=None,
+    )
+    payment.created_at = datetime.now(UTC) - timedelta(hours=25)
+
+    resp = await client.get(f'/billing/payments/{payment.id}/continue')
+
+    assert repo.payments[payment.id].status == 'failed'
+    assert repo.payments[payment.id].failure_reason == 'idempotency_key_expired'
+    assert [c.payment_id for c in provider.create_calls] != [payment.id]
+    assert all(
+        c.idempotency_key != payment.idempotency_key for c in provider.create_calls
+    )
+    assert resp.status_code == 303
+    new_payment = repo.payments[provider.create_calls[-1].payment_id]
+    assert resp.headers['location'] == new_payment.confirmation_url
+
+
+async def test_user_is_not_sent_to_payment_page_whose_number_was_not_saved(
+    continue_test_env: tuple[
+        httpx.AsyncClient,
+        FastAPI,
+        InMemoryPurchaseRepository,
+        FakeProviderGateway,
+        ConfigurableAuthGateway,
+        UUID,
+    ],
+) -> None:
+    """Инв. 13: редирект только на ссылку платежа, номер которого сохранён.
+
+    Регрессия: если пока шёл POST, фоновая сверка закрыла платёж, номер не
+    сохранялся, но пользователя всё равно отправляли на оплату. Оплата в
+    ЮKassa проходила мимо Биллинга: деньги списаны, подписки нет.
+    """
+    client, _, repo, provider, _, user_id = continue_test_env
+    payment = _seed_payment(
+        repo,
+        user_id=user_id,
+        status='pending',
+        provider_payment_id=None,
+        confirmation_url=None,
+    )
+    original_create = provider.create_payment
+
+    async def create_while_worker_closes(request):  # type: ignore[no-untyped-def]
+        snapshot = await original_create(request)
+        if request.payment_id == payment.id:
+            # Воркер закрыл платёж, пока шёл POST (инв. 13, другой процесс).
+            await repo.finalize_payment_failed(
+                payment.id,
+                failure_reason='idempotency_key_expired',
+                source='reconcile',
+            )
+        return snapshot
+
+    provider.create_payment = create_while_worker_closes  # type: ignore[method-assign]
+
+    resp = await client.get(f'/billing/payments/{payment.id}/continue')
+
+    orphan_url = 'https://yoomoney.ru/checkout/payments/v2/contract?orderId=yk-cont-1'
+    assert resp.headers.get('location') != orphan_url
+    saved_urls = {p.confirmation_url for p in repo.payments.values()}
+    assert resp.headers['location'] in saved_urls

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from uuid import UUID
 
 from clients.payment_provider import (
@@ -22,7 +23,11 @@ from domain.subscription import (
 from repositories.payments import PaymentRepository
 from repositories.records import PaymentRecordProtocol
 from repositories.user_views import UserBillingViews
-from services.reconciler import CHECK_THROTTLE_WINDOW, PaymentReconciler
+from services.reconciler import (
+    CHECK_THROTTLE_WINDOW,
+    IDEMPOTENCY_KEY_TTL,
+    PaymentReconciler,
+)
 
 __all__ = [
     'CHECK_THROTTLE_WINDOW',
@@ -312,6 +317,20 @@ class PurchaseService:
         user_id: UUID,
         payment: PaymentRecordProtocol,
     ) -> PurchaseOutcome:
+        if datetime.now(UTC) - payment.created_at >= IDEMPOTENCY_KEY_TTL:
+            # Инв. 13: ключ идемпотентности в ЮKassa жив 24 ч. POST с истёкшим
+            # ключом создал бы в ЮKassa второй платёж. Номера нет, значит
+            # пользователь не платил: закрываем платёж и начинаем новый.
+            _, transitioned = await self._payments.finalize_payment_failed(
+                payment.id,
+                failure_reason='idempotency_key_expired',
+                source='continue',
+                public_base_url=self._public_base_url,
+            )
+            if transitioned and self._reconciler is not None:
+                await self._reconciler.notify_payment_tasks(payment.id)
+            return await self.start_or_continue_purchase(user_id)
+
         return_url = f'{self._public_base_url}/billing/payments/{payment.id}'
         try:
             snapshot = await self._providers.get(payment.provider_code).create_payment(
@@ -349,6 +368,15 @@ class PurchaseService:
             confirmation_url=snapshot.confirmation_url,
             provider_details=snapshot.provider_details,
         )
+        if payment.provider_payment_id != snapshot.provider_payment_id:
+            # Номер не сохранён: пока шёл POST, платёж закрыла фоновая сверка
+            # (например, по истечении ключа). Инв. 13 разрешает отправить на
+            # оплату только после сохранения номера, иначе оплата в ЮKassa
+            # прошла бы мимо Биллинга. Платёж ЮKassa без оплаты отменится сам.
+            return await self.continue_payment_for_user(
+                payment_id=payment.id,
+                user_id=user_id,
+            )
 
         # Инвариант 6 и BIL-NFR-SEC-04: если повтор POST вернул не-pending,
         # никогда не меняем статус по ответу POST, а проверяем через GET в Reconciler.
