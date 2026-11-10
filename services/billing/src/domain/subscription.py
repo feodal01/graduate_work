@@ -110,6 +110,23 @@ def format_amount_rubles(amount_kopeks: int) -> str:
     return f'{rubles},{kopeks:02d} ₽'
 
 
+def format_days_ru(days: int) -> str:
+    """Склоняет срок тарифа: «1 день», «2 дня», «5 дней»."""
+    tail100, tail10 = days % 100, days % 10
+    if tail10 == 1 and tail100 != 11:
+        word = 'день'
+    elif 2 <= tail10 <= 4 and not 12 <= tail100 <= 14:
+        word = 'дня'
+    else:
+        word = 'дней'
+    return f'{days} {word}'
+
+
+def build_payment_description(*, tariff_title: str, duration_days: int) -> str:
+    """Описание платежа в ЮKassa из тарифа: название и срок берутся из БД."""
+    return f'Подписка «{tariff_title}» на {format_days_ru(duration_days)}'
+
+
 def humanize_failure_reason(reason: str | None) -> str:
     """Переводит причину отказа в человекочитаемый текст по allowlist (BIL-NFR-U-01)."""
     if not reason:
@@ -133,6 +150,7 @@ def build_payment_succeeded_email_payload(
     user_id: UUID,
     ends_at: datetime,
     public_base_url: str,
+    tariff_title: str,
 ) -> dict[str, Any]:
     """Формирует payload письма «Оплата прошла» (4.4, US-U-01, инв. 12)."""
     base_url = public_base_url.rstrip('/')
@@ -145,9 +163,9 @@ def build_payment_succeeded_email_payload(
         'batch_id': str(batch_id),
         'user_id': str(user_id),
         'template_id': 'billing_notification',
-        'subject': 'Подписка «Премиум» оплачена',
+        'subject': f'Подписка «{tariff_title}» оплачена',
         'text': (
-            f'Оплата подписки «Премиум» подтверждена. '
+            f'Оплата подписки «{tariff_title}» подтверждена. '
             f'Доступ к новинкам открыт до {ends_msk}. '
             f'Страница подписки: {my_sub_url}'
         ),
@@ -163,6 +181,7 @@ def build_subscription_expiration_email_payload(
     user_id: UUID,
     ends_at: datetime,
     public_base_url: str,
+    tariff_title: str,
 ) -> dict[str, Any]:
     """Формирует payload отложенного письма «Подписка закончилась» на момент T."""
     base_url = public_base_url.rstrip('/')
@@ -175,9 +194,9 @@ def build_subscription_expiration_email_payload(
         'batch_id': str(batch_id),
         'user_id': str(user_id),
         'template_id': 'billing_notification',
-        'subject': 'Срок подписки «Премиум» закончился',
+        'subject': f'Срок подписки «{tariff_title}» закончился',
         'text': (
-            f'Срок действия вашей подписки «Премиум» истёк '
+            f'Срок действия вашей подписки «{tariff_title}» истёк '
             f'({ends_msk}). Вы можете оформить новую подписку '
             f'на странице: {my_sub_url}'
         ),
@@ -192,6 +211,7 @@ def build_payment_failed_email_payload(
     user_id: UUID,
     failure_reason: str,
     public_base_url: str,
+    tariff_title: str,
 ) -> dict[str, Any]:
     """Формирует payload письма «Оплата не прошла» без утечки сырых ошибок (4.4)."""
     base_url = public_base_url.rstrip('/')
@@ -204,9 +224,9 @@ def build_payment_failed_email_payload(
         'batch_id': str(batch_id),
         'user_id': str(user_id),
         'template_id': 'billing_notification',
-        'subject': 'Оплата подписки «Премиум» не прошла',
+        'subject': f'Оплата подписки «{tariff_title}» не прошла',
         'text': (
-            f'Не удалось провести оплату подписки «Премиум» '
+            f'Не удалось провести оплату подписки «{tariff_title}» '
             f'({human_reason}). '
             f'Попробовать снова можно на странице: {retry_url}'
         ),
@@ -235,6 +255,7 @@ def build_refund_succeeded_email_payload(
     payment_id: UUID,
     user_id: UUID,
     amount_kopeks: int,
+    tariff_title: str,
     currency: str = 'RUB',
     public_base_url: str = 'http://localhost',
 ) -> dict[str, Any]:
@@ -253,9 +274,9 @@ def build_refund_succeeded_email_payload(
         'batch_id': str(batch_id),
         'user_id': str(user_id),
         'template_id': 'billing_notification',
-        'subject': 'Возврат средств по подписке «Премиум» выполнен',
+        'subject': f'Возврат средств по подписке «{tariff_title}» выполнен',
         'text': (
-            f'Возврат средств на сумму {amount_display} по подписке «Премиум» '
+            f'Возврат средств на сумму {amount_display} по подписке «{tariff_title}» '
             f'выполнен. Доступ к новинкам закрыт. '
             f'Подробности на странице: {my_sub_url}'
         ),
@@ -320,7 +341,7 @@ def compute_my_subscription_summary(
     latest_subscription_has_processing_refund: bool,
     latest_subscription_auth_delivered: bool,
     user_tz: str,
-    tariff_price_display: str = '299 ₽',
+    tariff_price_display: str | None,
     now_utc: datetime | None = None,
 ) -> MySubscriptionSummaryResult:
     """Вычисляет статус и действие экрана «Моя подписка» по 7 правилам US-U-05."""
@@ -337,17 +358,30 @@ def compute_my_subscription_summary(
             subscription_ends_display=None,
         )
 
-    subscribe_label = f'Оформить за {tariff_price_display}'
+    # Цена — из активного тарифа в БД. Нет тарифа — купить нельзя, и выдуманную
+    # цену не показываем.
+    subscribe_action: dict[str, Any] = (
+        {
+            'action_type': 'subscribe',
+            'action_label': f'Оформить за {tariff_price_display}',
+            'action_url': '/billing/subscribe',
+            'can_subscribe': True,
+        }
+        if tariff_price_display is not None
+        else {
+            'action_type': 'none',
+            'action_label': None,
+            'action_url': None,
+            'can_subscribe': False,
+        }
+    )
     # Правило 7: Подписок не было (в том числе если все платежи «Не оплачен»)
     if latest_subscription_ends_at is None:
         return MySubscriptionSummaryResult(
             rule_number=7,
             status_key='no_subscription',
             status_display='Нет подписки',
-            action_type='subscribe',
-            action_label=subscribe_label,
-            action_url='/billing/subscribe',
-            can_subscribe=True,
+            **subscribe_action,
             subscription_ends_display=None,
         )
 
@@ -399,10 +433,7 @@ def compute_my_subscription_summary(
             rule_number=5,
             status_key='expired',
             status_display=f'Завершена {ends_display}',
-            action_type='subscribe',
-            action_label=subscribe_label,
-            action_url='/billing/subscribe',
-            can_subscribe=True,
+            **subscribe_action,
             subscription_ends_display=ends_display,
         )
 
@@ -411,9 +442,6 @@ def compute_my_subscription_summary(
         rule_number=6,
         status_key='refunded',
         status_display='Возвращена',
-        action_type='subscribe',
-        action_label=subscribe_label,
-        action_url='/billing/subscribe',
-        can_subscribe=True,
+        **subscribe_action,
         subscription_ends_display=ends_display,
     )

@@ -8,7 +8,6 @@ from sqlalchemy.exc import SQLAlchemyError
 from db.sql.errors import DatabaseUnavailableError
 from models import (
     DEFAULT_TARIFF_CODE,
-    DEFAULT_TARIFF_PRICE_KOPEKS,
     OutboxTask,
     Payment,
     Refund,
@@ -121,10 +120,9 @@ class SQLAlchemyUserBillingViews(SQLAlchemyRepository):
                     )
                     .limit(1)
                 )
+                # Нет активного тарифа — цены нет, покупка недоступна.
                 tariff_price_kopeks = (
-                    tariff.price_kopeks
-                    if tariff is not None
-                    else DEFAULT_TARIFF_PRICE_KOPEKS
+                    tariff.price_kopeks if tariff is not None else None
                 )
 
                 latest_sub_stmt = (

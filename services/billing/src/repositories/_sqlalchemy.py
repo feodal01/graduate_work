@@ -9,8 +9,21 @@ from models import (
     Payment,
     Refund,
     Subscription,
+    Tariff,
     UserAccessVersion,
 )
+from repositories.read_models import TariffData
+
+
+def tariff_data(tariff: Tariff) -> TariffData:
+    return TariffData(
+        id=tariff.id,
+        code=tariff.code,
+        title=tariff.title,
+        price_kopeks=tariff.price_kopeks,
+        currency=tariff.currency.strip(),
+        duration_days=tariff.duration_days,
+    )
 
 
 class SQLAlchemyRepository:
@@ -18,6 +31,14 @@ class SQLAlchemyRepository:
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
+
+    @staticmethod
+    async def _tariff_title(session: AsyncSession, tariff_id: UUID) -> str:
+        """Название тарифа для писем: берётся из БД, а не из кода."""
+        title = await session.scalar(select(Tariff.title).where(Tariff.id == tariff_id))
+        if title is None:
+            raise LookupError(f'Tariff {tariff_id} not found')
+        return title
 
     @staticmethod
     async def _acquire_user_lock(session: AsyncSession, user_id: UUID) -> None:

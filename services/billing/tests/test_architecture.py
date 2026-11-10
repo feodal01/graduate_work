@@ -265,3 +265,57 @@ def test_orm_models_satisfy_record_protocols(model: type, protocol: type) -> Non
         assert columns[name].nullable == nullable, (
             f'{model.__name__}.{name}: nullable={columns[name].nullable}'
         )
+
+
+# Значения тарифа живут только в таблице `tariffs` (сид — в миграции).
+TARIFF_LITERALS = ('Премиум', '299', '29900', '29_900', '30 дней')
+TARIFF_CONSTANTS = (
+    'DEFAULT_TARIFF_TITLE',
+    'DEFAULT_TARIFF_PRICE_KOPEKS',
+    'DEFAULT_TARIFF_CURRENCY',
+    'DEFAULT_TARIFF_DURATION_DAYS',
+)
+
+
+@pytest.mark.parametrize(
+    'path',
+    [
+        p
+        for p in sorted(SRC.rglob('*.py'))
+        if 'migrations' not in p.parts
+        and p != SRC / 'models' / 'entity.py'
+        and p != SRC / 'models' / '__init__.py'
+    ],
+    ids=lambda p: str(p.relative_to(SRC)),
+)
+def test_tariff_values_are_not_hardcoded(path: Path) -> None:
+    """Название, цена и срок тарифа не зашиты в код: смена строки в `tariffs`.
+
+    Регрессия: «Премиум», «30 дней» и «299 ₽» стояли в описании платежа,
+    письмах и на экране, и расходились с тарифом в БД.
+    """
+    tree = ast.parse(path.read_text())
+    literals = [
+        (node.lineno, node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and any(bad in node.value for bad in TARIFF_LITERALS)
+    ]
+    numbers = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, int)
+        and not isinstance(node.value, bool)
+        and node.value == 29_900
+    ]
+    names = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name | ast.alias)
+        and getattr(node, 'id', getattr(node, 'name', None)) in TARIFF_CONSTANTS
+    ]
+    assert not literals and not numbers and not names, (
+        f'{path.relative_to(SRC)}: tariff hardcoded at {literals} {numbers} {names}'
+    )

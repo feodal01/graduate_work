@@ -334,6 +334,7 @@ def test_email_payload_builders_format_msk_and_humanize_failure_reason() -> None
         user_id=user_id,
         ends_at=ends_at,
         public_base_url='https://cinema.example/',
+        tariff_title='Премиум',
     )
     assert paid_payload['template_id'] == 'billing_notification'
     assert paid_payload['available_at'] is None
@@ -345,6 +346,7 @@ def test_email_payload_builders_format_msk_and_humanize_failure_reason() -> None
         user_id=user_id,
         failure_reason='HTTP 401: Invalid secret key',
         public_base_url='https://cinema.example/',
+        tariff_title='Премиум',
     )
     assert 'HTTP 401' not in str(failed_payload['text'])
     assert 'Платёж отклонён платёжной системой' in str(failed_payload['text'])

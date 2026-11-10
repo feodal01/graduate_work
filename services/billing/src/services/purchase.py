@@ -223,7 +223,11 @@ class PurchaseService:
     ) -> MySubscriptionView:
         """Возвращает статус по 7 правилам US-U-05 и историю платежей (BIL-FR-09)."""
         overview = await self._views.get_user_billing_overview(user_id)
-        tariff_price_display = format_amount_rubles(overview.tariff_price_kopeks)
+        tariff_price_display = (
+            format_amount_rubles(overview.tariff_price_kopeks)
+            if overview.tariff_price_kopeks is not None
+            else None
+        )
         summary = compute_my_subscription_summary(
             pending_payment_id=overview.pending_payment_id,
             latest_subscription_ends_at=overview.latest_subscription_ends_at,
@@ -338,7 +342,7 @@ class PurchaseService:
                     idempotency_key=payment.idempotency_key,
                     amount_kopeks=payment.amount_kopeks,
                     currency=payment.currency.strip(),
-                    description='Подписка «Премиум» на 30 дней',
+                    description=await self._reconciler.payment_description(payment),
                     return_url=return_url,
                 )
             )

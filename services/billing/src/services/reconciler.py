@@ -15,7 +15,11 @@ from clients.payment_provider import (
 )
 from clients.payment_provider_registry import PaymentProviderRegistry
 from core.observability import correlation_request_id
-from domain.subscription import ReconcileSource, ensure_utc
+from domain.subscription import (
+    ReconcileSource,
+    build_payment_description,
+    ensure_utc,
+)
 from repositories.payments import PaymentRepository
 from repositories.records import PaymentRecordProtocol, RefundRecordProtocol
 from repositories.refunds import RefundRepository
@@ -91,6 +95,16 @@ class PaymentReconciler:
         self._providers = payment_providers
         self._public_base_url = public_base_url.rstrip('/')
         self._outbox_dispatcher = outbox_dispatcher
+
+    async def payment_description(self, payment: PaymentRecordProtocol) -> str:
+        """Описание платежа в ЮKassa из тарифа платежа (название и срок из БД)."""
+        tariff = await self._payments.get_tariff(payment.tariff_id)
+        if tariff is None:
+            raise LookupError(f'Tariff {payment.tariff_id} not found')
+        return build_payment_description(
+            tariff_title=tariff.title,
+            duration_days=tariff.duration_days,
+        )
 
     async def notify_payment_tasks(self, payment_id: UUID) -> None:
         """Немедленно запускает отправку задач outbox для платежа (US-S-02)."""
@@ -267,7 +281,7 @@ class PaymentReconciler:
                         idempotency_key=payment.idempotency_key,
                         amount_kopeks=payment.amount_kopeks,
                         currency=payment.currency.strip(),
-                        description='Подписка «Премиум» на 30 дней',
+                        description=await self.payment_description(payment),
                         return_url=return_url,
                     )
                 )

@@ -375,6 +375,7 @@ async def test_refund_api_full_lifecycle_consequences_and_unhappy_paths() -> Non
             user_id=user_id,
             ends_at=repo.subscriptions[sub_id].ends_at,
             public_base_url='http://localhost',
+            tariff_title='Премиум',
         )
         assert ntf_gw.cancelled_campaigns == [UUID(str(exp_payload['campaign_id']))]
         # - в Notifications отправлено письмо о выполненном возврате

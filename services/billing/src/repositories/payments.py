@@ -7,7 +7,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from db.sql.errors import DatabaseUnavailableError
-from domain.errors import RuleConflictError
+from domain.errors import DependencyUnavailableError, RuleConflictError
 from domain.subscription import (
     ReconcileSource,
     build_payment_failed_email_payload,
@@ -24,7 +24,8 @@ from models import (
     Subscription,
     Tariff,
 )
-from repositories._sqlalchemy import SQLAlchemyRepository
+from repositories._sqlalchemy import SQLAlchemyRepository, tariff_data
+from repositories.read_models import TariffData
 from repositories.records import (
     PaymentRecordProtocol,
 )
@@ -57,6 +58,8 @@ class PaymentRepository(Protocol):
         payment_id: UUID,
         user_id: UUID,
     ) -> PaymentRecordProtocol | None: ...
+
+    async def get_tariff(self, tariff_id: UUID) -> TariffData | None: ...
 
     async def get_payment_by_provider_id(
         self,
@@ -153,6 +156,15 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
         try:
             async with self._session_factory() as session:
                 return await session.get(Payment, payment_id)
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def get_tariff(self, tariff_id: UUID) -> TariffData | None:
+        """Тариф платежа: название и срок для описания в ЮKassa и писем."""
+        try:
+            async with self._session_factory() as session:
+                tariff = await session.get(Tariff, tariff_id)
+                return None if tariff is None else tariff_data(tariff)
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 
@@ -383,8 +395,9 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
                     )
                 )
                 if tariff is None:
-                    raise RuntimeError(
-                        'Active default tariff not found in tariffs table'
+                    raise DependencyUnavailableError(
+                        'Покупка временно недоступна: нет активного тарифа',
+                        error_code='tariff_unavailable',
                     )
 
                 provider = await session.scalar(
@@ -503,8 +516,11 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
                 if payment.status != 'pending':
                     return payment, False
 
+                # FK RESTRICT не даёт удалить тариф с платежами, поэтому он есть.
                 tariff = await session.get(Tariff, payment.tariff_id)
-                duration_days = tariff.duration_days if tariff is not None else 30
+                if tariff is None:
+                    raise LookupError(f'Tariff {payment.tariff_id} not found')
+                duration_days = tariff.duration_days
 
                 old_status = payment.status
                 payment.status = 'succeeded'
@@ -571,6 +587,7 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
                                 user_id=payment.user_id,
                                 ends_at=ends_at,
                                 public_base_url=public_base_url,
+                                tariff_title=tariff.title,
                             ),
                             next_retry_at=now_utc,
                         ),
@@ -586,6 +603,7 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
                                 user_id=payment.user_id,
                                 ends_at=ends_at,
                                 public_base_url=public_base_url,
+                                tariff_title=tariff.title,
                             ),
                             next_retry_at=now_utc,
                         ),
@@ -649,6 +667,9 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
                             user_id=payment.user_id,
                             failure_reason=failure_reason,
                             public_base_url=public_base_url,
+                            tariff_title=await self._tariff_title(
+                                session, payment.tariff_id
+                            ),
                         ),
                         next_retry_at=now_utc,
                     )

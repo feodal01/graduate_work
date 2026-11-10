@@ -19,7 +19,11 @@ from clients.payment_provider import (
 )
 from core.observability import correlation_request_id
 from db.sql.errors import DatabaseUnavailableError
-from domain.errors import EntityNotFoundError, RuleConflictError
+from domain.errors import (
+    DependencyUnavailableError,
+    EntityNotFoundError,
+    RuleConflictError,
+)
 from domain.subscription import (
     ReconcileSource,
     build_cancel_expiration_email_payload,
@@ -51,6 +55,7 @@ from repositories.read_models import (
     InternalSubscriptionItemData,
     LocalPaymentResultData,
     OperationalMetricsSnapshot,
+    TariffData,
     UserBillingOverviewData,
     UserPaymentHistoryItemData,
 )
@@ -149,6 +154,17 @@ class InMemoryPurchaseRepository:
         self.access_versions: dict[UUID, int] = {}
         self.outbox_tasks: dict[str, FakeOutboxTaskRow] = {}
         self.admin_actions: list[FakeAdminActionRow] = []
+        # Единственный продаваемый тариф, как строка `premium` в `tariffs`.
+        # Тесты меняют его поля, чтобы проверить, что код не зашивает цену.
+        self.tariff = TariffData(
+            id=UUID('00000000-0000-0000-0000-000000000001'),
+            code='premium',
+            title='Премиум',
+            price_kopeks=29_900,
+            currency='RUB',
+            duration_days=30,
+        )
+        self.tariff_active = True
         self.events: list[
             tuple[str, UUID, str | None, str, str, dict[str, Any] | None]
         ] = []
@@ -187,6 +203,10 @@ class InMemoryPurchaseRepository:
             raise DatabaseUnavailableError('billing-db is down')
         return self.payments.get(payment_id)
 
+    async def get_tariff(self, tariff_id: UUID) -> TariffData | None:
+        """Тариф платежа (в фейке один тариф на все платежи)."""
+        return self.tariff
+
     async def get_payment_for_user(
         self,
         payment_id: UUID,
@@ -218,7 +238,7 @@ class InMemoryPurchaseRepository:
         return LocalPaymentResultData(
             payment_id=payment.id,
             user_id=payment.user_id,
-            tariff_title='Премиум',
+            tariff_title=self.tariff.title,
             amount_kopeks=payment.amount_kopeks,
             currency=payment.currency,
             status=payment.status,
@@ -282,7 +302,7 @@ class InMemoryPurchaseRepository:
                 UserPaymentHistoryItemData(
                     payment_id=p.id,
                     created_at=p.created_at,
-                    tariff_title='Премиум',
+                    tariff_title=self.tariff.title,
                     amount_kopeks=p.amount_kopeks,
                     currency=p.currency,
                     status=p.status,
@@ -296,7 +316,9 @@ class InMemoryPurchaseRepository:
             latest_subscription_has_succeeded_refund=has_succeeded_refund,
             latest_subscription_has_processing_refund=has_processing_refund,
             latest_subscription_auth_delivered=auth_delivered,
-            tariff_price_kopeks=29_900,
+            tariff_price_kopeks=(
+                self.tariff.price_kopeks if self.tariff_active else None
+            ),
             payments=history,
         )
 
@@ -411,14 +433,19 @@ class InMemoryPurchaseRepository:
         for payment in self.payments.values():
             if payment.user_id == user_id and payment.status == 'pending':
                 return payment, False
+        if not self.tariff_active:
+            raise DependencyUnavailableError(
+                'Покупка временно недоступна: нет активного тарифа',
+                error_code='tariff_unavailable',
+            )
         pid = uuid4()
         row = FakePaymentRow(
             id=pid,
             user_id=user_id,
-            tariff_id=UUID('00000000-0000-0000-0000-000000000001'),
+            tariff_id=self.tariff.id,
             provider_code=provider_code,
-            amount_kopeks=29_900,
-            currency='RUB',
+            amount_kopeks=self.tariff.price_kopeks,
+            currency=self.tariff.currency,
             status='pending',
             idempotency_key=pid,
         )
@@ -508,7 +535,7 @@ class InMemoryPurchaseRepository:
         row.updated_at = now_utc
 
         starts_at = now_utc
-        ends_at = starts_at + timedelta(days=30)
+        ends_at = starts_at + timedelta(days=self.tariff.duration_days)
         sub_id = uuid4()
         self.subscriptions[payment_id] = FakeSubscriptionRow(
             id=sub_id,
@@ -562,6 +589,7 @@ class InMemoryPurchaseRepository:
                     user_id=row.user_id,
                     ends_at=ends_at,
                     public_base_url=public_base_url,
+                    tariff_title=self.tariff.title,
                 ),
             ),
             FakeOutboxTaskRow(
@@ -577,6 +605,7 @@ class InMemoryPurchaseRepository:
                     user_id=row.user_id,
                     ends_at=ends_at,
                     public_base_url=public_base_url,
+                    tariff_title=self.tariff.title,
                 ),
             ),
         ]
@@ -629,6 +658,7 @@ class InMemoryPurchaseRepository:
                 user_id=row.user_id,
                 failure_reason=failure_reason,
                 public_base_url=public_base_url,
+                tariff_title=self.tariff.title,
             ),
         )
         return row, True
@@ -1716,6 +1746,7 @@ class InMemoryPurchaseRepository:
                 payment_id=pay.id,
                 user_id=pay.user_id,
                 amount_kopeks=row.amount_kopeks,
+                tariff_title=self.tariff.title,
                 currency=row.currency.strip(),
                 public_base_url=public_base_url,
             ),

@@ -422,6 +422,7 @@ class SQLAlchemyRefundRepository(SQLAlchemyRepository):
                 )
                 new_version = int((await session.execute(version_stmt)).scalar_one())
 
+                tariff_title = await self._tariff_title(session, payment.tariff_id)
                 session.add_all(
                     [
                         OutboxTask(
@@ -462,6 +463,7 @@ class SQLAlchemyRefundRepository(SQLAlchemyRepository):
                                 payment_id=payment.id,
                                 user_id=payment.user_id,
                                 amount_kopeks=refund.amount_kopeks,
+                                tariff_title=tariff_title,
                                 currency=refund.currency.strip(),
                                 public_base_url=public_base_url,
                             ),

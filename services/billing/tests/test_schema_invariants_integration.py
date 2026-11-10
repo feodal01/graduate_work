@@ -1804,3 +1804,71 @@ async def test_next_reconcile_at_migration_moves_backoff_both_ways(
         )
     assert restored is True
     await _run_alembic(database, 'upgrade', 'head')
+
+
+async def test_tariff_row_drives_new_payments_and_texts_in_postgres(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """Смена строки `tariffs` действует на новые покупки; история не меняется."""
+    from domain.errors import DependencyUnavailableError
+    from repositories.bundle import BillingRepositories
+
+    repos = BillingRepositories.sqlalchemy(migrated_billing_db)
+    old, _ = await repos.payments.get_or_create_pending_payment(uuid4())
+
+    async with migrated_billing_db() as session:
+        await session.execute(
+            text(
+                "UPDATE tariffs SET title = 'Годовой', price_kopeks = 99900, "
+                "duration_days = 365 WHERE code = 'premium'"
+            )
+        )
+        await session.commit()
+
+    tariff = await repos.payments.get_tariff(DEFAULT_TARIFF_ID)
+    assert tariff is not None
+    assert (tariff.title, tariff.price_kopeks, tariff.duration_days) == (
+        'Годовой',
+        99_900,
+        365,
+    )
+    old_after = await repos.payments.get_payment(old.id)
+    assert old_after is not None and old_after.amount_kopeks == 29_900
+
+    user_id = uuid4()
+    new, _ = await repos.payments.get_or_create_pending_payment(user_id)
+    assert new.amount_kopeks == 99_900
+    await repos.payments.save_provider_payment_created(
+        new.id,
+        provider_payment_id='yk_tariff_change',
+        confirmation_url='https://yookassa.test/confirm',
+        provider_details={'id': 'yk_tariff_change'},
+    )
+    await repos.payments.finalize_payment_succeeded(new.id, source='webhook')
+    async with migrated_billing_db() as session:
+        sub = await session.scalar(
+            select(Subscription).where(Subscription.payment_id == new.id)
+        )
+        assert sub is not None
+        assert sub.ends_at - sub.starts_at == timedelta(days=365)
+        subjects = list(
+            await session.scalars(
+                select(OutboxTask.payload['subject'].astext).where(
+                    OutboxTask.payment_id == new.id,
+                    OutboxTask.target_service == 'notifications',
+                )
+            )
+        )
+    assert subjects and all('«Годовой»' in s for s in subjects)
+    overview = await repos.user_views.get_user_billing_overview(user_id)
+    assert overview.tariff_price_kopeks == 99_900
+
+    async with migrated_billing_db() as session:
+        await session.execute(text('UPDATE tariffs SET is_active = false'))
+        await session.commit()
+    assert (
+        await repos.user_views.get_user_billing_overview(uuid4())
+    ).tariff_price_kopeks is None
+    with pytest.raises(DependencyUnavailableError) as exc_info:
+        await repos.payments.get_or_create_pending_payment(uuid4())
+    assert exc_info.value.error_code == 'tariff_unavailable'

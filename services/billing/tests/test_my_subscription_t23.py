@@ -63,6 +63,7 @@ def test_compute_my_subscription_summary_all_7_rules_in_priority_order() -> None
         latest_subscription_has_processing_refund=False,
         latest_subscription_auth_delivered=False,
         user_tz='Europe/Moscow',
+        tariff_price_display='299 ₽',
         now_utc=now_utc,
     )
     assert r7.rule_number == 7
@@ -79,6 +80,7 @@ def test_compute_my_subscription_summary_all_7_rules_in_priority_order() -> None
         latest_subscription_has_processing_refund=False,
         latest_subscription_auth_delivered=True,
         user_tz='Europe/Moscow',
+        tariff_price_display='299 ₽',
         now_utc=now_utc,
     )
     assert r6.rule_number == 6
@@ -95,6 +97,7 @@ def test_compute_my_subscription_summary_all_7_rules_in_priority_order() -> None
         latest_subscription_has_processing_refund=False,
         latest_subscription_auth_delivered=True,
         user_tz='Europe/Moscow',
+        tariff_price_display='299 ₽',
         now_utc=now_utc,
     )
     assert r5.rule_number == 5
@@ -111,6 +114,7 @@ def test_compute_my_subscription_summary_all_7_rules_in_priority_order() -> None
         latest_subscription_has_processing_refund=True,
         latest_subscription_auth_delivered=True,
         user_tz='Europe/Moscow',
+        tariff_price_display='299 ₽',
         now_utc=now_utc,
     )
     assert r4.rule_number == 4
@@ -127,6 +131,7 @@ def test_compute_my_subscription_summary_all_7_rules_in_priority_order() -> None
         latest_subscription_has_processing_refund=True,
         latest_subscription_auth_delivered=True,
         user_tz='Europe/Moscow',
+        tariff_price_display='299 ₽',
         now_utc=now_utc,
     )
     assert r3.rule_number == 3
@@ -143,6 +148,7 @@ def test_compute_my_subscription_summary_all_7_rules_in_priority_order() -> None
         latest_subscription_has_processing_refund=False,
         latest_subscription_auth_delivered=False,
         user_tz='Europe/Moscow',
+        tariff_price_display='299 ₽',
         now_utc=now_utc,
     )
     assert r2.rule_number == 2
@@ -159,6 +165,7 @@ def test_compute_my_subscription_summary_all_7_rules_in_priority_order() -> None
         latest_subscription_has_processing_refund=False,
         latest_subscription_auth_delivered=True,
         user_tz='Europe/Moscow',
+        tariff_price_display='299 ₽',
         now_utc=now_utc,
     )
     assert r1.rule_number == 1

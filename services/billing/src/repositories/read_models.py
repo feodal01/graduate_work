@@ -5,6 +5,18 @@ from uuid import UUID
 
 
 @dataclass(frozen=True, slots=True)
+class TariffData:
+    """Условия продажи из таблицы `tariffs`: единственный источник цены и срока."""
+
+    id: UUID
+    code: str
+    title: str
+    price_kopeks: int
+    currency: str
+    duration_days: int
+
+
+@dataclass(frozen=True, slots=True)
 class LocalPaymentResultData:
     payment_id: UUID
     user_id: UUID
@@ -36,7 +48,8 @@ class UserBillingOverviewData:
     latest_subscription_has_succeeded_refund: bool
     latest_subscription_has_processing_refund: bool
     latest_subscription_auth_delivered: bool
-    tariff_price_kopeks: int
+    # None — активного тарифа нет, покупка недоступна.
+    tariff_price_kopeks: int | None
     payments: list[UserPaymentHistoryItemData]
 
 
