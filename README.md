@@ -498,6 +498,10 @@ backend передаёт выбранных получателей и готов
 | Новинки каталога | Рабочий Elasticsearch Movies и расписание | `new_films` |
 | Внешняя кампания | Внутренний Campaign API | `marketing` для шаблона `personal_offer` |
 
+Формат событий от Auth, UGC и Movies ETL описан JSON Schema в
+[contracts/notifications/](contracts/notifications/README.md). Эти схемы общие для
+нескольких сервисов, поэтому лежат в корне репозитория.
+
 ### Архитектура и доставка
 
 ![Архитектура Notifications](docs/diagrams/notifications-arch/00-overview.png)
