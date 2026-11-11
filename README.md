@@ -1,3 +1,5 @@
+https://github.com/feodal01/notifications_sprint_1
+
 # Дипломный проект: Биллинг подписок
 
 Тема диплома — **«Биллинг»**: платная подписка на фильмы-новинки онлайн-кинотеатра. Новый сервис [`services/billing`](services/billing/README.md) встроен в существующий проект и связан с Auth, Notifications, Django Admin и ЮKassa (тестовый магазин, API v3).
@@ -71,8 +73,6 @@
    - полный сквозной прогон в Docker (сценарии `T-06`…`T-37` из ТЗ): `./tests/integration/run_billing_integration.sh`.
 
 ---
-
-https://github.com/feodal01/notifications_sprint_1
 
 # Онлайн-кинотеатр
 
