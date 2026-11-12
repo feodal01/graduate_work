@@ -1,4 +1,4 @@
-https://github.com/feodal01/notifications_sprint_1
+https://github.com/feodal01/graduate_work
 
 # Дипломный проект: Биллинг подписок
 
