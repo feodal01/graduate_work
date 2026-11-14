@@ -318,7 +318,11 @@ async def get_payment_result_page(
     )
 
 
-@router.get('/payments/{payment_id}/continue', response_model=None)
+@router.post(
+        '/payments/{payment_id}/continue',
+        response_model=None,
+        dependencies=[Depends(require_same_site_form)]
+)
 async def continue_payment(
     parsed_payment_id: Annotated[UUID, Depends(parse_ui_payment_id)],
     user: Annotated[AuthenticatedUser, Depends(require_ui_user)],
