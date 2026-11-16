@@ -410,6 +410,23 @@ class BillingIntegrationCheck:
 
         self._psql(f"DELETE FROM payments WHERE id = '{pay_1}';")
 
+    @staticmethod
+    def _session_cookie_header(login_res: HttpResult) -> str:
+        """Cookie, которые остаются в браузере после входа (без стираемых)."""
+        return '; '.join(
+            c.split(';', 1)[0] for c in login_res.set_cookies if 'Max-Age=0' not in c
+        )
+
+    @staticmethod
+    def _bearer_header(login_res: HttpResult) -> dict[str, str]:
+        """JSON API принимает только Bearer: cookie туда браузер не шлёт."""
+        token = next(
+            c.split(';', 1)[0].split('=', 1)[1]
+            for c in login_res.set_cookies
+            if c.startswith('billing_access_token=') and 'Max-Age=0' not in c
+        )
+        return {'Authorization': f'Bearer {token}'}
+
     def _check_login_logout_and_auth_degradation_t08(self) -> None:
         """T-08 (BIL-API-01, BIL-FR-12, BIL-NFR-SEC-03): E1 login, logout, E4 503."""
         login_page = self._http('GET', '/billing/login')
@@ -464,8 +481,29 @@ class BillingIntegrationCheck:
                 f'Missing HttpOnly refresh cookie: {good_login.set_cookies}'
             )
 
-        cookie_pairs = [c.split(';', 1)[0] for c in good_login.set_cookies]
-        cookie_header = '; '.join(cookie_pairs)
+        # Токены видны только адресам, где их читают: другие сервисы за шлюзом
+        # их не получают; прежние cookie с Path=/ стираются при входе.
+        for name, path in (
+            ('billing_access_token', '/billing'),
+            ('billing_refresh_token', '/billing/logout'),
+        ):
+            live = [
+                c
+                for c in good_login.set_cookies
+                if c.startswith(f'{name}=') and 'Max-Age=0' not in c
+            ]
+            if len(live) != 1 or f'Path={path};' not in f'{live[0]};':
+                raise AssertionError(f'Expected {name} with Path={path}: {live}')
+            if not any(
+                c.startswith(f'{name}=') and 'Max-Age=0' in c and 'Path=/;' in f'{c};'
+                for c in good_login.set_cookies
+            ):
+                raise AssertionError(
+                    f'Legacy {name} with Path=/ was not cleared on login: '
+                    f'{good_login.set_cookies}'
+                )
+
+        cookie_header = self._session_cookie_header(good_login)
         logout_res = self._http(
             'POST',
             '/billing/logout',
@@ -602,12 +640,13 @@ class BillingIntegrationCheck:
             follow_redirects=False,
         )
         assert login_res.status == 303, login_res
-        cookie_header = '; '.join([c.split(';', 1)[0] for c in login_res.set_cookies])
+        cookie_header = self._session_cookie_header(login_res)
+        bearer = self._bearer_header(login_res)
 
         pay_1 = self._http(
             'POST',
             '/api/v1/billing/payments',
-            headers={'Cookie': cookie_header},
+            headers=bearer,
         )
         if pay_1.status == 200:
             pay_1_data = pay_1.json()
@@ -796,13 +835,11 @@ class BillingIntegrationCheck:
             follow_redirects=False,
         )
         assert login_res.status == 303, login_res
-        cookie_header = '; '.join([c.split(';', 1)[0] for c in login_res.set_cookies])
+        cookie_header = self._session_cookie_header(login_res)
 
         # Get admin user_id via billing-api container using AuthGateway
-        access_cookie = next(
-            c.split(';', 1)[0].split('=', 1)[1]
-            for c in login_res.set_cookies
-            if 'billing_access_token=' in c
+        access_cookie = self._bearer_header(login_res)['Authorization'].removeprefix(
+            'Bearer '
         )
         uid_code = (
             'import asyncio, httpx\n'
@@ -855,7 +892,7 @@ class BillingIntegrationCheck:
 
             # T-13: /continue on fake provider_payment_id -> 503 E4 screen
             res_cont_err = self._http(
-                'GET',
+                'POST',
                 f'/billing/payments/{pay_id}/continue',
                 headers={'Cookie': cookie_header},
                 follow_redirects=False,
@@ -920,7 +957,7 @@ class BillingIntegrationCheck:
 
             # T-13: /continue on local succeeded -> 303 redirect to result page
             res_cont_ok = self._http(
-                'GET',
+                'POST',
                 f'/billing/payments/{pay_id}/continue',
                 headers={'Cookie': cookie_header},
                 follow_redirects=False,
@@ -1433,11 +1470,11 @@ class BillingIntegrationCheck:
             headers={'Content-Type': 'application/x-www-form-urlencoded'},
             follow_redirects=False,
         )
-        cookie_header = '; '.join([c.split(';', 1)[0] for c in login_res.set_cookies])
+        bearer = self._bearer_header(login_res)
         pay_res = self._http(
             'POST',
             '/api/v1/billing/payments',
-            headers={'Cookie': cookie_header},
+            headers=bearer,
         )
         if pay_res.status == 200:
             pay_id = pay_res.json()['payment_id']
@@ -1914,9 +1951,8 @@ class BillingIntegrationCheck:
             follow_redirects=False,
         )
         assert login_res.status == 303, login_res.text()
-        cookie_header = '; '.join(
-            c.split(';', 1)[0] for c in login_res.set_cookies if '=' in c
-        )
+        cookie_header = self._session_cookie_header(login_res)
+        bearer = self._bearer_header(login_res)
 
         # Rule 7: No subscription yet
         r7_html = self._http(
@@ -1928,7 +1964,7 @@ class BillingIntegrationCheck:
         r7_json = self._http(
             'GET',
             '/api/v1/billing/me/summary',
-            headers={'Cookie': cookie_header, 'X-Request-Id': 't23-r7'},
+            headers={**bearer, 'X-Request-Id': 't23-r7'},
         ).json()
         assert r7_json['rule_number'] == 7
         assert r7_json['status_display'] == 'Нет подписки'
@@ -1966,7 +2002,7 @@ class BillingIntegrationCheck:
         r3_json = self._http(
             'GET',
             '/api/v1/billing/me/summary',
-            headers={'Cookie': cookie_header, 'X-Request-Id': 't23-r3'},
+            headers={**bearer, 'X-Request-Id': 't23-r3'},
         ).json()
         assert r3_json['rule_number'] == 3
         assert r3_json['can_subscribe'] is False
@@ -2006,7 +2042,7 @@ class BillingIntegrationCheck:
             auth_down_json = self._http(
                 'GET',
                 '/api/v1/billing/me/summary',
-                headers={'Cookie': cookie_header, 'X-Request-Id': 't23-auth-down'},
+                headers={**bearer, 'X-Request-Id': 't23-auth-down'},
             )
             if (
                 auth_down_json.status != 503
@@ -3254,7 +3290,8 @@ class BillingIntegrationCheck:
             headers={'Content-Type': 'application/x-www-form-urlencoded'},
             follow_redirects=False,
         )
-        cookie_hdr = '; '.join([c.split(';', 1)[0] for c in login_res.set_cookies])
+        cookie_hdr = self._session_cookie_header(login_res)
+        bearer = self._bearer_header(login_res)
         for auth_path in ('/billing/', '/api/v1/billing/me/summary'):
             samples_ms = []
             for sample_no in range(15):
@@ -3267,7 +3304,11 @@ class BillingIntegrationCheck:
                 res = self._http(
                     'GET',
                     auth_path,
-                    headers={'Cookie': cookie_hdr},
+                    headers=(
+                        bearer
+                        if auth_path.startswith('/api/')
+                        else {'Cookie': cookie_hdr}
+                    ),
                     follow_redirects=False,
                 )
                 if res.status != 200:

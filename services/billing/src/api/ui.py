@@ -6,6 +6,13 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Form, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
+from api.auth_cookies import (
+    ACCESS_TOKEN_COOKIE,
+    REFRESH_TOKEN_COOKIE,
+    clear_auth_cookies,
+    is_secure_request,
+    set_auth_cookies,
+)
 from api.errors import BillingDomainError, UIErrorScreenException
 from api.templates import render_error_page, templates
 from clients.auth import (
@@ -17,8 +24,6 @@ from clients.auth import (
 from core.config import settings
 from core.observability import get_current_request_id
 from dependencies import (
-    ACCESS_TOKEN_COOKIE,
-    REFRESH_TOKEN_COOKIE,
     AuthenticatedUser,
     get_auth_gateway,
     get_purchase_service,
@@ -120,12 +125,6 @@ def sanitize_next_url(raw_next: str | None) -> str:
     return candidate
 
 
-def _is_secure_request(request: Request) -> bool:
-    forwarded_proto = request.headers.get('X-Forwarded-Proto', '')
-    first_proto = forwarded_proto.split(',', 1)[0].strip().lower()
-    return request.url.scheme == 'https' or first_proto == 'https'
-
-
 @router.get('/', response_class=HTMLResponse)
 async def get_my_subscription_page(
     request: Request,
@@ -213,26 +212,15 @@ async def submit_login_form(
             message='Сервис авторизации временно недоступен',
         )
 
-    secure_cookie = _is_secure_request(request)
     redirect = RedirectResponse(
         url=safe_next,
         status_code=status.HTTP_303_SEE_OTHER,
     )
-    redirect.set_cookie(
-        key=ACCESS_TOKEN_COOKIE,
-        value=access_token,
-        httponly=True,
-        secure=secure_cookie,
-        samesite='lax',
-        path='/',
-    )
-    redirect.set_cookie(
-        key=REFRESH_TOKEN_COOKIE,
-        value=refresh_token,
-        httponly=True,
-        secure=secure_cookie,
-        samesite='lax',
-        path='/',
+    set_auth_cookies(
+        redirect,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        secure=is_secure_request(request),
     )
     return redirect
 
@@ -259,25 +247,11 @@ async def submit_logout(
         except Exception:
             # Gateway сам глушит ошибки Auth; сюда попадает только дефект кода.
             logger.exception('Unexpected error while revoking Auth session')
-    secure_cookie = _is_secure_request(request)
     redirect = RedirectResponse(
         url='/billing/login',
         status_code=status.HTTP_303_SEE_OTHER,
     )
-    redirect.delete_cookie(
-        key=ACCESS_TOKEN_COOKIE,
-        path='/',
-        httponly=True,
-        secure=secure_cookie,
-        samesite='lax',
-    )
-    redirect.delete_cookie(
-        key=REFRESH_TOKEN_COOKIE,
-        path='/',
-        httponly=True,
-        secure=secure_cookie,
-        samesite='lax',
-    )
+    clear_auth_cookies(redirect, secure=is_secure_request(request))
     return redirect
 
 
@@ -319,9 +293,9 @@ async def get_payment_result_page(
 
 
 @router.post(
-        '/payments/{payment_id}/continue',
-        response_model=None,
-        dependencies=[Depends(require_same_site_form)]
+    '/payments/{payment_id}/continue',
+    response_model=None,
+    dependencies=[Depends(require_same_site_form)],
 )
 async def continue_payment(
     parsed_payment_id: Annotated[UUID, Depends(parse_ui_payment_id)],

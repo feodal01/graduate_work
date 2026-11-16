@@ -4,6 +4,7 @@ from uuid import UUID
 
 from fastapi import Depends, Request
 
+from api.auth_cookies import ACCESS_TOKEN_COOKIE
 from api.errors import (
     BillingDomainError,
     InvalidServiceCredentialsError,
@@ -31,8 +32,6 @@ from services.outbox_dispatcher import OutboxDispatcher
 from services.purchase import PurchaseService
 from services.reconciler import PaymentReconciler
 
-ACCESS_TOKEN_COOKIE = 'billing_access_token'
-REFRESH_TOKEN_COOKIE = 'billing_refresh_token'
 AUTH_RATE_LIMITED_MESSAGE = 'Слишком много запросов, повторите через минуту'
 
 
@@ -146,23 +145,22 @@ async def get_purchase_service(
     )
 
 
-def _extract_access_token(request: Request) -> str | None:
+def _bearer_token(request: Request) -> str | None:
     auth_header = request.headers.get('Authorization', '')
     if auth_header.lower().startswith('bearer '):
-        token = auth_header[7:].strip()
-        if token:
-            return token
-    cookie_token = request.cookies.get(ACCESS_TOKEN_COOKIE)
-    if cookie_token:
-        return cookie_token
+        return auth_header[7:].strip() or None
     return None
+
+
+def _ui_access_token(request: Request) -> str | None:
+    return _bearer_token(request) or request.cookies.get(ACCESS_TOKEN_COOKIE) or None
 
 
 async def require_ui_user(
     request: Request,
     auth_gateway: AuthGateway = Depends(get_auth_gateway),
 ) -> AuthenticatedUser:
-    token = _extract_access_token(request)
+    token = _ui_access_token(request)
     if not token:
         raise UILoginRedirectError()
     request_id = get_current_request_id()
@@ -196,7 +194,9 @@ async def require_api_user(
     request: Request,
     auth_gateway: AuthGateway = Depends(get_auth_gateway),
 ) -> AuthenticatedUser:
-    token = _extract_access_token(request)
+    # Только Bearer: cookie браузер прикладывает сам, и запрос с ней могла бы
+    # отправить чужая страница (CSRF). Заголовок Authorization она не задаст.
+    token = _bearer_token(request)
     if not token:
         raise BillingDomainError(
             'Authentication credentials were not provided',

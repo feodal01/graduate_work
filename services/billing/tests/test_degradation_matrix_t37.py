@@ -8,6 +8,7 @@ import httpx
 import pytest
 import sentry_sdk
 
+from api.auth_cookies import ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE
 from clients.auth import (
     AuthInvalidCredentialsError,
     AuthPermanentDeliveryError,
@@ -34,8 +35,6 @@ from clients.payment_provider_registry import PaymentProviderRegistry
 from core.config import settings
 from db.health import HealthCheck
 from dependencies import (
-    ACCESS_TOKEN_COOKIE,
-    REFRESH_TOKEN_COOKIE,
     get_auth_gateway,
     get_database_health,
     get_notifications_gateway,

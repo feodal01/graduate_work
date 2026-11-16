@@ -18,9 +18,9 @@
 </div>
 
 {% if view.action_type == 'continue_payment' and view.action_url %}
-<p style="margin-bottom: 24px;">
-    <a href="{{ view.action_url }}" class="btn">{{ view.action_label }}</a>
-</p>
+<form method="post" action="{{ view.action_url }}" style="margin-bottom: 24px;">
+    <button type="submit" class="btn">{{ view.action_label }}</button>
+</form>
 {% elif view.action_type == 'subscribe' %}
 <form method="post" action="/billing/subscribe" style="margin-bottom: 24px;">
     <button type="submit" class="btn">{{ view.action_label }}</button>

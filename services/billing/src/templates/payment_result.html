@@ -36,9 +36,9 @@
     <strong>Проверяем оплату…</strong>
     <p style="margin: 8px 0 0 0;">Ожидаем подтверждения от платёжной системы. Страница обновляется автоматически раз в {{ view.auto_refresh_seconds }} с.</p>
 </div>
-<p>
-    <a href="/billing/payments/{{ view.payment_id }}/continue" class="btn">Продолжить оплату</a>
-</p>
+<form method="post" action="/billing/payments/{{ view.payment_id }}/continue" style="margin-bottom: 16px;">
+    <button type="submit" class="btn">Продолжить оплату</button>
+</form>
 {% endif %}
 
 <p style="margin-top: 20px;">

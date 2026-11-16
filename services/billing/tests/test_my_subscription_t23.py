@@ -4,9 +4,9 @@ from uuid import UUID, uuid4
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from api.auth_cookies import ACCESS_TOKEN_COOKIE
 from clients.payment_provider_registry import PaymentProviderRegistry
 from dependencies import (
-    ACCESS_TOKEN_COOKIE,
     get_auth_gateway,
     get_purchase_service,
 )
@@ -272,7 +272,11 @@ def test_my_subscription_html_and_json_summary_all_rules_and_history_isolation()
         r1_html = client.get('/billing/')
         assert r1_html.status_code == 200
         assert 'Ожидает оплаты' in r1_html.text
-        assert f'/billing/payments/{pending_pid}/continue' in r1_html.text
+        # Продолжение оплаты меняет состояние, поэтому это форма POST, а не ссылка.
+        assert (
+            f'<form method="post" action="/billing/payments/{pending_pid}/continue"'
+            in r1_html.text
+        )
         assert 'Оформить за 299 ₽' not in r1_html.text
 
         # Переводим платёж в succeeded и создаём подписку (ещё не доставлена в Auth)

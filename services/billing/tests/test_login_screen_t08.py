@@ -3,7 +3,7 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 
 from clients.auth import (
     AuthInvalidCredentialsError,
@@ -96,6 +96,22 @@ class FakeAuthGateway:
         return SubscriptionAccessSyncResult(applied=True, current_version=version)
 
 
+def _cookies_by_name_and_path(
+    set_cookie_headers: list[str],
+) -> dict[tuple[str, str], str]:
+    """Set-Cookie по ключу (имя, Path): так браузер различает cookie."""
+    result: dict[tuple[str, str], str] = {}
+    for header in set_cookie_headers:
+        name = header.split('=', 1)[0]
+        path = next(
+            part.strip()[len('Path=') :]
+            for part in header.split(';')
+            if part.strip().startswith('Path=')
+        )
+        result[name, path] = header
+    return result
+
+
 @pytest.fixture
 async def login_client() -> AsyncGenerator[
     tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],
@@ -150,20 +166,20 @@ async def test_post_login_valid_credentials_sets_httponly_cookies_and_redirects(
     assert fake_auth.last_request_id == 'billing-login-test'
 
     set_cookie_headers = response.headers.get_list('set-cookie')
-    assert any(
-        'billing_access_token=valid-access-token' in header
-        and 'HttpOnly' in header
-        and 'SameSite=lax' in header
-        and 'Path=/' in header
-        for header in set_cookie_headers
-    )
-    assert any(
-        'billing_refresh_token=valid-refresh-token' in header
-        and 'HttpOnly' in header
-        and 'SameSite=lax' in header
-        and 'Path=/' in header
-        for header in set_cookie_headers
-    )
+    # Каждая cookie видна только там, где её читают: access — экранам
+    # /billing/*, refresh — только выходу. Другие сервисы за шлюзом их не получают.
+    cookies = _cookies_by_name_and_path(set_cookie_headers)
+    access = cookies['billing_access_token', '/billing']
+    refresh = cookies['billing_refresh_token', '/billing/logout']
+    assert access.startswith('billing_access_token=valid-access-token;')
+    assert refresh.startswith('billing_refresh_token=valid-refresh-token;')
+    for header in (access, refresh):
+        assert 'HttpOnly' in header
+        assert 'SameSite=lax' in header
+        assert 'Max-Age=0' not in header
+    # Прежние cookie с Path=/ стираются уже при входе.
+    for name in ('billing_access_token', 'billing_refresh_token'):
+        assert 'Max-Age=0' in cookies[name, '/']
 
     # При X-Forwarded-Proto: https выставляется атрибут Secure
     https_resp = await client.post(
@@ -299,11 +315,88 @@ async def test_post_logout_clears_cookies_and_redirects_to_login(
     assert response.status_code == 303
     assert response.headers['location'] == '/billing/login'
     assert fake_auth.logout_called_with == ('valid-access-token', 'valid-refresh-token')
-    set_cookie_headers = response.headers.get_list('set-cookie')
-    assert any(
-        'billing_access_token=""' in header or 'Max-Age=0' in header
-        for header in set_cookie_headers
+    # Cookie стирается только с тем же Path, с каким ставилась; прежние
+    # с Path=/ стираются отдельно.
+    cookies = _cookies_by_name_and_path(response.headers.get_list('set-cookie'))
+    assert set(cookies) == {
+        ('billing_access_token', '/billing'),
+        ('billing_refresh_token', '/billing/logout'),
+        ('billing_access_token', '/'),
+        ('billing_refresh_token', '/'),
+    }
+    assert all('Max-Age=0' in header for header in cookies.values())
+
+
+@pytest.mark.asyncio
+async def test_login_cookies_reach_only_billing_screens_and_logout(
+    login_client: tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],
+) -> None:
+    """BIL-API-01: клиент отдаёт токены только адресам, где их читают."""
+    client, app, fake_auth = login_client
+    seen: dict[str, dict[str, str]] = {}
+
+    @app.get('/{path:path}')
+    async def echo_cookies(path: str, request: Request) -> dict[str, str]:
+        seen[f'/{path}'] = dict(request.cookies)
+        return {}
+
+    login = await client.post(
+        '/billing/login',
+        data={'login': 'cinema_viewer', 'password': 'secret'},
     )
+    assert login.status_code == 303
+
+    for path in ('/billing/probe', '/api/v1/billing/probe', '/api/v1/films', '/admin/'):
+        await client.get(path)
+
+    assert seen['/billing/probe'] == {'billing_access_token': 'valid-access-token'}
+    assert seen['/api/v1/billing/probe'] == {}
+    assert seen['/api/v1/films'] == {}
+    assert seen['/admin/'] == {}
+
+    await client.post('/billing/logout')
+    assert fake_auth.logout_called_with == ('valid-access-token', 'valid-refresh-token')
+
+
+@pytest.mark.asyncio
+async def test_json_api_ignores_access_cookie(
+    login_client: tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],
+) -> None:
+    """JSON API не входит по cookie: её приложил бы и запрос с чужой страницы."""
+    client, app, _ = login_client
+
+    @app.get('/api/v1/billing/cookie-probe')
+    async def api_probe(
+        user: AuthenticatedUser = Depends(require_api_user),
+    ) -> dict[str, str]:
+        return {'login': user.login}
+
+    client.cookies.set('billing_access_token', 'valid-access-token')
+
+    response = await client.get('/api/v1/billing/cookie-probe')
+
+    assert response.status_code == 401
+    assert response.json()['error_code'] == 'unauthenticated'
+
+
+@pytest.mark.asyncio
+async def test_login_redirect_clears_cookies_of_rejected_token(
+    login_client: tuple[httpx.AsyncClient, FastAPI, FakeAuthGateway],
+) -> None:
+    """Экран с истёкшим или отозванным токеном стирает нерабочие cookie."""
+    client, _, fake_auth = login_client
+    fake_auth.profile_status = 401
+    client.cookies.set('billing_access_token', 'expired-access-token')
+
+    response = await client.get('/billing/')
+
+    assert response.status_code == 303
+    assert response.headers['location'] == '/billing/login'
+    cookies = _cookies_by_name_and_path(response.headers.get_list('set-cookie'))
+    assert ('billing_access_token', '/billing') in cookies
+    assert ('billing_refresh_token', '/billing/logout') in cookies
+    assert ('billing_access_token', '/') in cookies
+    assert all('Max-Age=0' in header for header in cookies.values())
 
 
 @pytest.mark.asyncio

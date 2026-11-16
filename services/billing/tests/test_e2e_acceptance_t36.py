@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 
+from api.auth_cookies import ACCESS_TOKEN_COOKIE
 from clients.auth import LogoutOutcome, SubscriptionAccessSyncResult
 from clients.notifications import NotificationsTransientError
 from clients.payment_provider import YooKassaProviderAdapter
@@ -213,6 +214,10 @@ async def test_e2e_acceptance_criteria_task_1_to_6_and_link_navigation() -> None
         assert r_login.status_code == 303
         assert r_login.headers['location'] == '/billing/'
         client.cookies.update(r_login.cookies)
+        # JSON API принимает только Bearer: cookie туда браузер не шлёт.
+        api_auth = {
+            'Authorization': f'Bearer {r_login.cookies[ACCESS_TOKEN_COOKIE]}',
+        }
 
         r_sub_empty = await client.get('/billing/')
         assert r_sub_empty.status_code == 200
@@ -255,7 +260,7 @@ async def test_e2e_acceptance_criteria_task_1_to_6_and_link_navigation() -> None
         # Повторный запрос создания покупки возвращает тот же платёж без дубля в ЮKassa
         r_buy_dup = await client.post(
             '/api/v1/billing/payments',
-            headers={'X-Request-Id': 'e2e-dup-buy'},
+            headers={'X-Request-Id': 'e2e-dup-buy', **api_auth},
         )
         assert r_buy_dup.status_code == 200
         assert r_buy_dup.json()['payment_id'] == str(payment_id)
@@ -308,7 +313,7 @@ async def test_e2e_acceptance_criteria_task_1_to_6_and_link_navigation() -> None
 
         r_summary_active = await client.get(
             '/api/v1/billing/me/summary',
-            headers={'X-Request-Id': 'e2e-summary-active'},
+            headers={'X-Request-Id': 'e2e-summary-active', **api_auth},
         )
         assert r_summary_active.status_code == 200
         assert r_summary_active.json()['status_key'] == 'active'
@@ -316,7 +321,7 @@ async def test_e2e_acceptance_criteria_task_1_to_6_and_link_navigation() -> None
         # Повторная покупка при активной подписке -> 409 в едином формате (NFR-U-02)
         r_buy_active = await client.post(
             '/api/v1/billing/payments',
-            headers={'X-Request-Id': 'e2e-active-409'},
+            headers={'X-Request-Id': 'e2e-active-409', **api_auth},
         )
         assert r_buy_active.status_code == 409
         assert r_buy_active.json()['error_code'] == 'subscription_already_active'
@@ -423,7 +428,7 @@ async def test_e2e_acceptance_criteria_task_1_to_6_and_link_navigation() -> None
         provider.get_status = 'pending'
         r_buy_2 = await client.post(
             '/api/v1/billing/payments',
-            headers={'X-Request-Id': 'e2e-buy-outage'},
+            headers={'X-Request-Id': 'e2e-buy-outage', **api_auth},
         )
         assert r_buy_2.status_code == 200
         pay_2_id = UUID(r_buy_2.json()['payment_id'])

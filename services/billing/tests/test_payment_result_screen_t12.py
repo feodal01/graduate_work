@@ -154,7 +154,12 @@ async def test_result_screen_pending_shows_checking_block_and_zero_yookassa_call
         body = resp.text
         assert 'Проверяем оплату…' in body
         assert 'meta http-equiv="refresh" content="5"' in body
-        assert f'/billing/payments/{payment.id}/continue' in body
+        # Продолжение оплаты меняет состояние: форма POST, а не ссылка.
+        assert (
+            f'<form method="post" action="/billing/payments/{payment.id}/continue"'
+            in body
+        )
+        assert 'Продолжить оплату' in body
         assert 'href="/billing/"' in body
         # Однозначность состояния (BIL-NFR-U-01): других блоков на странице нет
         assert 'Оплата прошла, доступ открыт до' not in body

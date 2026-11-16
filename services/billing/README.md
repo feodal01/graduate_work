@@ -39,7 +39,7 @@ docker compose ps
 | `GET /billing/login`, `POST /billing/login`, `POST /billing/logout` | Вход и выход из биллинга (`Э1`, `BIL-API-01`) |
 | `POST /billing/subscribe` | Старт или продолжение покупки подписки из браузера с редиректом на ЮKassa (`BIL-API-03`) |
 | `GET /billing/payments/{payment_id}` | Экран «Результат оплаты» (`Э3`, читает только локальную БД, `BIL-API-04`) |
-| `GET /billing/payments/{payment_id}/continue` | Продолжение незавершённой оплаты с проверкой статуса в ЮKassa не чаще 1 раза в 5 с (`BIL-API-04`) |
+| `POST /billing/payments/{payment_id}/continue` | Продолжение незавершённой оплаты с проверкой статуса в ЮKassa не чаще 1 раза в 5 с (`BIL-API-04`) |
 | `POST /api/v1/billing/payments` | Создание или возврат существующего `pending`-платежа в JSON (`BIL-API-03`) |
 | `GET /api/v1/billing/me/summary` | JSON-сводка статуса подписки (по 7 правилам `US-U-05`) и истории платежей (`BIL-API-02`) |
 | `POST /api/v1/billing/webhooks/yookassa` | Приём уведомлений ЮKassa (из тела берётся только `object.id`, `BIL-API-05`) |

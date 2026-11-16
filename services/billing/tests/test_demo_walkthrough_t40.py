@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
+from api.auth_cookies import ACCESS_TOKEN_COOKIE
 from clients.auth import LogoutOutcome, SubscriptionAccessSyncResult
 from clients.notifications import NotificationsTransientError
 from clients.payment_provider_registry import PaymentProviderRegistry
@@ -230,6 +231,10 @@ async def test_defense_presentation_and_full_demo_walkthrough_section_9_2() -> N
         )
         assert r_login.status_code == 303
         client.cookies.update(r_login.cookies)
+        # JSON API принимает только Bearer: cookie туда браузер не шлёт.
+        api_auth = {
+            'Authorization': f'Bearer {r_login.cookies[ACCESS_TOKEN_COOKIE]}',
+        }
 
         r_step1 = await client.get('/billing/')
         assert r_step1.status_code == 200
@@ -247,7 +252,7 @@ async def test_defense_presentation_and_full_demo_walkthrough_section_9_2() -> N
         # Повторный параллельный запрос возвращает тот же платёж без дубля в ЮKassa
         r_buy_dup = await client.post(
             '/api/v1/billing/payments',
-            headers={'X-Request-Id': 'demo-step2-dup'},
+            headers={'X-Request-Id': 'demo-step2-dup', **api_auth},
         )
         assert r_buy_dup.status_code == 200
         assert r_buy_dup.json()['payment_id'] == str(pay_1_id)
@@ -277,7 +282,7 @@ async def test_defense_presentation_and_full_demo_walkthrough_section_9_2() -> N
         # Повторная покупка при активной подписке -> 409 Conflict
         r_buy_409 = await client.post(
             '/api/v1/billing/payments',
-            headers={'X-Request-Id': 'demo-step2-409'},
+            headers={'X-Request-Id': 'demo-step2-409', **api_auth},
         )
         assert r_buy_409.status_code == 409
 

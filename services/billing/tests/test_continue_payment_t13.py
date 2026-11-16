@@ -116,7 +116,7 @@ async def test_continue_local_succeeded_redirects_to_result_without_calling_yook
     client, _, repo, provider, _, user_id = continue_test_env
     payment = _seed_payment(repo, user_id=user_id, status='succeeded')
 
-    resp = await client.get(f'/billing/payments/{payment.id}/continue')
+    resp = await client.post(f'/billing/payments/{payment.id}/continue')
     assert resp.status_code == 303
     assert resp.headers['location'] == f'/billing/payments/{payment.id}'
     assert len(provider.get_calls) == 0
@@ -137,7 +137,7 @@ async def test_continue_local_failed_creates_new_payment_and_redirects_to_new_ur
     client, _, repo, provider, _, user_id = continue_test_env
     failed_payment = _seed_payment(repo, user_id=user_id, status='failed')
 
-    resp = await client.get(f'/billing/payments/{failed_payment.id}/continue')
+    resp = await client.post(f'/billing/payments/{failed_payment.id}/continue')
     assert resp.status_code == 303
     assert (
         resp.headers['location']
@@ -163,7 +163,7 @@ async def test_continue_pending_throttles_10_calls_to_1_yookassa_get_call(
     payment = _seed_payment(repo, user_id=user_id, status='pending')
 
     for _ in range(10):
-        resp = await client.get(f'/billing/payments/{payment.id}/continue')
+        resp = await client.post(f'/billing/payments/{payment.id}/continue')
         assert resp.status_code == 303
         assert (
             resp.headers['location']
@@ -195,7 +195,7 @@ async def test_continue_pending_throttled_without_confirmation_url_returns_503_e
         last_checked_at=datetime.now(UTC) - timedelta(seconds=1),
     )
 
-    resp = await client.get(f'/billing/payments/{payment.id}/continue')
+    resp = await client.post(f'/billing/payments/{payment.id}/continue')
     assert resp.status_code == 503
     assert 'Не удалось связаться с платёжной системой' in resp.text
     assert len(provider.get_calls) == 0
@@ -216,7 +216,7 @@ async def test_continue_pending_when_canceled_in_yookassa_marks_failed_and_creat
     payment = _seed_payment(repo, user_id=user_id, status='pending')
     provider.get_status = 'failed'
 
-    resp = await client.get(f'/billing/payments/{payment.id}/continue')
+    resp = await client.post(f'/billing/payments/{payment.id}/continue')
     assert resp.status_code == 303
     assert (
         resp.headers['location']
@@ -245,7 +245,7 @@ async def test_continue_pending_when_succeeded_in_yookassa_finalizes_and_redirec
     payment = _seed_payment(repo, user_id=user_id, status='pending')
     provider.get_status = 'succeeded'
 
-    resp = await client.get(f'/billing/payments/{payment.id}/continue')
+    resp = await client.post(f'/billing/payments/{payment.id}/continue')
     assert resp.status_code == 303
     assert resp.headers['location'] == f'/billing/payments/{payment.id}'
     assert repo.payments[payment.id].status == 'succeeded'
@@ -274,7 +274,7 @@ async def test_continue_pending_without_provider_id_recovers_by_same_idempotency
         confirmation_url=None,
     )
 
-    resp = await client.get(f'/billing/payments/{payment.id}/continue')
+    resp = await client.post(f'/billing/payments/{payment.id}/continue')
     assert resp.status_code == 303
     assert (
         resp.headers['location']
@@ -301,23 +301,23 @@ async def test_continue_unhappy_foreign_unknown_invalid_uuid_provider_down_and_4
     own_pending = _seed_payment(repo, user_id=user_id, status='pending')
 
     # 1. Чужой платёж -> 404 Э4
-    resp_foreign = await client.get(f'/billing/payments/{foreign_payment.id}/continue')
+    resp_foreign = await client.post(f'/billing/payments/{foreign_payment.id}/continue')
     assert resp_foreign.status_code == 404
     assert 'Платёж не найден' in resp_foreign.text
 
     # 2. Неизвестный UUID -> 404 Э4
-    resp_missing = await client.get(f'/billing/payments/{uuid4()}/continue')
+    resp_missing = await client.post(f'/billing/payments/{uuid4()}/continue')
     assert resp_missing.status_code == 404
     assert 'Платёж не найден' in resp_missing.text
 
     # 3. Невалидный UUID -> 404 Э4
-    resp_invalid = await client.get('/billing/payments/invalid-uuid/continue')
+    resp_invalid = await client.post('/billing/payments/invalid-uuid/continue')
     assert resp_invalid.status_code == 404
     assert 'Платёж не найден' in resp_invalid.text
 
     # 4. ЮKassa недоступна при GET -> 503 Э4, платёж остаётся pending
     provider.get_error = ProviderTransientError('YooKassa timeout')
-    resp_yk_down = await client.get(f'/billing/payments/{own_pending.id}/continue')
+    resp_yk_down = await client.post(f'/billing/payments/{own_pending.id}/continue')
     assert resp_yk_down.status_code == 503
     assert 'Не удалось связаться с платёжной системой' in resp_yk_down.text
     assert repo.payments[own_pending.id].status == 'pending'
@@ -326,14 +326,14 @@ async def test_continue_unhappy_foreign_unknown_invalid_uuid_provider_down_and_4
     # 5. Если платёж failed, но подписка уже активна -> 409 Э4
     failed_own = _seed_payment(repo, user_id=user_id, status='failed')
     repo.has_active_subscription = True
-    resp_409 = await client.get(f'/billing/payments/{failed_own.id}/continue')
+    resp_409 = await client.post(f'/billing/payments/{failed_own.id}/continue')
     assert resp_409.status_code == 409
     assert 'Подписка уже активна' in resp_409.text
     repo.has_active_subscription = False
 
     # 6. Auth недоступен -> 503 Э4
     auth.unavailable = True
-    resp_auth = await client.get(f'/billing/payments/{own_pending.id}/continue')
+    resp_auth = await client.post(f'/billing/payments/{own_pending.id}/continue')
     assert resp_auth.status_code == 503
     assert 'Сервис авторизации временно недоступен' in resp_auth.text
 
@@ -364,7 +364,7 @@ async def test_parallel_continue_calls_make_exactly_one_yookassa_get(
     provider.get_payment = slow_get  # type: ignore[method-assign,assignment]
 
     responses = await asyncio.gather(
-        *(client.get(f'/billing/payments/{payment.id}/continue') for _ in range(10))
+        *(client.post(f'/billing/payments/{payment.id}/continue') for _ in range(10))
     )
 
     assert all(r.status_code == 303 for r in responses)
@@ -386,9 +386,9 @@ async def test_clicks_during_provider_outage_do_not_hammer_yookassa(
     payment = _seed_payment(repo, user_id=user_id, status='pending')
     provider.get_error = ProviderTransientError('YooKassa 503')
 
-    first = await client.get(f'/billing/payments/{payment.id}/continue')
+    first = await client.post(f'/billing/payments/{payment.id}/continue')
     for _ in range(4):
-        await client.get(f'/billing/payments/{payment.id}/continue')
+        await client.post(f'/billing/payments/{payment.id}/continue')
 
     assert first.status_code == 503
     assert len(provider.get_calls) == 1
@@ -420,7 +420,7 @@ async def test_background_backoff_does_not_block_user_check(
     payment.next_reconcile_at = datetime.now(UTC) + timedelta(minutes=4)
     provider.get_status = 'canceled'
 
-    resp = await client.get(f'/billing/payments/{payment.id}/continue')
+    resp = await client.post(f'/billing/payments/{payment.id}/continue')
 
     assert len(provider.get_calls) == 1
     assert repo.payments[payment.id].status == 'failed'
@@ -452,7 +452,7 @@ async def test_continue_after_key_expiry_closes_payment_instead_of_stale_post(
     )
     payment.created_at = datetime.now(UTC) - timedelta(hours=25)
 
-    resp = await client.get(f'/billing/payments/{payment.id}/continue')
+    resp = await client.post(f'/billing/payments/{payment.id}/continue')
 
     assert repo.payments[payment.id].status == 'failed'
     assert repo.payments[payment.id].failure_reason == 'idempotency_key_expired'
@@ -504,7 +504,7 @@ async def test_user_is_not_sent_to_payment_page_whose_number_was_not_saved(
 
     provider.create_payment = create_while_worker_closes  # type: ignore[method-assign]
 
-    resp = await client.get(f'/billing/payments/{payment.id}/continue')
+    resp = await client.post(f'/billing/payments/{payment.id}/continue')
 
     orphan_url = 'https://yoomoney.ru/checkout/payments/v2/contract?orderId=yk-cont-1'
     assert resp.headers.get('location') != orphan_url

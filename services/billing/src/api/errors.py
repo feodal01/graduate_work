@@ -8,6 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.types import ExceptionHandler
 
+from api.auth_cookies import clear_auth_cookies, is_secure_request
 from api.templates import render_error_page
 from db.sql.errors import DatabaseUnavailableError
 from domain.errors import (
@@ -178,10 +179,13 @@ async def ui_login_redirect_handler(
         login_url = f'/billing/login?next={quote(target_path, safe="/")}'
     else:
         login_url = '/billing/login'
-    return RedirectResponse(
+    redirect = RedirectResponse(
         url=login_url,
         status_code=status.HTTP_303_SEE_OTHER,
     )
+    # Токен отсутствует, истёк или отозван: нерабочие cookie в браузере не нужны.
+    clear_auth_cookies(redirect, secure=is_secure_request(request))
+    return redirect
 
 
 async def ui_error_screen_handler(
