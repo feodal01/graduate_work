@@ -42,6 +42,8 @@ class SettingsTests(TestCase):
         )
         self.assertEqual(config.BILLING_CLIENT_CONNECT_TIMEOUT_SECONDS, 0.5)
         self.assertEqual(config.BILLING_CLIENT_TIMEOUT_SECONDS, 3.0)
+        self.assertEqual(config.BILLING_PAGINATION_DEFAULT_PAGE_SIZE, 50)
+        self.assertEqual(config.BILLING_PAGINATION_MAX_PAGE_SIZE, 100)
 
     def test_environment_is_typed_and_secrets_are_masked(self):
         environment = {
@@ -63,6 +65,8 @@ class SettingsTests(TestCase):
             'AUTH_INTERNAL_URL': 'http://auth:8000/api/v1/internal',
             'BILLING_CLIENT_CONNECT_TIMEOUT_SECONDS': '0.4',
             'BILLING_CLIENT_TIMEOUT_SECONDS': '4.5',
+            'BILLING_PAGINATION_DEFAULT_PAGE_SIZE': '20',
+            'BILLING_PAGINATION_MAX_PAGE_SIZE': '40',
         }
         with patch.dict(os.environ, environment, clear=True):
             config = Settings(_env_file=None)
@@ -93,6 +97,8 @@ class SettingsTests(TestCase):
         )
         self.assertEqual(config.BILLING_CLIENT_CONNECT_TIMEOUT_SECONDS, 0.4)
         self.assertEqual(config.BILLING_CLIENT_TIMEOUT_SECONDS, 4.5)
+        self.assertEqual(config.BILLING_PAGINATION_DEFAULT_PAGE_SIZE, 20)
+        self.assertEqual(config.BILLING_PAGINATION_MAX_PAGE_SIZE, 40)
         self.assertIsInstance(config.SECRET_KEY, SecretStr)
         self.assertIsInstance(config.POSTGRES_PASSWORD, SecretStr)
         self.assertEqual(config.POSTGRES_PASSWORD.get_secret_value(), 'test-db-password')

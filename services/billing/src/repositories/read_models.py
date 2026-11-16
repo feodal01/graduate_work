@@ -53,13 +53,14 @@ class UserBillingOverviewData:
     payments: list[UserPaymentHistoryItemData]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class InternalSubscriptionFilter:
+    # Размер страницы задаёт вызывающий: значение по умолчанию живёт в настройках.
+    limit: int
     user_id: UUID | None = None
     status: Literal['active', 'expired', 'refunded'] | None = None
     created_from: datetime | None = None
     created_to: datetime | None = None
-    limit: int = 50
     offset: int = 0
 
 
@@ -78,8 +79,10 @@ class InternalSubscriptionItemData:
     created_at: datetime
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class InternalPaymentFilter:
+    # Размер страницы задаёт вызывающий: значение по умолчанию живёт в настройках.
+    limit: int
     status: Literal['pending', 'succeeded', 'failed'] | None = None
     has_refund: bool | None = None
     stuck: bool = False
@@ -88,7 +91,6 @@ class InternalPaymentFilter:
     provider_payment_id: str | None = None
     created_from: datetime | None = None
     created_to: datetime | None = None
-    limit: int = 50
     offset: int = 0
 
 
@@ -158,27 +160,29 @@ class InternalOutboxTaskItemData:
     user_id: UUID | None = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class InternalOutboxFilter:
+    # Размер страницы задаёт вызывающий: значение по умолчанию живёт в настройках.
+    limit: int
     target_service: Literal['auth', 'notifications'] | None = None
     status: Literal['pending', 'requires_intervention'] | None = None
     user_id: UUID | None = None
     payment_id: UUID | None = None
     created_from: datetime | None = None
     created_to: datetime | None = None
-    limit: int = 50
     offset: int = 0
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class InternalAdminActionFilter:
+    # Размер страницы задаёт вызывающий: значение по умолчанию живёт в настройках.
+    limit: int
     admin_user_id: UUID | None = None
     action_type: (
         Literal['refund_requested', 'outbox_retried', 'outbox_closed'] | None
     ) = None
     created_from: datetime | None = None
     created_to: datetime | None = None
-    limit: int = 50
     offset: int = 0
 
 

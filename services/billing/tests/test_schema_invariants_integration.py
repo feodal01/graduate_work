@@ -1182,7 +1182,7 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
         sub_total_act,
         sub_items_act,
     ) = await repos.admin_queries.list_internal_subscriptions(
-        InternalSubscriptionFilter(user_id=user_active, status='active'),
+        InternalSubscriptionFilter(user_id=user_active, status='active', limit=50),
         now_utc=now_utc,
     )
     assert sub_total_act == 1
@@ -1193,7 +1193,7 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
         sub_total_ref,
         sub_items_ref,
     ) = await repos.admin_queries.list_internal_subscriptions(
-        InternalSubscriptionFilter(user_id=user_refunded, status='refunded'),
+        InternalSubscriptionFilter(user_id=user_refunded, status='refunded', limit=50),
         now_utc=now_utc,
     )
     assert sub_total_ref == 1
@@ -1202,7 +1202,7 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
 
     # Проверяем фильтрацию платежей (по provider_payment_id, has_refund и stuck=True)
     pay_total_prov, pay_items_prov = await repos.admin_queries.list_internal_payments(
-        InternalPaymentFilter(provider_payment_id='yk_t26_pg_active'),
+        InternalPaymentFilter(provider_payment_id='yk_t26_pg_active', limit=50),
         now_utc=now_utc,
     )
     assert pay_total_prov == 1
@@ -1210,7 +1210,7 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
     assert pay_items_prov[0].has_refund is False
 
     pay_total_ref, pay_items_ref = await repos.admin_queries.list_internal_payments(
-        InternalPaymentFilter(user_id=user_refunded, has_refund=True),
+        InternalPaymentFilter(user_id=user_refunded, has_refund=True, limit=50),
         now_utc=now_utc,
     )
     assert pay_total_ref == 1
@@ -1218,7 +1218,7 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
     assert pay_items_ref[0].refund_status == 'succeeded'
 
     pay_total_stuck, pay_items_stuck = await repos.admin_queries.list_internal_payments(
-        InternalPaymentFilter(user_id=user_stuck, stuck=True),
+        InternalPaymentFilter(user_id=user_stuck, stuck=True, limit=50),
         stuck_threshold_seconds=600,
         now_utc=now_utc,
     )
@@ -1415,7 +1415,7 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
         await session.commit()
 
     ob_total, ob_items = await repos.outbox_admin.list_internal_outbox_tasks(
-        InternalOutboxFilter(user_id=user_id),
+        InternalOutboxFilter(user_id=user_id, limit=50),
         stuck_threshold_seconds=600,
         now_utc=now_utc,
     )
@@ -1460,7 +1460,7 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
     from repositories.read_models import InternalAdminActionFilter
 
     act_total, act_items = await repos.admin_queries.list_internal_admin_actions(
-        InternalAdminActionFilter(admin_user_id=admin_id)
+        InternalAdminActionFilter(admin_user_id=admin_id, limit=50)
     )
     assert act_total == 4
     assert {a.action_type for a in act_items} == {

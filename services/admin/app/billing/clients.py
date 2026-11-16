@@ -319,7 +319,7 @@ class BillingAdminClient:
         status: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
-        limit: int = 50,
+        limit: int,
         offset: int = 0,
     ) -> BillingSubscriptionsPage:
         params: dict[str, Any] = {'limit': limit, 'offset': offset}
@@ -370,7 +370,7 @@ class BillingAdminClient:
         provider_payment_id: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
-        limit: int = 50,
+        limit: int,
         offset: int = 0,
     ) -> BillingPaymentsPage:
         params: dict[str, Any] = {'limit': limit, 'offset': offset}
@@ -582,7 +582,7 @@ class BillingAdminClient:
         payment_id: UUID | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
-        limit: int = 50,
+        limit: int,
         offset: int = 0,
     ) -> BillingOutboxTasksPage:
         params: dict[str, Any] = {'limit': limit, 'offset': offset}
@@ -748,7 +748,7 @@ class BillingAdminClient:
         action_type: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
-        limit: int = 50,
+        limit: int,
         offset: int = 0,
     ) -> BillingAdminActionsPage:
         params: dict[str, Any] = {'limit': limit, 'offset': offset}

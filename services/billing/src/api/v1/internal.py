@@ -2,10 +2,11 @@ from datetime import UTC, date, datetime, time
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from api.errors import BillingDomainError
+from api.pagination import PaginationParams
 from clients.payment_provider import PaymentProviderError
 from core.config import settings
 from dependencies import (
@@ -260,14 +261,13 @@ def _validate_date_range(
 )
 async def get_internal_subscriptions(
     repo: Annotated[AdminQueries, Depends(get_admin_queries)],
+    page: PaginationParams,
     user_id: UUID | None = None,
     status: Literal['active', 'expired', 'refunded'] | None = None,
     created_from: datetime | None = None,
     created_to: datetime | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
-    limit: Annotated[int, Query(ge=1, le=100)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
 ) -> InternalSubscriptionsListResponse:
     lower = _normalize_bound(created_from, date_from, is_upper=False)
     upper = _normalize_bound(created_to, date_to, is_upper=True)
@@ -279,8 +279,8 @@ async def get_internal_subscriptions(
             status=status,
             created_from=lower,
             created_to=upper,
-            limit=limit,
-            offset=offset,
+            limit=page.limit,
+            offset=page.offset,
         )
     )
     return InternalSubscriptionsListResponse(
@@ -315,6 +315,7 @@ async def get_internal_subscriptions(
 )
 async def get_internal_payments(
     repo: Annotated[AdminQueries, Depends(get_admin_queries)],
+    page: PaginationParams,
     status: Literal['pending', 'succeeded', 'failed'] | None = None,
     has_refund: bool | None = None,
     stuck: bool = False,
@@ -326,8 +327,6 @@ async def get_internal_payments(
     created_to: datetime | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
-    limit: Annotated[int, Query(ge=1, le=100)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
 ) -> InternalPaymentsListResponse:
     lower = _normalize_bound(created_from, date_from, is_upper=False)
     upper = _normalize_bound(created_to, date_to, is_upper=True)
@@ -349,8 +348,8 @@ async def get_internal_payments(
             provider_payment_id=normalized_provider_id,
             created_from=lower,
             created_to=upper,
-            limit=limit,
-            offset=offset,
+            limit=page.limit,
+            offset=page.offset,
         ),
         stuck_threshold_seconds=settings.worker.billing_stuck_threshold_seconds,
     )
@@ -497,6 +496,7 @@ async def get_internal_payment_card(
 )
 async def get_internal_outbox_tasks(
     repo: Annotated[OutboxAdminRepository, Depends(get_outbox_admin_repository)],
+    page: PaginationParams,
     target_service: Literal['auth', 'notifications'] | None = None,
     status: Literal['pending', 'requires_intervention'] | None = None,
     user_id: UUID | None = None,
@@ -505,8 +505,6 @@ async def get_internal_outbox_tasks(
     created_to: datetime | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
-    limit: Annotated[int, Query(ge=1, le=100)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
 ) -> InternalOutboxTasksListResponse:
     lower = _normalize_bound(created_from, date_from, is_upper=False)
     upper = _normalize_bound(created_to, date_to, is_upper=True)
@@ -520,8 +518,8 @@ async def get_internal_outbox_tasks(
             payment_id=payment_id,
             created_from=lower,
             created_to=upper,
-            limit=limit,
-            offset=offset,
+            limit=page.limit,
+            offset=page.offset,
         ),
         stuck_threshold_seconds=settings.worker.billing_stuck_threshold_seconds,
     )
@@ -675,6 +673,7 @@ async def post_internal_outbox_task_close(
 )
 async def get_internal_admin_actions(
     repo: Annotated[AdminQueries, Depends(get_admin_queries)],
+    page: PaginationParams,
     admin_user_id: UUID | None = None,
     action_type: Literal['refund_requested', 'outbox_retried', 'outbox_closed']
     | None = None,
@@ -682,8 +681,6 @@ async def get_internal_admin_actions(
     created_to: datetime | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
-    limit: Annotated[int, Query(ge=1, le=100)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
 ) -> InternalAdminActionsListResponse:
     lower = _normalize_bound(created_from, date_from, is_upper=False)
     upper = _normalize_bound(created_to, date_to, is_upper=True)
@@ -695,8 +692,8 @@ async def get_internal_admin_actions(
             action_type=action_type,
             created_from=lower,
             created_to=upper,
-            limit=limit,
-            offset=offset,
+            limit=page.limit,
+            offset=page.offset,
         )
     )
     return InternalAdminActionsListResponse(

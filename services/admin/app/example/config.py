@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -62,3 +62,16 @@ class Settings(BaseSettings):
         gt=0,
         allow_inf_nan=False,
     )
+    # Те же значения получает billing-api: параметры страницы, допустимые в
+    # админке, допустимы и во внутреннем API Биллинга.
+    BILLING_PAGINATION_DEFAULT_PAGE_SIZE: int = Field(default=50, ge=1)
+    BILLING_PAGINATION_MAX_PAGE_SIZE: int = Field(default=100, ge=1)
+
+    @model_validator(mode='after')
+    def _default_page_size_fits_max(self) -> 'Settings':
+        if self.BILLING_PAGINATION_DEFAULT_PAGE_SIZE > self.BILLING_PAGINATION_MAX_PAGE_SIZE:
+            raise ValueError(
+                'BILLING_PAGINATION_DEFAULT_PAGE_SIZE must not exceed '
+                'BILLING_PAGINATION_MAX_PAGE_SIZE'
+            )
+        return self

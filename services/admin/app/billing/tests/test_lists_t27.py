@@ -359,6 +359,40 @@ class BillingListsT27Tests(TestCase):
         )
         self.assertEqual(bad_pid_pay.status_code, 400)
 
+        # 3b. Недопустимые параметры страницы -> та же ошибка фильтра 400, а не
+        #     молчаливая подмена значения; границы общие с Биллингом.
+        for list_url in (
+            reverse('admin:billing_subscriptions'),
+            reverse('admin:billing_payments'),
+            reverse('admin:billing_admin_actions'),
+        ):
+            for bad_page, message in (
+                ({'limit': '101'}, 'Размер страницы должен быть от 1 до 100'),
+                ({'limit': '0'}, 'Размер страницы должен быть от 1 до 100'),
+                ({'limit': 'abc'}, 'Параметры страницы должны быть целыми числами'),
+                ({'offset': '-1'}, 'Смещение страницы не может быть отрицательным'),
+            ):
+                bad_page_res = self._get(
+                    list_url,
+                    bad_page,
+                    billing_client=bil,
+                    lookup_client=down_lkp,
+                )
+                self.assertContains(bad_page_res, message, status_code=400)
+
+        with self.settings(BILLING_PAGINATION_MAX_PAGE_SIZE=10):
+            over_configured_max = self._get(
+                reverse('admin:billing_subscriptions'),
+                {'limit': '11'},
+                billing_client=bil,
+                lookup_client=down_lkp,
+            )
+        self.assertContains(
+            over_configured_max,
+            'Размер страницы должен быть от 1 до 10',
+            status_code=400,
+        )
+
         # 4. При недоступном Billing возвращается штатная страница 503 (ADM-NFR-R-02)
         bil.fail = True
         res_bil_down_sub = self._get(
@@ -572,11 +606,11 @@ class BillingListsT27Tests(TestCase):
         batch = lkp.get_by_ids([uid], request_id='req-1')
         self.assertIn(uid, batch)
 
-        subs_page = bil.list_subscriptions(request_id='req-1', user_id=uid)
+        subs_page = bil.list_subscriptions(request_id='req-1', limit=50, user_id=uid)
         self.assertEqual(subs_page.total, 1)
         self.assertEqual(subs_page.items[0].id, sid)
 
-        pays_page = bil.list_payments(request_id='req-1', user_id=uid, stuck=True)
+        pays_page = bil.list_payments(request_id='req-1', limit=50, user_id=uid, stuck=True)
         self.assertEqual(pays_page.total, 1)
         self.assertEqual(pays_page.items[0].id, pid)
 
@@ -595,7 +629,7 @@ class BillingListsT27Tests(TestCase):
         with self.assertRaises(AuthLookupUnavailableError):
             lkp_503.find_by_login('lookup_user', request_id='req-1')
         with self.assertRaises(BillingUnavailableError):
-            bil_503.list_subscriptions(request_id='req-1')
+            bil_503.list_subscriptions(request_id='req-1', limit=50)
 
         http_bad_json = httpx.Client(
             transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={'unexpected': 1}))
@@ -606,4 +640,4 @@ class BillingListsT27Tests(TestCase):
             http_client=http_bad_json,
         )
         with self.assertRaises(BillingContractError):
-            bil_bad.list_payments(request_id='req-1')
+            bil_bad.list_payments(request_id='req-1', limit=50)

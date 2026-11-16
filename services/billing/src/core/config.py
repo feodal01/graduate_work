@@ -1,7 +1,7 @@
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import AnyHttpUrl, Field, SecretStr
+from pydantic import AnyHttpUrl, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
@@ -200,6 +200,26 @@ class LogstashSettings(BaseSettings):
     port: int = Field(default=5044, ge=1, le=65535)
 
 
+class PaginationSettings(BaseSettings):
+    """Размер страницы в постраничных списках внутреннего API."""
+
+    model_config = SettingsConfigDict(
+        env_file=_ENV_FILE,
+        env_file_encoding='utf-8',
+        env_prefix='PAGINATION_',
+        extra='ignore',
+    )
+
+    default_page_size: int = Field(default=50, ge=1)
+    max_page_size: int = Field(default=100, ge=1)
+
+    @model_validator(mode='after')
+    def _default_fits_max(self) -> Self:
+        if self.default_page_size > self.max_page_size:
+            raise ValueError('default_page_size must not exceed max_page_size')
+        return self
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         hide_input_in_errors=True,
@@ -217,6 +237,7 @@ class Settings(BaseSettings):
     tracing: TracingSettings
     sentry: SentrySettings = Field(default_factory=SentrySettings)
     logstash: LogstashSettings = Field(default_factory=LogstashSettings)
+    pagination: PaginationSettings = Field(default_factory=PaginationSettings)
 
 
 settings = Settings(

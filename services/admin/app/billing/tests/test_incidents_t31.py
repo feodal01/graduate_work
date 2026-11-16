@@ -246,6 +246,7 @@ class IncidentFiltersT31Tests(TestCase):
         )
         page = client.list_outbox_tasks(
             request_id='req-t31',
+            limit=50,
             user_id=uid,
             target_service='auth',
         )
@@ -262,4 +263,4 @@ class IncidentFiltersT31Tests(TestCase):
             ),
         )
         with self.assertRaises(BillingContractError):
-            bad_client.list_outbox_tasks(request_id='req-bad')
+            bad_client.list_outbox_tasks(request_id='req-bad', limit=50)

@@ -5,6 +5,7 @@ from datetime import date, datetime, timezone
 from uuid import NAMESPACE_DNS, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from django.conf import settings
 from django.contrib import messages
 from django.http import Http404, HttpRequest, HttpResponse
 from django.shortcuts import redirect, render
@@ -58,8 +59,6 @@ ADMIN_ACTION_LABELS: dict[str, str] = {
     'outbox_retried': 'Ручной повтор задачи outbox',
     'outbox_closed': 'Закрытие задачи outbox с причиной',
 }
-
-DEFAULT_PAGE_LIMIT = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,20 +208,31 @@ def _get_admin_user_uuid(request: HttpRequest) -> UUID:
     )
 
 
-def _parse_pagination(request: HttpRequest) -> tuple[int, int]:
+def _parse_pagination(request: HttpRequest) -> tuple[int, int, str | None]:
+    """Параметры страницы и текст ошибки фильтра, если они недопустимы.
+
+    Значение вне границ не подменяется молча: оператор видит ту же ошибку
+    фильтра, что и для дат. Границы общие с Биллингом (те же переменные
+    окружения), поэтому допустимый здесь запрос допустим и там.
+    """
+    default_limit = settings.BILLING_PAGINATION_DEFAULT_PAGE_SIZE
+    max_limit = settings.BILLING_PAGINATION_MAX_PAGE_SIZE
     raw_limit = (request.GET.get('limit') or '').strip()
     raw_offset = (request.GET.get('offset') or '').strip()
     try:
-        limit = int(raw_limit) if raw_limit else DEFAULT_PAGE_LIMIT
-    except ValueError:
-        limit = DEFAULT_PAGE_LIMIT
-    limit = max(1, min(100, limit))
-    try:
+        limit = int(raw_limit) if raw_limit else default_limit
         offset = int(raw_offset) if raw_offset else 0
     except ValueError:
-        offset = 0
-    offset = max(0, offset)
-    return limit, offset
+        return default_limit, 0, 'Параметры страницы должны быть целыми числами'
+    if not 1 <= limit <= max_limit:
+        return (
+            default_limit,
+            0,
+            f'Размер страницы должен быть от 1 до {max_limit}',
+        )
+    if offset < 0:
+        return default_limit, 0, 'Смещение страницы не может быть отрицательным'
+    return limit, offset, None
 
 
 def _validate_date_filters(
@@ -281,12 +291,13 @@ def subscriptions_list(request: HttpRequest) -> HttpResponse:
     status_filter = raw_status if raw_status in SUBSCRIPTION_STATUS_LABELS else None
     raw_date_from = (request.GET.get('date_from') or '').strip()
     raw_date_to = (request.GET.get('date_to') or '').strip()
-    limit, offset = _parse_pagination(request)
+    limit, offset, pagination_error = _parse_pagination(request)
 
     date_from, date_to, filter_error = _validate_date_filters(
         raw_date_from,
         raw_date_to,
     )
+    filter_error = filter_error or pagination_error
     if filter_error is not None:
         return render(
             request,
@@ -422,7 +433,7 @@ def payments_list(request: HttpRequest) -> HttpResponse:
     stuck_param = (request.GET.get('stuck') or '').strip().lower()
     raw_date_from = (request.GET.get('date_from') or '').strip()
     raw_date_to = (request.GET.get('date_to') or '').strip()
-    limit, offset = _parse_pagination(request)
+    limit, offset, pagination_error = _parse_pagination(request)
 
     status_filter: str | None = None
     has_refund: bool | None = None
@@ -460,6 +471,7 @@ def payments_list(request: HttpRequest) -> HttpResponse:
         raw_date_from,
         raw_date_to,
     )
+    filter_error = filter_error or pagination_error
     if filter_error is not None:
         return render(
             request,
@@ -1005,12 +1017,13 @@ def admin_actions_list(request: HttpRequest) -> HttpResponse:
     action_type_filter = raw_action_type if raw_action_type in ADMIN_ACTION_LABELS else None
     raw_date_from = (request.GET.get('date_from') or '').strip()
     raw_date_to = (request.GET.get('date_to') or '').strip()
-    limit, offset = _parse_pagination(request)
+    limit, offset, pagination_error = _parse_pagination(request)
 
     date_from, date_to, filter_error = _validate_date_filters(
         raw_date_from,
         raw_date_to,
     )
+    filter_error = filter_error or pagination_error
     if filter_error is not None:
         return render(
             request,

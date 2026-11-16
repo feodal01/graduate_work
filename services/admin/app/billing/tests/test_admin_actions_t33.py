@@ -227,6 +227,7 @@ class AdminActionsLogT33Tests(TestCase):
         )
         page = client.list_admin_actions(
             request_id='req-t33',
+            limit=50,
             admin_user_id=aid,
             action_type='outbox_closed',
         )
@@ -243,4 +244,4 @@ class AdminActionsLogT33Tests(TestCase):
             ),
         )
         with self.assertRaises(BillingContractError):
-            bad_client.list_admin_actions(request_id='req-bad')
+            bad_client.list_admin_actions(request_id='req-bad', limit=50)
