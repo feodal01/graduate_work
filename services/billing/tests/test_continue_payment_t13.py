@@ -523,3 +523,53 @@ def test_idempotency_key_expiry_accepts_naive_and_aware_times() -> None:
     assert idempotency_key_expired(old_aware, now_utc=now) is True
     assert idempotency_key_expired(fresh_naive, now_utc=now) is False
     assert idempotency_key_expired(old_aware.replace(tzinfo=None), now_utc=now)
+
+
+async def test_get_continue_does_not_start_a_purchase(
+    continue_test_env: tuple[
+        httpx.AsyncClient,
+        FastAPI,
+        InMemoryPurchaseRepository,
+        FakeProviderGateway,
+        ConfigurableAuthGateway,
+        UUID,
+    ],
+) -> None:
+    """Переход по ссылке (GET) не создаёт платёж: «Продолжить» — только POST.
+
+    Регрессия: `GET .../continue` для неудавшегося платежа запускал новую
+    покупку, и предзагрузка ссылки браузером создавала платёж в ЮKassa.
+    """
+    client, _, repo, provider, _, user_id = continue_test_env
+    failed_payment = _seed_payment(repo, user_id=user_id, status='failed')
+
+    resp = await client.get(f'/billing/payments/{failed_payment.id}/continue')
+
+    assert resp.status_code == 405
+    assert len(repo.payments) == 1
+    assert len(provider.create_calls) == 0
+    assert len(provider.get_calls) == 0
+
+
+async def test_cross_site_continue_form_is_rejected(
+    continue_test_env: tuple[
+        httpx.AsyncClient,
+        FastAPI,
+        InMemoryPurchaseRepository,
+        FakeProviderGateway,
+        ConfigurableAuthGateway,
+        UUID,
+    ],
+) -> None:
+    """Форма «Продолжить оплату» с чужого сайта отклоняется и платёж не создаёт."""
+    client, _, repo, provider, _, user_id = continue_test_env
+    failed_payment = _seed_payment(repo, user_id=user_id, status='failed')
+
+    resp = await client.post(
+        f'/billing/payments/{failed_payment.id}/continue',
+        headers={'Origin': 'https://evil.example'},
+    )
+
+    assert resp.status_code == 403
+    assert len(repo.payments) == 1
+    assert len(provider.create_calls) == 0
