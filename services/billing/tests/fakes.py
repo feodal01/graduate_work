@@ -237,6 +237,18 @@ class InMemoryPurchaseRepository:
         sub_ends_at = sub.ends_at if sub is not None else None
         auth_task = self.outbox_tasks.get(f'payment_succeeded:{payment_id}:auth_access')
         auth_delivered = auth_task is not None and auth_task.status == 'completed'
+        refund_statuses = {
+            refund.status
+            for refund in self.refunds.values()
+            if refund.payment_id == payment_id
+        }
+        refund_status: Literal['processing', 'succeeded'] | None = (
+            'succeeded'
+            if 'succeeded' in refund_statuses
+            else 'processing'
+            if 'processing' in refund_statuses
+            else None
+        )
         return LocalPaymentResultData(
             payment_id=payment.id,
             user_id=payment.user_id,
@@ -247,6 +259,7 @@ class InMemoryPurchaseRepository:
             failure_reason=payment.failure_reason,
             subscription_ends_at=sub_ends_at,
             auth_access_delivered=auth_delivered,
+            refund_status=refund_status,
         )
 
     async def get_user_billing_overview(

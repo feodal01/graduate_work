@@ -2046,3 +2046,47 @@ async def test_outbox_outcome_is_recorded_only_by_lease_owner(
     assert task.attempts == 0
     assert task.last_error is None
     assert task.lease_token == new_owner
+
+
+async def test_local_payment_result_reports_refund_state(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """Запрос экрана результата возвращает состояние возврата платежа.
+
+    После возврата задача выдачи доступа остаётся `completed`, а у подписки
+    остаётся дата окончания, поэтому без состояния возврата экран показывал
+    «доступ открыт».
+    """
+    from repositories.bundle import BillingRepositories
+
+    session_factory = migrated_billing_db
+    repos = BillingRepositories.sqlalchemy(session_factory)
+    user_id = uuid4()
+    payment, _ = await repos.payments.get_or_create_pending_payment(user_id)
+    await repos.payments.finalize_payment_succeeded(payment.id, source='webhook')
+
+    before = await repos.user_views.get_local_payment_result_for_user(
+        payment.id, user_id
+    )
+    assert before is not None
+    assert before.refund_status is None
+
+    refund, created = await repos.refunds.get_or_create_processing_refund(
+        payment.id, admin_user_id=uuid4(), reason='Возврат по обращению'
+    )
+    assert created is True
+    processing = await repos.user_views.get_local_payment_result_for_user(
+        payment.id, user_id
+    )
+    assert processing is not None
+    assert processing.refund_status == 'processing'
+
+    await repos.refunds.finalize_refund_succeeded(refund.id, source='webhook')
+    refunded = await repos.user_views.get_local_payment_result_for_user(
+        payment.id, user_id
+    )
+    assert refunded is not None
+    assert refunded.refund_status == 'succeeded'
+    # Именно эти два признака раньше давали «доступ открыт».
+    assert refunded.status == 'succeeded'
+    assert refunded.subscription_ends_at is not None

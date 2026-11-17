@@ -27,6 +27,9 @@ class LocalPaymentResultData:
     failure_reason: str | None
     subscription_ends_at: datetime | None
     auth_access_delivered: bool
+    # Действующий возврат платежа: исходная задача выдачи доступа после него
+    # остаётся выполненной, поэтому открыт ли доступ, по ней одной не понять.
+    refund_status: Literal['processing', 'succeeded'] | None = None
 
 
 @dataclass(frozen=True, slots=True)

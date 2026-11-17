@@ -24,6 +24,7 @@ from tests.fakes import (
     FakeOutboxTaskRow,
     FakePaymentRow,
     FakeProviderGateway,
+    FakeRefundRow,
     FakeSubscriptionRow,
     InMemoryPurchaseRepository,
 )
@@ -410,3 +411,112 @@ async def test_result_screen_edge_cases_technical_reasons_fractional_kopeks_and_
     naive_dt = datetime(2026, 11, 4, 12, 0)
     assert format_user_datetime(naive_dt, 'Invalid/Zone') == '04.11.2026 12:00'
     assert provider.calls == 0
+
+
+def _delivered_subscription(
+    repo: InMemoryPurchaseRepository,
+    payment: FakePaymentRow,
+) -> FakeSubscriptionRow:
+    """Оплаченная подписка, доступ по которой уже доставлен в Auth."""
+    ends_at = datetime(2026, 12, 4, 12, 0, tzinfo=UTC)
+    subscription = FakeSubscriptionRow(
+        id=uuid4(),
+        user_id=payment.user_id,
+        tariff_id=payment.tariff_id,
+        payment_id=payment.id,
+        starts_at=ends_at - timedelta(days=30),
+        ends_at=ends_at,
+    )
+    repo.subscriptions[payment.id] = subscription
+    dedup_key = f'payment_succeeded:{payment.id}:auth_access'
+    repo.outbox_tasks[dedup_key] = FakeOutboxTaskRow(
+        id=uuid4(),
+        dedup_key=dedup_key,
+        target_service='auth',
+        task_type='sync_access',
+        payment_id=payment.id,
+        user_id=payment.user_id,
+        access_version=1,
+        payload={'expires_at': ends_at.isoformat()},
+        status='completed',
+    )
+    return subscription
+
+
+def _refund_row(
+    payment: FakePaymentRow,
+    subscription: FakeSubscriptionRow,
+    *,
+    status: str,
+) -> FakeRefundRow:
+    refund_id = uuid4()
+    return FakeRefundRow(
+        id=refund_id,
+        payment_id=payment.id,
+        subscription_id=subscription.id,
+        provider_code='yookassa',
+        amount_kopeks=payment.amount_kopeks,
+        status=status,
+        reason='Возврат по обращению',
+        admin_user_id=uuid4(),
+        idempotency_key=refund_id,
+    )
+
+
+async def test_result_screen_refunded_payment_does_not_claim_open_access(
+    payment_result_env: tuple[
+        httpx.AsyncClient,
+        FastAPI,
+        InMemoryPurchaseRepository,
+        ForbiddenProviderGateway,
+        ConfigurableAuthGateway,
+        UUID,
+    ],
+) -> None:
+    """После полного возврата экран сообщает о возврате, а не об открытом доступе.
+
+    Регрессия: исходная задача выдачи доступа остаётся `completed`, у подписки
+    остаётся дата окончания, поэтому экран показывал «доступ открыт до …».
+    """
+    client, _, repo, provider, _, user_id = payment_result_env
+    payment = _create_payment_row(repo, user_id=user_id, status='succeeded')
+    subscription = _delivered_subscription(repo, payment)
+    refund = _refund_row(payment, subscription, status='succeeded')
+    repo.refunds[refund.id] = refund
+
+    resp = await client.get(f'/billing/payments/{payment.id}')
+
+    assert resp.status_code == 200
+    body = resp.text
+    assert 'Платёж возвращён, подписка отменена' in body
+    assert 'доступ открыт' not in body
+    assert 'Оплачено, доступ активируется' not in body
+    assert 'meta http-equiv="refresh"' not in body
+    assert 'href="/billing/"' in body
+    assert provider.calls == 0
+
+
+@pytest.mark.parametrize('refund_status', ['processing', 'rejected'])
+async def test_result_screen_keeps_open_access_until_refund_succeeds(
+    payment_result_env: tuple[
+        httpx.AsyncClient,
+        FastAPI,
+        InMemoryPurchaseRepository,
+        ForbiddenProviderGateway,
+        ConfigurableAuthGateway,
+        UUID,
+    ],
+    refund_status: str,
+) -> None:
+    """Возврат в обработке или отклонённый доступ не отзывает: блок прежний."""
+    client, _, repo, _, _, user_id = payment_result_env
+    payment = _create_payment_row(repo, user_id=user_id, status='succeeded')
+    subscription = _delivered_subscription(repo, payment)
+    refund = _refund_row(payment, subscription, status=refund_status)
+    repo.refunds[refund.id] = refund
+
+    resp = await client.get(f'/billing/payments/{payment.id}')
+
+    assert resp.status_code == 200
+    assert 'Оплата прошла, доступ открыт до 04.12.2026 17:00' in resp.text
+    assert 'Платёж возвращён' not in resp.text

@@ -60,6 +60,7 @@ class SQLAlchemyUserBillingViews(SQLAlchemyRepository):
                         Tariff.title,
                         Subscription.ends_at,
                         OutboxTask.status,
+                        Refund.status,
                     )
                     .join(Tariff, Tariff.id == Payment.tariff_id)
                     .outerjoin(
@@ -69,6 +70,15 @@ class SQLAlchemyUserBillingViews(SQLAlchemyRepository):
                     .outerjoin(
                         OutboxTask,
                         OutboxTask.dedup_key == payment_access_task_key(payment_id),
+                    )
+                    # Не больше одной строки: действующий возврат у платежа
+                    # один (инвариант 4, частичный уникальный индекс).
+                    .outerjoin(
+                        Refund,
+                        and_(
+                            Refund.payment_id == Payment.id,
+                            Refund.status.in_(('processing', 'succeeded')),
+                        ),
                     )
                     .where(
                         Payment.id == payment_id,
@@ -89,6 +99,7 @@ class SQLAlchemyUserBillingViews(SQLAlchemyRepository):
                     tariff_title,
                     sub_ends_at,
                     auth_task_status,
+                    refund_status,
                 ) = row
 
                 return LocalPaymentResultData(
@@ -101,6 +112,13 @@ class SQLAlchemyUserBillingViews(SQLAlchemyRepository):
                     failure_reason=failure_reason,
                     subscription_ends_at=sub_ends_at,
                     auth_access_delivered=auth_task_status == 'completed',
+                    refund_status=(
+                        'succeeded'
+                        if refund_status == 'succeeded'
+                        else 'processing'
+                        if refund_status == 'processing'
+                        else None
+                    ),
                 )
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc

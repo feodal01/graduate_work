@@ -13,6 +13,7 @@ ReconcileSource = Literal['webhook', 'reconcile', 'continue', 'admin']
 PaymentResultBlock = Literal[
     'succeeded_ready',
     'succeeded_activating',
+    'refunded',
     'failed',
     'pending',
 ]

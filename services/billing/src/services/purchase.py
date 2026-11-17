@@ -171,6 +171,18 @@ class PurchaseService:
 
         amount_display = format_amount_rubles(local.amount_kopeks)
         if local.status == 'succeeded':
+            # Возврат проверяется первым: после него задача выдачи доступа
+            # остаётся выполненной, а у подписки остаётся дата окончания.
+            if local.refund_status == 'succeeded':
+                return PaymentResultView(
+                    payment_id=local.payment_id,
+                    tariff_title=local.tariff_title,
+                    amount_display=amount_display,
+                    block='refunded',
+                    subscription_ends_display=None,
+                    failure_reason_display=None,
+                    auto_refresh_seconds=None,
+                )
             if local.auth_access_delivered and local.subscription_ends_at is not None:
                 return PaymentResultView(
                     payment_id=local.payment_id,
