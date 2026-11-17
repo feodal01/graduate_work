@@ -12,7 +12,7 @@
   - внутреннее API для `Django Admin` (`/api/v1/internal/billing/*`, защищено заголовком `X-Service-Api-Key`).
 - `billing-worker` — фоновый процесс с корректным завершением по `SIGTERM`/`SIGINT`:
   - активная сверка незавершённых платежей (`pending`) и возвратов (`processing`) через `GET` в ЮKassa (`SELECT ... FOR UPDATE SKIP LOCKED`);
-  - доставка задач из транзакционного outbox (`outbox_tasks`) в `Auth` и `Notifications` с экспоненциальным backoff и переводом в `requires_intervention` при постоянных ошибках;
+  - доставка задач из транзакционного outbox (`outbox_tasks`) в `Auth` и `Notifications` с экспоненциальным backoff и переводом в `requires_intervention` при постоянных ошибках. На время сетевого вызова задача закрепляется арендой (`lease_token`, `lease_until`, срок `BILLING_OUTBOX_LEASE_SECONDS`), транзакция БД при этом не удерживается;
   - мониторинг зависших операций и проблемных задач доставки (`OperationalMonitor`, сигналы в `GlitchTip` и `ERROR`-лог).
 - `billing-migrate` — одноразовый контейнер применения миграций Alembic к `billing-db` (`PostgreSQL 16`, `synchronous_commit = on`).
 

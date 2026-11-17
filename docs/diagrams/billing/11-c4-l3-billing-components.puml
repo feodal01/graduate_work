@@ -68,7 +68,7 @@ Rel_D(reconciler_svc, yookassa_client, "Чтение статуса (GET), до�
 Rel_D(reconciler_svc, repos, "Атомарная фиксация итога и задач outbox")
 Rel_D(reconciler_svc, glitchtip, "Сигналы об аномалиях ответа ЮKassa")
 
-Rel_D(outbox_dispatcher, repos, "Выборка задач SKIP LOCKED и смена статуса")
+Rel_D(outbox_dispatcher, repos, "Аренда задачи (SKIP LOCKED) и запись исхода")
 Rel_D(outbox_dispatcher, internal_clients, "Доставка доступа и писем")
 Rel_D(outbox_dispatcher, glitchtip, "Сигнал «Требует вмешательства»")
 

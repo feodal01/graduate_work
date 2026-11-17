@@ -17,7 +17,11 @@ from clients.notifications import (
 )
 from core.observability import correlation_request_id
 from db.sql.errors import DatabaseUnavailableError
-from repositories.outbox import DeliveryOutcome, OutboxRepository
+from repositories.outbox import (
+    DEFAULT_OUTBOX_LEASE_SECONDS,
+    DeliveryOutcome,
+    OutboxRepository,
+)
 from repositories.records import OutboxTaskRecordProtocol
 
 __all__ = [
@@ -49,11 +53,13 @@ class OutboxDispatcher:
         auth_gateway: AuthGateway,
         notifications_gateway: NotificationsGateway | None = None,
         max_attempts: int = 20,
+        lease_seconds: float = DEFAULT_OUTBOX_LEASE_SECONDS,
     ) -> None:
         self._repo = repository
         self._auth = auth_gateway
         self._notifications = notifications_gateway
         self._max_attempts = max_attempts
+        self._lease_seconds = lease_seconds
 
     @property
     def _enabled_target_services(self) -> tuple[str, ...]:
@@ -70,6 +76,7 @@ class OutboxDispatcher:
                 payment_id=payment_id,
                 limit=5,
                 max_attempts=self._max_attempts,
+                lease_seconds=self._lease_seconds,
             )
         except DatabaseUnavailableError as exc:
             # Ожидаемый сбой: задачу доставит фоновый воркер (BIL-NFR-R-04).
@@ -97,6 +104,7 @@ class OutboxDispatcher:
                 task_id=task_id,
                 limit=1,
                 max_attempts=self._max_attempts,
+                lease_seconds=self._lease_seconds,
             )
         except DatabaseUnavailableError as exc:
             # Ожидаемый сбой: задачу доставит фоновый воркер (BIL-NFR-R-04).
@@ -128,6 +136,7 @@ class OutboxDispatcher:
             payment_id=None,
             limit=limit,
             max_attempts=self._max_attempts,
+            lease_seconds=self._lease_seconds,
             should_stop=should_stop,
         )
 

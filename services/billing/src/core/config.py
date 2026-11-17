@@ -160,6 +160,9 @@ class WorkerSettings(BaseSettings):
     reconcile_min_age_seconds: float = Field(default=5.0, ge=0)
     billing_outbox_interval_seconds: float = Field(default=2.0, gt=0)
     billing_outbox_max_attempts: int = Field(default=20, ge=1)
+    # На сколько задача outbox закрепляется за обработчиком, пока он ждёт
+    # ответ Auth или Notifications. Должно быть больше тайм-аутов этих клиентов.
+    billing_outbox_lease_seconds: float = Field(default=60.0, gt=0)
     billing_stuck_threshold_seconds: int = Field(default=600, ge=1)
 
 

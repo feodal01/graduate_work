@@ -4,8 +4,8 @@ import sys
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
-from uuid import uuid4
+from typing import TYPE_CHECKING, Any
+from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
@@ -1872,3 +1872,177 @@ async def test_tariff_row_drives_new_payments_and_texts_in_postgres(
     with pytest.raises(DependencyUnavailableError) as exc_info:
         await repos.payments.get_or_create_pending_payment(uuid4())
     assert exc_info.value.error_code == 'tariff_unavailable'
+
+
+async def _paid_payment_with_access_task(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> tuple['BillingRepositories', UUID]:
+    from repositories.bundle import BillingRepositories
+
+    repos = BillingRepositories.sqlalchemy(session_factory)
+    payment, _ = await repos.payments.get_or_create_pending_payment(uuid4())
+    await repos.payments.finalize_payment_succeeded(payment.id, source='webhook')
+    return repos, payment.id
+
+
+async def _access_task(
+    session_factory: async_sessionmaker[AsyncSession], payment_id: UUID
+) -> OutboxTask:
+    async with session_factory() as session:
+        task = await session.scalar(
+            select(OutboxTask).where(
+                OutboxTask.payment_id == payment_id,
+                OutboxTask.task_type == 'sync_access',
+            )
+        )
+    assert task is not None
+    return task
+
+
+async def test_outbox_delivery_runs_without_open_db_transaction(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """Во время сетевого вызова транзакция закрыта, а задача закреплена арендой.
+
+    Регрессия: обработчик блокировал строку задачи, шёл в Auth/Notifications
+    и только потом делал commit. Соединение висело `idle in transaction` всё
+    время ожидания ответа, и медленный получатель мог исчерпать пул.
+    """
+    from repositories.outbox import DeliveryOutcome
+    from repositories.records import OutboxTaskRecordProtocol
+
+    session_factory = migrated_billing_db
+    repos, payment_id = await _paid_payment_with_access_task(session_factory)
+    observed: dict[str, Any] = {}
+
+    async def unreachable(
+        _: OutboxTaskRecordProtocol,
+    ) -> tuple[DeliveryOutcome, str | None]:
+        raise AssertionError('leased task must not be delivered twice')
+
+    async def deliver(
+        _: OutboxTaskRecordProtocol,
+    ) -> tuple[DeliveryOutcome, str | None]:
+        async with session_factory() as session:
+            observed['idle_in_transaction'] = await session.scalar(
+                text(
+                    'SELECT count(*) FROM pg_stat_activity '
+                    'WHERE datname = current_database() '
+                    "AND state = 'idle in transaction'"
+                )
+            )
+        leased = await _access_task(session_factory, payment_id)
+        observed['lease_token'] = leased.lease_token
+        observed['lease_until'] = leased.lease_until
+        observed['second_handler'] = await repos.outbox.process_due_auth_outbox_tasks(
+            unreachable, payment_id=payment_id
+        )
+        return 'completed', None
+
+    processed = await repos.outbox.process_due_auth_outbox_tasks(
+        deliver, payment_id=payment_id, lease_seconds=30
+    )
+
+    assert processed == 1
+    assert observed['idle_in_transaction'] == 0
+    assert observed['lease_token'] is not None
+    assert observed['lease_until'] > datetime.now(UTC) + timedelta(seconds=20)
+    assert observed['second_handler'] == 0
+    done = await _access_task(session_factory, payment_id)
+    assert done.status == 'completed'
+    assert (done.lease_token, done.lease_until) == (None, None)
+
+
+async def test_outbox_task_is_redelivered_with_same_keys_after_handler_dies(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """Обработчик погиб после отправки: задача уходит повторно с теми же ключами."""
+    from repositories.outbox import DeliveryOutcome
+    from repositories.records import OutboxTaskRecordProtocol
+
+    class _HandlerKilled(BaseException):
+        """Процесс остановлен после отправки запроса, до записи исхода."""
+
+    session_factory = migrated_billing_db
+    repos, payment_id = await _paid_payment_with_access_task(session_factory)
+    sent: list[tuple[int | None, dict[str, Any]]] = []
+
+    async def deliver_then_die(
+        task: OutboxTaskRecordProtocol,
+    ) -> tuple[DeliveryOutcome, str | None]:
+        sent.append((task.access_version, dict(task.payload)))
+        raise _HandlerKilled
+
+    async def deliver_ok(
+        task: OutboxTaskRecordProtocol,
+    ) -> tuple[DeliveryOutcome, str | None]:
+        sent.append((task.access_version, dict(task.payload)))
+        return 'completed', None
+
+    with pytest.raises(_HandlerKilled):
+        await repos.outbox.process_due_auth_outbox_tasks(
+            deliver_then_die, payment_id=payment_id
+        )
+
+    # Аренда ещё действует: исход неизвестен, задачу никто не берёт.
+    orphaned = await _access_task(session_factory, payment_id)
+    assert orphaned.status == 'pending'
+    assert orphaned.attempts == 0
+    assert orphaned.lease_token is not None
+    assert (
+        await repos.outbox.process_due_auth_outbox_tasks(
+            deliver_ok, payment_id=payment_id
+        )
+        == 0
+    )
+
+    # Срок аренды истёк: задачу забирает другой обработчик.
+    async with session_factory() as session:
+        row = await session.get(OutboxTask, orphaned.id)
+        assert row is not None
+        row.lease_until = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+    assert (
+        await repos.outbox.process_due_auth_outbox_tasks(
+            deliver_ok, payment_id=payment_id
+        )
+        == 1
+    )
+
+    assert len(sent) == 2
+    assert sent[0] == sent[1]
+    assert (await _access_task(session_factory, payment_id)).status == 'completed'
+
+
+async def test_outbox_outcome_is_recorded_only_by_lease_owner(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """Исход от обработчика, потерявшего аренду, в задачу не записывается."""
+    from repositories.outbox import DeliveryOutcome
+    from repositories.records import OutboxTaskRecordProtocol
+
+    session_factory = migrated_billing_db
+    repos, payment_id = await _paid_payment_with_access_task(session_factory)
+    new_owner = uuid4()
+
+    async def deliver_too_late(
+        task: OutboxTaskRecordProtocol,
+    ) -> tuple[DeliveryOutcome, str | None]:
+        # Пока первый обработчик ждал ответа, задачу забрал другой.
+        async with session_factory() as session:
+            row = await session.get(OutboxTask, task.id)
+            assert row is not None
+            row.lease_token = new_owner
+            await session.commit()
+        return 'permanent_error', 'late answer of the first handler'
+
+    processed = await repos.outbox.process_due_auth_outbox_tasks(
+        deliver_too_late, payment_id=payment_id
+    )
+
+    assert processed == 0
+    task = await _access_task(session_factory, payment_id)
+    assert task.status == 'pending'
+    assert task.attempts == 0
+    assert task.last_error is None
+    assert task.lease_token == new_owner

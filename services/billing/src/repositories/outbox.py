@@ -1,8 +1,9 @@
 import logging
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import sentry_sdk
 from sqlalchemy import and_, case, func, or_, select
@@ -29,6 +30,35 @@ logger = logging.getLogger(__name__)
 
 
 DeliveryOutcome = Literal['completed', 'transient_error', 'permanent_error']
+
+
+# Срок аренды задачи на время доставки. Должен быть заметно больше тайм-аутов
+# клиентов Auth и Notifications: иначе задачу заберёт второй обработчик, пока
+# первый ещё ждёт ответа.
+DEFAULT_OUTBOX_LEASE_SECONDS = 60.0
+
+
+@dataclass(slots=True)
+class ClaimedOutboxTask:
+    """Снимок задачи, закреплённой за обработчиком на время доставки.
+
+    Доставка идёт уже без сессии БД, поэтому обработчик получает копию полей,
+    а не ORM-объект. `lease_token` подтверждает владельца при записи исхода.
+    """
+
+    id: UUID
+    dedup_key: str
+    target_service: str
+    task_type: str
+    payment_id: UUID
+    user_id: UUID
+    access_version: int | None
+    payload: dict[str, Any]
+    status: str
+    attempts: int
+    last_error: str | None
+    next_retry_at: datetime
+    lease_token: UUID
 
 
 OutboxDeliverFn = Callable[
@@ -99,6 +129,7 @@ class OutboxRepository(Protocol):
         task_id: UUID | None = None,
         limit: int = 20,
         max_attempts: int = 20,
+        lease_seconds: float = DEFAULT_OUTBOX_LEASE_SECONDS,
         should_stop: Callable[[], bool] | None = None,
     ) -> int: ...
 
@@ -109,6 +140,7 @@ class OutboxRepository(Protocol):
         payment_id: UUID | None = None,
         limit: int = 20,
         max_attempts: int = 20,
+        lease_seconds: float = DEFAULT_OUTBOX_LEASE_SECONDS,
         should_stop: Callable[[], bool] | None = None,
     ) -> int: ...
 
@@ -160,9 +192,17 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
         task_id: UUID | None = None,
         limit: int = 20,
         max_attempts: int = 20,
+        lease_seconds: float = DEFAULT_OUTBOX_LEASE_SECONDS,
         should_stop: Callable[[], bool] | None = None,
     ) -> int:
-        """Выбирает и обрабатывает задачи outbox под SKIP LOCKED (T-19, BIL-FR-11)."""
+        """Доставляет готовые задачи outbox (T-19, BIL-FR-11).
+
+        Сетевой вызов идёт без соединения с БД. Задача сначала закрепляется за
+        обработчиком короткой транзакцией (аренда до `lease_until`), а исход
+        доставки записывает вторая короткая транзакция с проверкой владельца.
+        Если обработчик завершится между ними, аренда истечёт и задачу
+        доставят повторно с теми же ключами из `payload` и `access_version`.
+        """
         if not target_services:
             return 0
         processed = 0
@@ -170,115 +210,201 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
             for _ in range(limit):
                 if should_stop is not None and should_stop():
                     break
-                async with self._session_factory() as session:
-                    now_utc = datetime.now(UTC)
-                    stmt = (
-                        select(OutboxTask)
-                        .where(
-                            OutboxTask.target_service.in_(tuple(target_services)),
-                            OutboxTask.status == 'pending',
-                            OutboxTask.next_retry_at <= now_utc,
-                        )
-                        .order_by(
-                            OutboxTask.next_retry_at.asc(),
-                            OutboxTask.created_at.asc(),
-                        )
-                        .limit(1)
-                        .with_for_update(skip_locked=True)
+                claim = await self._claim_next_outbox_task(
+                    target_services=target_services,
+                    payment_id=payment_id,
+                    task_id=task_id,
+                    lease_seconds=lease_seconds,
+                )
+                if claim is None:
+                    break
+                if claim == 'superseded':
+                    processed += 1
+                    continue
+
+                try:
+                    outcome, error_msg = await deliver_fn(claim)
+                except Exception as exc:
+                    logger.exception(
+                        'Unexpected error delivering outbox task %s',
+                        claim.id,
                     )
-                    if payment_id is not None:
-                        stmt = stmt.where(OutboxTask.payment_id == payment_id)
-                    if task_id is not None:
-                        stmt = stmt.where(OutboxTask.id == task_id)
+                    outcome = 'transient_error'
+                    error_msg = f'Unexpected delivery error: {exc}'
 
-                    task = await session.scalar(stmt)
-                    if task is None:
-                        break
-
-                    # US-S-02 шаг 3: если уже доставлена более новая версия,
-                    # закрываем устаревшую задачу без вызова Auth.
-                    if (
-                        task.target_service == 'auth'
-                        and task.access_version is not None
-                    ):
-                        max_delivered = await session.scalar(
-                            select(func.max(OutboxTask.access_version)).where(
-                                OutboxTask.user_id == task.user_id,
-                                OutboxTask.target_service == 'auth',
-                                OutboxTask.status == 'completed',
-                            )
-                        )
-                        if (
-                            max_delivered is not None
-                            and int(max_delivered) >= task.access_version
-                        ):
-                            task.status = 'completed'
-                            task.last_error = None
-                            task.updated_at = now_utc
-                            await session.commit()
-                            processed += 1
-                            continue
-
-                    try:
-                        outcome, error_msg = await deliver_fn(
-                            task  # pyright: ignore[reportArgumentType]  # Mapped[T]
-                        )
-                    except Exception as exc:
-                        logger.exception(
-                            'Unexpected error delivering outbox task %s',
-                            task.id,
-                        )
-                        outcome = 'transient_error'
-                        error_msg = f'Unexpected delivery error: {exc}'
-
-                    now_after = datetime.now(UTC)
-                    alert_msg: str | None = None
-                    if outcome == 'completed':
-                        task.status = 'completed'
-                        task.last_error = None
-                        task.updated_at = now_after
-                    elif outcome == 'permanent_error':
-                        task.attempts += 1
-                        task.status = 'requires_intervention'
-                        task.last_error = error_msg
-                        task.updated_at = now_after
-                        alert_msg = (
-                            f'Outbox task {task.id} requires intervention '
-                            f'(permanent error): {error_msg}'
-                        )
-                    else:
-                        task.attempts += 1
-                        task.last_error = error_msg
-                        task.updated_at = now_after
-                        transition, alert = transient_failure_transition(
-                            task.task_type, task.attempts, max_attempts
-                        )
-                        if transition == 'requires_intervention':
-                            task.status = 'requires_intervention'
-                            alert_msg = (
-                                f'Outbox task {task.id} exhausted {max_attempts} '
-                                f'attempts and requires intervention: {error_msg}'
-                            )
-                        else:
-                            backoff_sec = compute_outbox_backoff_seconds(task.attempts)
-                            task.next_retry_at = now_after + timedelta(
-                                seconds=backoff_sec
-                            )
-                            if alert:
-                                alert_msg = (
-                                    f'Outbox task {task.id} ({task.task_type}) failed '
-                                    f'{max_attempts} attempts and keeps retrying '
-                                    f'until delivered: {error_msg}'
-                                )
-                    await session.commit()
-                    if alert_msg is not None:
-                        with correlation_request_id(f'outbox-{task.id}'):
-                            logger.error(alert_msg)
-                            sentry_sdk.capture_message(alert_msg, level='error')
+                if await self._record_delivery_outcome(
+                    claim,
+                    outcome=outcome,
+                    error_msg=error_msg,
+                    max_attempts=max_attempts,
+                ):
                     processed += 1
             return processed
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
+
+    async def _claim_next_outbox_task(
+        self,
+        *,
+        target_services: Sequence[str],
+        payment_id: UUID | None,
+        task_id: UUID | None,
+        lease_seconds: float,
+    ) -> 'ClaimedOutboxTask | Literal["superseded"] | None':
+        """Короткая транзакция: закрепляет за обработчиком одну готовую задачу.
+
+        Возвращает снимок задачи с номером аренды, `'superseded'`, если задача
+        закрыта без вызова получателя, или `None`, если готовых задач нет.
+        """
+        async with self._session_factory() as session:
+            now_utc = datetime.now(UTC)
+            stmt = (
+                select(OutboxTask)
+                .where(
+                    OutboxTask.target_service.in_(tuple(target_services)),
+                    OutboxTask.status == 'pending',
+                    OutboxTask.next_retry_at <= now_utc,
+                    # Задачу с действующей арендой сейчас доставляет другой
+                    # обработчик; истёкшая аренда — обработчик не дописал исход.
+                    or_(
+                        OutboxTask.lease_until.is_(None),
+                        OutboxTask.lease_until <= now_utc,
+                    ),
+                )
+                .order_by(
+                    OutboxTask.next_retry_at.asc(),
+                    OutboxTask.created_at.asc(),
+                )
+                .limit(1)
+                .with_for_update(skip_locked=True)
+            )
+            if payment_id is not None:
+                stmt = stmt.where(OutboxTask.payment_id == payment_id)
+            if task_id is not None:
+                stmt = stmt.where(OutboxTask.id == task_id)
+
+            task = await session.scalar(stmt)
+            if task is None:
+                return None
+
+            # US-S-02 шаг 3: если уже доставлена более новая версия,
+            # закрываем устаревшую задачу без вызова Auth.
+            if task.target_service == 'auth' and task.access_version is not None:
+                max_delivered = await session.scalar(
+                    select(func.max(OutboxTask.access_version)).where(
+                        OutboxTask.user_id == task.user_id,
+                        OutboxTask.target_service == 'auth',
+                        OutboxTask.status == 'completed',
+                    )
+                )
+                if (
+                    max_delivered is not None
+                    and int(max_delivered) >= task.access_version
+                ):
+                    task.status = 'completed'
+                    task.last_error = None
+                    task.lease_token = None
+                    task.lease_until = None
+                    task.updated_at = now_utc
+                    await session.commit()
+                    return 'superseded'
+
+            lease_token = uuid4()
+            task.lease_token = lease_token
+            task.lease_until = now_utc + timedelta(seconds=lease_seconds)
+            claimed = ClaimedOutboxTask(
+                id=task.id,
+                dedup_key=task.dedup_key,
+                target_service=task.target_service,
+                task_type=task.task_type,
+                payment_id=task.payment_id,
+                user_id=task.user_id,
+                access_version=task.access_version,
+                payload=dict(task.payload),
+                status=task.status,
+                attempts=task.attempts,
+                last_error=task.last_error,
+                next_retry_at=task.next_retry_at,
+                lease_token=lease_token,
+            )
+            await session.commit()
+            return claimed
+
+    async def _record_delivery_outcome(
+        self,
+        claimed: 'ClaimedOutboxTask',
+        *,
+        outcome: DeliveryOutcome,
+        error_msg: str | None,
+        max_attempts: int,
+    ) -> bool:
+        """Короткая транзакция: записывает исход доставки, если аренда ещё наша.
+
+        Возвращает `False`, когда задачу уже забрал другой обработчик (аренда
+        истекла) или её закрыл администратор: чужой исход не перезаписывается.
+        """
+        async with self._session_factory() as session:
+            task = await session.scalar(
+                select(OutboxTask)
+                .where(
+                    OutboxTask.id == claimed.id,
+                    OutboxTask.lease_token == claimed.lease_token,
+                    OutboxTask.status == 'pending',
+                )
+                .with_for_update()
+            )
+            if task is None:
+                logger.warning(
+                    'Outbox task %s is no longer leased by this handler; '
+                    'delivery outcome %s is not recorded',
+                    claimed.id,
+                    outcome,
+                )
+                return False
+
+            now_after = datetime.now(UTC)
+            alert_msg: str | None = None
+            task.lease_token = None
+            task.lease_until = None
+            task.updated_at = now_after
+            if outcome == 'completed':
+                task.status = 'completed'
+                task.last_error = None
+            elif outcome == 'permanent_error':
+                task.attempts += 1
+                task.status = 'requires_intervention'
+                task.last_error = error_msg
+                alert_msg = (
+                    f'Outbox task {task.id} requires intervention '
+                    f'(permanent error): {error_msg}'
+                )
+            else:
+                task.attempts += 1
+                task.last_error = error_msg
+                transition, alert = transient_failure_transition(
+                    task.task_type, task.attempts, max_attempts
+                )
+                if transition == 'requires_intervention':
+                    task.status = 'requires_intervention'
+                    alert_msg = (
+                        f'Outbox task {task.id} exhausted {max_attempts} '
+                        f'attempts and requires intervention: {error_msg}'
+                    )
+                else:
+                    backoff_sec = compute_outbox_backoff_seconds(task.attempts)
+                    task.next_retry_at = now_after + timedelta(seconds=backoff_sec)
+                    if alert:
+                        alert_msg = (
+                            f'Outbox task {task.id} ({task.task_type}) failed '
+                            f'{max_attempts} attempts and keeps retrying '
+                            f'until delivered: {error_msg}'
+                        )
+            await session.commit()
+        if alert_msg is not None:
+            with correlation_request_id(f'outbox-{claimed.id}'):
+                logger.error(alert_msg)
+                sentry_sdk.capture_message(alert_msg, level='error')
+        return True
 
     async def process_due_auth_outbox_tasks(
         self,
@@ -287,6 +413,7 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
         payment_id: UUID | None = None,
         limit: int = 20,
         max_attempts: int = 20,
+        lease_seconds: float = DEFAULT_OUTBOX_LEASE_SECONDS,
         should_stop: Callable[[], bool] | None = None,
     ) -> int:
         """Выбирает и обрабатывает задачи Auth под SKIP LOCKED (BIL-FR-11)."""
@@ -296,6 +423,7 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
             payment_id=payment_id,
             limit=limit,
             max_attempts=max_attempts,
+            lease_seconds=lease_seconds,
             should_stop=should_stop,
         )
 

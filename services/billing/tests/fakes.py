@@ -139,6 +139,8 @@ class FakeOutboxTaskRow:
     next_retry_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    lease_token: UUID | None = None
+    lease_until: datetime | None = None
 
 
 class InMemoryPurchaseRepository:
@@ -672,6 +674,7 @@ class InMemoryPurchaseRepository:
         task_id: UUID | None = None,
         limit: int = 20,
         max_attempts: int = 20,
+        lease_seconds: float = 60.0,
         should_stop: Callable[[], bool] | None = None,
     ) -> int:
         """Обрабатывает готовые задачи outbox в in-memory репозитории (T-19)."""
@@ -694,6 +697,7 @@ class InMemoryPurchaseRepository:
                 if task.target_service in target_services
                 and task.status == 'pending'
                 and task.next_retry_at <= now_utc
+                and (task.lease_until is None or task.lease_until <= now_utc)
                 and (payment_id is None or task.payment_id == payment_id)
                 and (task_id is None or task.id == task_id)
             ],
@@ -720,6 +724,12 @@ class InMemoryPurchaseRepository:
                     processed += 1
                     continue
 
+            # Как в SQL-репозитории: задача закрепляется арендой, сеть идёт
+            # без «транзакции», исход пишет только владелец аренды.
+            lease_token = uuid4()
+            task.lease_token = lease_token
+            task.lease_until = datetime.now(UTC) + timedelta(seconds=lease_seconds)
+
             outcome: DeliveryOutcome
             try:
                 outcome, error_msg = await deliver_fn(task)
@@ -730,6 +740,17 @@ class InMemoryPurchaseRepository:
                 )
                 outcome = 'transient_error'
                 error_msg = f'Unexpected delivery error: {exc}'
+
+            if task.lease_token != lease_token or task.status != 'pending':
+                logger.warning(
+                    'Outbox task %s is no longer leased by this handler; '
+                    'delivery outcome %s is not recorded',
+                    task.id,
+                    outcome,
+                )
+                continue
+            task.lease_token = None
+            task.lease_until = None
 
             now_after = datetime.now(UTC)
             alert_msg: str | None = None
@@ -779,6 +800,7 @@ class InMemoryPurchaseRepository:
         payment_id: UUID | None = None,
         limit: int = 20,
         max_attempts: int = 20,
+        lease_seconds: float = 60.0,
         should_stop: Callable[[], bool] | None = None,
     ) -> int:
         """Обрабатывает готовые задачи Auth в in-memory репозитории."""
@@ -788,6 +810,7 @@ class InMemoryPurchaseRepository:
             payment_id=payment_id,
             limit=limit,
             max_attempts=max_attempts,
+            lease_seconds=lease_seconds,
             should_stop=should_stop,
         )
 

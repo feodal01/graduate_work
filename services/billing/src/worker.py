@@ -176,6 +176,7 @@ async def main() -> None:
         auth_gateway=auth_gateway,
         notifications_gateway=notifications_gateway,
         max_attempts=settings.worker.billing_outbox_max_attempts,
+        lease_seconds=settings.worker.billing_outbox_lease_seconds,
     )
     reconciler = PaymentReconciler(
         payments=repos.payments,

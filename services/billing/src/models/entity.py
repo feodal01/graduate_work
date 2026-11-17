@@ -413,6 +413,10 @@ class OutboxTask(Base):
             name='ck_outbox_tasks_status',
         ),
         CheckConstraint('attempts >= 0', name='ck_outbox_tasks_attempts'),
+        CheckConstraint(
+            '(lease_token IS NULL) = (lease_until IS NULL)',
+            name='ck_outbox_tasks_lease',
+        ),
         Index('ix_outbox_tasks_status_next_retry_at', 'status', 'next_retry_at'),
         Index(
             'ix_outbox_tasks_pending_poll',
@@ -460,6 +464,14 @@ class OutboxTask(Base):
         default=_utc_now,
         server_default=now(),
         nullable=False,
+    )
+    # Аренда на время доставки: обработчик закрепляет задачу за собой короткой
+    # транзакцией и идёт в сеть уже без соединения с БД. Результат запишет
+    # только владелец `lease_token`; после `lease_until` задачу может взять другой.
+    lease_token: Mapped[UUID | None] = mapped_column(Uuid, nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

@@ -135,6 +135,8 @@ package "2 — Доставка в Auth и Notifications (Outbox и версии
         * attempts : INTEGER (default 0)
         last_error : TEXT NULL
         * next_retry_at : TIMESTAMPTZ
+        lease_token : UUID NULL
+        lease_until : TIMESTAMPTZ NULL
         * created_at : TIMESTAMPTZ
         * updated_at : TIMESTAMPTZ
     }

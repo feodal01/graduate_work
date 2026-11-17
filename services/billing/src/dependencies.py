@@ -114,6 +114,7 @@ async def get_outbox_dispatcher(
         auth_gateway=auth_gateway,
         notifications_gateway=notifications_gateway,
         max_attempts=settings.worker.billing_outbox_max_attempts,
+        lease_seconds=settings.worker.billing_outbox_lease_seconds,
     )
 
 
