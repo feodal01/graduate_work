@@ -129,6 +129,7 @@ class PaymentProviderGateway(Protocol):
         provider_refund_id: str,
         *,
         expected_refund_id: UUID | None = None,
+        expected_provider_payment_id: str | None = None,
         expected_amount_kopeks: int | None = None,
         expected_currency: str | None = None,
     ) -> ProviderRefundSnapshot: ...
@@ -306,6 +307,7 @@ class YooKassaProviderAdapter:
         return self._to_refund_snapshot(
             data,
             expected_refund_id=request.refund_id,
+            expected_provider_payment_id=safe_pay_id,
             expected_amount_kopeks=request.amount_kopeks,
             expected_currency=request.currency,
         )
@@ -315,6 +317,7 @@ class YooKassaProviderAdapter:
         provider_refund_id: str,
         *,
         expected_refund_id: UUID | None = None,
+        expected_provider_payment_id: str | None = None,
         expected_amount_kopeks: int | None = None,
         expected_currency: str | None = None,
     ) -> ProviderRefundSnapshot:
@@ -327,6 +330,7 @@ class YooKassaProviderAdapter:
         snapshot = self._to_refund_snapshot(
             data,
             expected_refund_id=expected_refund_id,
+            expected_provider_payment_id=expected_provider_payment_id,
             expected_amount_kopeks=expected_amount_kopeks,
             expected_currency=expected_currency,
         )
@@ -366,6 +370,7 @@ class YooKassaProviderAdapter:
                 return self._to_refund_snapshot(
                     item,
                     expected_refund_id=refund_id,
+                    expected_provider_payment_id=safe_pay_id,
                     expected_amount_kopeks=expected_amount_kopeks,
                     expected_currency=expected_currency,
                 )
@@ -573,6 +578,7 @@ class YooKassaProviderAdapter:
         data: dict[str, Any],
         *,
         expected_refund_id: UUID | None,
+        expected_provider_payment_id: str | None,
         expected_amount_kopeks: int | None,
         expected_currency: str | None,
     ) -> ProviderRefundSnapshot:
@@ -629,6 +635,18 @@ class YooKassaProviderAdapter:
         provider_payment_id: str | None = None
         if data.get('payment_id') is not None:
             provider_payment_id = str(data['payment_id']).strip() or None
+        # Доступ отзывается по нашей записи платежа, поэтому возврат обязан
+        # относиться к тому же платежу ЮKassa. Ответ без `payment_id` — тоже
+        # расхождение: подтвердить исходный платёж нечем.
+        if (
+            expected_provider_payment_id is not None
+            and provider_payment_id != expected_provider_payment_id.strip()
+        ):
+            _raise_integrity_mismatch(
+                f'Refund payment_id mismatch for {provider_refund_id}: '
+                f'expected {expected_provider_payment_id!r}, '
+                f'got {provider_payment_id!r}'
+            )
 
         rejection_reason: str | None = None
         cancellation_obj = data.get('cancellation_details')

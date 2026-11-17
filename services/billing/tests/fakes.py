@@ -1803,6 +1803,7 @@ class FakeProviderGateway:
         self.next_provider_num: int = 1
         self.create_refund_calls: list[CreateProviderRefundRequest] = []
         self.get_refund_calls: list[str] = []
+        self.get_refund_expected_payment_ids: list[str | None] = []
         self.create_refund_error: Exception | None = None
         self.get_refund_error: Exception | None = None
         self.find_refund_error: Exception | None = None
@@ -1892,17 +1893,19 @@ class FakeProviderGateway:
         provider_refund_id: str,
         *,
         expected_refund_id: UUID | None = None,
+        expected_provider_payment_id: str | None = None,
         expected_amount_kopeks: int | None = None,
         expected_currency: str | None = None,
     ) -> ProviderRefundSnapshot:
         """Эмулирует чтение статуса возврата в ЮKassa (T-29)."""
         self.get_refund_calls.append(provider_refund_id)
+        self.get_refund_expected_payment_ids.append(expected_provider_payment_id)
         if self.get_refund_error is not None:
             raise self.get_refund_error
         return ProviderRefundSnapshot(
             provider_code='yookassa',
             provider_refund_id=provider_refund_id,
-            provider_payment_id='yk-pay-1',
+            provider_payment_id=expected_provider_payment_id or 'yk-pay-1',
             domain_status=self.next_get_refund_status,  # type: ignore[arg-type]
             amount_kopeks=expected_amount_kopeks or 29_900,
             currency=expected_currency or 'RUB',

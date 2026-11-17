@@ -5,12 +5,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol
 from uuid import UUID
 
+import sentry_sdk
 from opentelemetry import trace
 
 from clients.payment_provider import (
     CreateProviderPaymentRequest,
     CreateProviderRefundRequest,
     PaymentProviderError,
+    ProviderIntegrityMismatchError,
     ProviderPermanentError,
 )
 from clients.payment_provider_registry import PaymentProviderRegistry
@@ -746,9 +748,22 @@ class PaymentReconciler:
                 throttled=True,
             )
 
+        payment = await self._payments.get_payment(refund.payment_id)
+        if payment is None or not payment.provider_payment_id:
+            # Возврат уже создан в ЮKassa, а номера исходного платежа у нас
+            # нет: сверить возврат не с чем, оставляем его на сверке.
+            message = (
+                f'Refund {refund.id} has provider refund id but payment '
+                f'{refund.payment_id} has no provider payment id'
+            )
+            logger.error(message)
+            sentry_sdk.capture_message(message, level='error')
+            raise ProviderIntegrityMismatchError(message)
+
         snapshot = await self._providers.get(refund.provider_code).get_refund(
             refund.provider_refund_id,
             expected_refund_id=refund.id,
+            expected_provider_payment_id=payment.provider_payment_id,
             expected_amount_kopeks=refund.amount_kopeks,
             expected_currency=refund.currency.strip(),
         )
