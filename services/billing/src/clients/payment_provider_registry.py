@@ -113,6 +113,8 @@ def build_payment_provider_registry(
         shop_id=settings.yookassa.shop_id,
         secret_key=settings.yookassa.secret_key.get_secret_value(),
         base_url=str(settings.yookassa.api_base_url),
+        refund_list_page_size=settings.yookassa.refund_list_page_size,
+        refund_list_max_pages=settings.yookassa.refund_list_max_pages,
     )
     return PaymentProviderRegistry(
         {yookassa.provider_code: yookassa},

@@ -121,6 +121,11 @@ class YooKassaSettings(BaseSettings):
     )
     api_base_url: AnyHttpUrl = AnyHttpUrl('https://api.yookassa.ru/v3')
     timeout_seconds: float = Field(default=5.0, gt=0, le=5.0)
+    # Розыск возврата по `metadata` (инвариант 14) читает список возвратов
+    # платежа страницами. ЮKassa отдаёт не больше 100 записей за запрос.
+    refund_list_page_size: int = Field(default=100, ge=1, le=100)
+    # Сколько страниц просматривать, прежде чем признать обход незавершённым.
+    refund_list_max_pages: int = Field(default=10, ge=1, le=1000)
 
 
 class PaymentProvidersSettings(BaseSettings):

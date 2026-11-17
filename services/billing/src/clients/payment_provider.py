@@ -14,10 +14,6 @@ logger = logging.getLogger(__name__)
 DomainPaymentStatus = Literal['pending', 'succeeded', 'failed']
 DomainRefundStatus = Literal['processing', 'succeeded', 'rejected']
 _SAFE_PROVIDER_ID_RE = re.compile(r'^[A-Za-z0-9._-]{1,128}$')
-# Список ЮKassa отдаётся страницами: не больше 100 записей за запрос.
-_REFUND_LIST_PAGE_SIZE = 100
-# Предел обхода: 10 страниц по 100 записей, то есть 1000 возвратов платежа.
-_REFUND_LIST_MAX_PAGES = 10
 
 
 class PaymentProviderError(Exception):
@@ -208,10 +204,15 @@ class YooKassaProviderAdapter:
         shop_id: str,
         secret_key: str,
         base_url: str = 'https://api.yookassa.ru/v3',
+        refund_list_page_size: int = 100,
+        refund_list_max_pages: int = 10,
     ) -> None:
         self._http = http_client
         self._auth = httpx.BasicAuth(username=shop_id, password=secret_key)
         self._base_url = base_url.rstrip('/')
+        # Размер страницы и предел обхода списка возвратов (инвариант 14).
+        self._refund_list_page_size = refund_list_page_size
+        self._refund_list_max_pages = refund_list_max_pages
 
     async def create_payment(
         self,
@@ -363,10 +364,10 @@ class YooKassaProviderAdapter:
         target_id = str(refund_id)
         seen_cursors: set[str] = set()
         cursor: str | None = None
-        for _ in range(_REFUND_LIST_MAX_PAGES):
+        for _ in range(self._refund_list_max_pages):
             query: dict[str, str | int] = {
                 'payment_id': safe_pay_id,
-                'limit': _REFUND_LIST_PAGE_SIZE,
+                'limit': self._refund_list_page_size,
             }
             if cursor is not None:
                 query['cursor'] = cursor
@@ -409,7 +410,7 @@ class YooKassaProviderAdapter:
             cursor = next_cursor
         _raise_protocol_anomaly(
             f'Refund list for {safe_pay_id} exceeds '
-            f'{_REFUND_LIST_MAX_PAGES} pages; search is incomplete'
+            f'{self._refund_list_max_pages} pages; search is incomplete'
         )
         return None
 

@@ -7,12 +7,17 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from clients.payment_provider import (
     ProviderProtocolAnomalyError,
     YooKassaProviderAdapter,
 )
-from clients.payment_provider_registry import PaymentProviderRegistry
+from clients.payment_provider_registry import (
+    PaymentProviderRegistry,
+    build_payment_provider_registry,
+)
+from core.config import PaymentProvidersSettings, YooKassaSettings
 from services.reconciler import PaymentReconciler
 from tests.fakes import (
     FakePaymentRow,
@@ -52,6 +57,8 @@ def _adapter(
     queries: list[dict[str, str]],
     *,
     refund_id: UUID | None = None,
+    page_size: int = 100,
+    max_pages: int = 10,
 ) -> YooKassaProviderAdapter:
     """Адаптер поверх подставной ЮKassa; `queries` копит параметры списка."""
 
@@ -70,6 +77,8 @@ def _adapter(
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         shop_id='shop-1',
         secret_key='secret-1',
+        refund_list_page_size=page_size,
+        refund_list_max_pages=max_pages,
     )
 
 
@@ -141,6 +150,53 @@ async def test_unfinished_listing_is_an_error_not_absence(
     with pytest.raises(ProviderProtocolAnomalyError):
         await adapter.find_refund_by_metadata(PAYMENT, refund_id=uuid4())
     assert len(queries) == expected_requests
+
+
+async def test_page_size_and_page_cap_come_from_adapter_settings() -> None:
+    """Размер страницы и предел обхода берутся из параметров адаптера."""
+    queries: list[dict[str, str]] = []
+
+    def page_for_cursor(cursor: str | None) -> Page:
+        return {'type': 'list', 'items': [], 'next_cursor': f'after-{cursor}'}
+
+    adapter = _adapter(
+        page_for_cursor,
+        queries,
+        page_size=25,
+        max_pages=3,
+    )
+
+    with pytest.raises(ProviderProtocolAnomalyError, match='exceeds 3 pages'):
+        await adapter.find_refund_by_metadata(PAYMENT, refund_id=uuid4())
+    assert [query['limit'] for query in queries] == ['25', '25', '25']
+
+
+async def test_registry_passes_refund_list_settings_to_adapter() -> None:
+    """Настройки `YOOKASSA_REFUND_LIST_*` доходят до адаптера ЮKassa."""
+    registry = build_payment_provider_registry(
+        PaymentProvidersSettings(
+            yookassa=YooKassaSettings(refund_list_page_size=50, refund_list_max_pages=4)
+        )
+    )
+    try:
+        adapter = registry.get('yookassa')
+        assert isinstance(adapter, YooKassaProviderAdapter)
+        assert adapter._refund_list_page_size == 50
+        assert adapter._refund_list_max_pages == 4
+    finally:
+        await registry.aclose()
+
+
+@pytest.mark.parametrize(
+    ('page_size', 'max_pages'),
+    [(101, 10), (0, 10), (100, 0)],
+)
+def test_refund_list_settings_are_validated(page_size: int, max_pages: int) -> None:
+    """ЮKassa отдаёт до 100 записей за запрос; пустой обход не допускается."""
+    with pytest.raises(ValidationError):
+        YooKassaSettings(
+            refund_list_page_size=page_size, refund_list_max_pages=max_pages
+        )
 
 
 def _reconciler_with_lost_refund(
