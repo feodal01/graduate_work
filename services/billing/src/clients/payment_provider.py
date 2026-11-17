@@ -3,7 +3,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal, Inexact, InvalidOperation
 from typing import Any, Literal, Protocol
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from uuid import UUID
 
 import httpx
@@ -14,6 +14,10 @@ logger = logging.getLogger(__name__)
 DomainPaymentStatus = Literal['pending', 'succeeded', 'failed']
 DomainRefundStatus = Literal['processing', 'succeeded', 'rejected']
 _SAFE_PROVIDER_ID_RE = re.compile(r'^[A-Za-z0-9._-]{1,128}$')
+# Список ЮKassa отдаётся страницами: не больше 100 записей за запрос.
+_REFUND_LIST_PAGE_SIZE = 100
+# Предел обхода: 10 страниц по 100 записей, то есть 1000 возвратов платежа.
+_REFUND_LIST_MAX_PAGES = 10
 
 
 class PaymentProviderError(Exception):
@@ -349,31 +353,64 @@ class YooKassaProviderAdapter:
         expected_amount_kopeks: int | None = None,
         expected_currency: str | None = None,
     ) -> ProviderRefundSnapshot | None:
+        """Ищет возврат платежа по нашему номеру попытки в `metadata`.
+
+        `None` означает, что список просмотрен до последней страницы и возврата
+        в нём нет: по этому ответу попытка получает окончательный отказ. Поэтому
+        незавершённый обход — ошибка, а не «не найдено».
+        """
         safe_pay_id = validate_provider_operation_id(provider_payment_id)
-        data = await self._request(
-            'GET',
-            f'/refunds?payment_id={safe_pay_id}',
-            is_creation=False,
-        )
-        items = data.get('items')
-        if not isinstance(items, list):
-            _raise_protocol_anomaly('Missing items list in YooKassa GET /refunds')
-        assert isinstance(items, list)
         target_id = str(refund_id)
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            meta = item.get('metadata')
-            if isinstance(meta, dict) and str(meta.get('refund_id') or '').strip() == (
-                target_id
-            ):
-                return self._to_refund_snapshot(
-                    item,
-                    expected_refund_id=refund_id,
-                    expected_provider_payment_id=safe_pay_id,
-                    expected_amount_kopeks=expected_amount_kopeks,
-                    expected_currency=expected_currency,
+        seen_cursors: set[str] = set()
+        cursor: str | None = None
+        for _ in range(_REFUND_LIST_MAX_PAGES):
+            query: dict[str, str | int] = {
+                'payment_id': safe_pay_id,
+                'limit': _REFUND_LIST_PAGE_SIZE,
+            }
+            if cursor is not None:
+                query['cursor'] = cursor
+            data = await self._request(
+                'GET',
+                f'/refunds?{urlencode(query)}',
+                is_creation=False,
+            )
+            items = data.get('items')
+            if not isinstance(items, list):
+                _raise_protocol_anomaly('Missing items list in YooKassa GET /refunds')
+            assert isinstance(items, list)
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                meta = item.get('metadata')
+                if (
+                    isinstance(meta, dict)
+                    and str(meta.get('refund_id') or '').strip() == target_id
+                ):
+                    return self._to_refund_snapshot(
+                        item,
+                        expected_refund_id=refund_id,
+                        expected_provider_payment_id=safe_pay_id,
+                        expected_amount_kopeks=expected_amount_kopeks,
+                        expected_currency=expected_currency,
+                    )
+            next_cursor = data.get('next_cursor')
+            if next_cursor is None:
+                # Последняя страница: ЮKassa не прислала `next_cursor`.
+                return None
+            if not isinstance(next_cursor, str) or not next_cursor.strip():
+                _raise_protocol_anomaly('Invalid next_cursor in YooKassa GET /refunds')
+            assert isinstance(next_cursor, str)
+            if next_cursor in seen_cursors:
+                _raise_protocol_anomaly(
+                    f'Repeated next_cursor in YooKassa GET /refunds for {safe_pay_id}'
                 )
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        _raise_protocol_anomaly(
+            f'Refund list for {safe_pay_id} exceeds '
+            f'{_REFUND_LIST_MAX_PAGES} pages; search is incomplete'
+        )
         return None
 
     async def _request(
