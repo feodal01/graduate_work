@@ -554,3 +554,65 @@ async def test_immediate_dispatch_logs_code_defects_with_traceback(
     assert len(records) == 2
     assert {r.levelno for r in records} == {level}
     assert all((r.exc_info is not None) is has_traceback for r in records)
+
+
+@pytest.mark.asyncio
+async def test_permanent_cancellation_error_requires_intervention_at_once() -> None:
+    """Постоянный отказ на отмену письма сразу уходит в «Требует вмешательства».
+
+    Регрессия: `NotificationsPermanentError` из `cancel_campaign` не ловился и
+    доходил до общего обработчика очереди, который считает любое исключение
+    временным. Отмена — бессрочная задача, поэтому она повторялась вечно.
+    """
+    repo = InMemoryPurchaseRepository()
+    notifications = FakeNotificationsGateway()
+    notifications.permanent_error = NotificationsPermanentError(
+        422, 'Validation error in campaign cancel'
+    )
+    dispatcher = OutboxDispatcher(
+        repository=repo,
+        auth_gateway=ConfigurableAuthGateway(user_id=uuid4()),
+        notifications_gateway=notifications,
+        max_attempts=20,
+    )
+    task = _notification_task('cancel_expiration_email', attempts=0)
+    repo.outbox_tasks[task.dedup_key] = task
+
+    assert await dispatcher.process_due_tasks() == 1
+
+    assert task.status == 'requires_intervention'
+    assert task.attempts == 1
+    assert task.last_error == (
+        'Notifications returned 422: Validation error in campaign cancel'
+    )
+    # Задача больше не выбирается на повтор.
+    task.next_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+    assert await dispatcher.process_due_tasks() == 0
+
+
+@pytest.mark.asyncio
+async def test_transient_cancellation_error_is_not_reported_as_defect(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Временный сбой отмены — ожидаемый повтор, а не «непредвиденная ошибка»."""
+    repo = InMemoryPurchaseRepository()
+    notifications = FakeNotificationsGateway()
+    notifications.transient_error = NotificationsTransientError(
+        'Notifications returned 503'
+    )
+    dispatcher = OutboxDispatcher(
+        repository=repo,
+        auth_gateway=ConfigurableAuthGateway(user_id=uuid4()),
+        notifications_gateway=notifications,
+        max_attempts=20,
+    )
+    task = _notification_task('cancel_expiration_email', attempts=0)
+    repo.outbox_tasks[task.dedup_key] = task
+
+    with caplog.at_level(logging.WARNING):
+        assert await dispatcher.process_due_tasks() == 1
+
+    assert task.status == 'pending'
+    assert task.attempts == 1
+    assert task.last_error == 'Notifications returned 503'
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]

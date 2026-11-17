@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from uuid import UUID
 
@@ -221,11 +221,13 @@ class OutboxDispatcher:
             campaign_id = UUID(raw_campaign_id)
 
             if task.task_type == 'cancel_expiration_email':
-                await self._notifications.cancel_campaign(
-                    campaign_id,
-                    request_id=request_id,
+                return await self._call_notifications(
+                    task,
+                    self._notifications.cancel_campaign(
+                        campaign_id,
+                        request_id=request_id,
+                    ),
                 )
-                return 'completed', None
 
             if task.task_type not in _EMAIL_BATCH_TASK_TYPES:
                 return (
@@ -272,8 +274,9 @@ class OutboxDispatcher:
         except (ValueError, TypeError) as exc:
             return 'permanent_error', f'Malformed notifications payload: {exc}'
 
-        try:
-            await self._notifications.send_campaign_batch(
+        return await self._call_notifications(
+            task,
+            self._notifications.send_campaign_batch(
                 campaign_id=campaign_id,
                 batch_id=batch_id,
                 user_id=task.user_id,
@@ -282,7 +285,22 @@ class OutboxDispatcher:
                 text=text,
                 available_at=available_at,
                 request_id=request_id,
-            )
+            ),
+        )
+
+    @staticmethod
+    async def _call_notifications(
+        task: OutboxTaskRecordProtocol,
+        call: Awaitable[None],
+    ) -> tuple[DeliveryOutcome, str | None]:
+        """Выполняет запрос к Notifications и переводит его ошибки в исход задачи.
+
+        Через этот метод идут и отправка письма, и отмена: постоянный отказ
+        сразу даёт «Требует вмешательства», временный — повтор. Исключение,
+        ушедшее мимо, очередь сочла бы временным сбоем и повторяла бы задачу.
+        """
+        try:
+            await call
             return 'completed', None
         except NotificationsPermanentError as exc:
             return 'permanent_error', str(exc)
