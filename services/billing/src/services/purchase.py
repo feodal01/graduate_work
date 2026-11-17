@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from uuid import UUID
 
 from clients.payment_provider import (
@@ -160,6 +161,7 @@ class PurchaseService:
         payment_id: UUID,
         user_id: UUID,
         user_tz: str,
+        now_utc: datetime | None = None,
     ) -> PaymentResultView:
         """Читает только локальный статус из БД для Э3 без ЮKassa (BIL-FR-04)."""
         local = await self._views.get_local_payment_result_for_user(payment_id, user_id)
@@ -180,6 +182,25 @@ class PurchaseService:
                     amount_display=amount_display,
                     block='refunded',
                     subscription_ends_display=None,
+                    failure_reason_display=None,
+                    auto_refresh_seconds=None,
+                )
+            # Срок подписки сверяется с моментом показа: по старой ссылке из
+            # письма экран не должен обещать доступ, который уже закончился.
+            now = now_utc if now_utc is not None else datetime.now(UTC)
+            if (
+                local.subscription_ends_at is not None
+                and local.subscription_ends_at <= now
+            ):
+                return PaymentResultView(
+                    payment_id=local.payment_id,
+                    tariff_title=local.tariff_title,
+                    amount_display=amount_display,
+                    block='succeeded_ended',
+                    subscription_ends_display=format_user_datetime(
+                        local.subscription_ends_at,
+                        user_tz,
+                    ),
                     failure_reason_display=None,
                     auto_refresh_seconds=None,
                 )

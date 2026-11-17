@@ -16,6 +16,11 @@
 <div class="alert-success" role="status">
     <strong>Оплата прошла, доступ открыт до {{ view.subscription_ends_display }}</strong>
 </div>
+{% elif view.block == 'succeeded_ended' %}
+<div class="alert-info" role="status">
+    <strong>Оплата прошла, подписка завершена {{ view.subscription_ends_display }}</strong>
+    <p style="margin: 8px 0 0 0;">Срок этой подписки истёк. Оформить новую можно на экране «Моя подписка».</p>
+</div>
 {% elif view.block == 'refunded' %}
 <div class="alert-info" role="status">
     <strong>Платёж возвращён, подписка отменена</strong>

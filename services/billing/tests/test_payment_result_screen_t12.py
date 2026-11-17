@@ -183,8 +183,8 @@ async def test_result_screen_succeeded_and_delivered_shows_date_in_user_tz(
     """BIL-FR-04, BIL-NFR-U-01, NFR-U-03: блок «Оплата прошла…» в поясе пользователя."""
     client, _, repo, provider, _, user_id = payment_result_env
     payment = _create_payment_row(repo, user_id=user_id, status='succeeded')
-    starts_at = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
-    ends_at = datetime(2026, 12, 4, 12, 0, tzinfo=UTC)
+    starts_at = datetime(2099, 11, 4, 12, 0, tzinfo=UTC)
+    ends_at = datetime(2099, 12, 4, 12, 0, tzinfo=UTC)
     sub_id = uuid4()
     repo.subscriptions[payment.id] = FakeSubscriptionRow(
         id=sub_id,
@@ -211,7 +211,7 @@ async def test_result_screen_succeeded_and_delivered_shows_date_in_user_tz(
     assert resp.status_code == 200
     body = resp.text
     # 12:00 UTC -> 17:00 в Asia/Yekaterinburg (UTC+5)
-    assert 'Оплата прошла, доступ открыт до 04.12.2026 17:00' in body
+    assert 'Оплата прошла, доступ открыт до 04.12.2099 17:00' in body
     assert 'meta http-equiv="refresh"' not in body
     assert 'Оплачено, доступ активируется' not in body
     assert 'Оплата не прошла' not in body
@@ -416,9 +416,10 @@ async def test_result_screen_edge_cases_technical_reasons_fractional_kopeks_and_
 def _delivered_subscription(
     repo: InMemoryPurchaseRepository,
     payment: FakePaymentRow,
+    *,
+    ends_at: datetime = datetime(2099, 12, 4, 12, 0, tzinfo=UTC),
 ) -> FakeSubscriptionRow:
     """Оплаченная подписка, доступ по которой уже доставлен в Auth."""
-    ends_at = datetime(2026, 12, 4, 12, 0, tzinfo=UTC)
     subscription = FakeSubscriptionRow(
         id=uuid4(),
         user_id=payment.user_id,
@@ -518,5 +519,77 @@ async def test_result_screen_keeps_open_access_until_refund_succeeds(
     resp = await client.get(f'/billing/payments/{payment.id}')
 
     assert resp.status_code == 200
-    assert 'Оплата прошла, доступ открыт до 04.12.2026 17:00' in resp.text
+    assert 'Оплата прошла, доступ открыт до 04.12.2099 17:00' in resp.text
     assert 'Платёж возвращён' not in resp.text
+
+
+async def test_result_screen_ended_subscription_does_not_claim_open_access(
+    payment_result_env: tuple[
+        httpx.AsyncClient,
+        FastAPI,
+        InMemoryPurchaseRepository,
+        ForbiddenProviderGateway,
+        ConfigurableAuthGateway,
+        UUID,
+    ],
+) -> None:
+    """Подписка закончилась: экран сообщает о завершении, а не об открытом доступе.
+
+    Регрессия: по старой ссылке экран писал «доступ открыт до …» с датой
+    в прошлом.
+    """
+    client, _, repo, provider, _, user_id = payment_result_env
+    payment = _create_payment_row(repo, user_id=user_id, status='succeeded')
+    _delivered_subscription(
+        repo, payment, ends_at=datetime(2026, 10, 4, 12, 0, tzinfo=UTC)
+    )
+
+    resp = await client.get(f'/billing/payments/{payment.id}')
+
+    assert resp.status_code == 200
+    body = resp.text
+    # 12:00 UTC -> 17:00 в Asia/Yekaterinburg (UTC+5)
+    assert 'Оплата прошла, подписка завершена 04.10.2026 17:00' in body
+    assert 'доступ открыт' not in body
+    assert 'Оплачено, доступ активируется' not in body
+    assert 'meta http-equiv="refresh"' not in body
+    assert 'href="/billing/"' in body
+    assert provider.calls == 0
+
+
+async def test_result_view_block_follows_subscription_end_moment(
+    payment_result_env: tuple[
+        httpx.AsyncClient,
+        FastAPI,
+        InMemoryPurchaseRepository,
+        ForbiddenProviderGateway,
+        ConfigurableAuthGateway,
+        UUID,
+    ],
+) -> None:
+    """Блок меняется ровно в момент окончания подписки; возврат важнее срока."""
+    _, app, repo, _, _, user_id = payment_result_env
+    service: PurchaseService = app.dependency_overrides[get_purchase_service]()
+    payment = _create_payment_row(repo, user_id=user_id, status='succeeded')
+    ends_at = datetime(2026, 10, 4, 12, 0, tzinfo=UTC)
+    subscription = _delivered_subscription(repo, payment, ends_at=ends_at)
+
+    async def block_at(moment: datetime) -> str:
+        view = await service.get_payment_result_view(
+            payment_id=payment.id,
+            user_id=user_id,
+            user_tz='UTC',
+            now_utc=moment,
+        )
+        return view.block
+
+    assert await block_at(ends_at - timedelta(seconds=1)) == 'succeeded_ready'
+    assert await block_at(ends_at) == 'succeeded_ended'
+
+    # Доступ не успел доставиться, а срок уже вышел: «активируется» не показываем.
+    repo.outbox_tasks[f'payment_succeeded:{payment.id}:auth_access'].status = 'pending'
+    assert await block_at(ends_at + timedelta(days=1)) == 'succeeded_ended'
+
+    refund = _refund_row(payment, subscription, status='succeeded')
+    repo.refunds[refund.id] = refund
+    assert await block_at(ends_at + timedelta(days=1)) == 'refunded'
