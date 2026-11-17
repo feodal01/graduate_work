@@ -23,7 +23,8 @@ def test_all_paginated_lists_share_one_definition() -> None:
     """Все постраничные списки берут `limit` и `offset` из общей зависимости."""
     by_path = _pagination_parameters()
 
-    assert len(by_path) == 4
+    # Четыре списка внутреннего API, JSON-сводка и экран «Моя подписка».
+    assert len(by_path) == 6
     for path, params in by_path.items():
         assert params['limit']['schema'] == {
             'type': 'integer',

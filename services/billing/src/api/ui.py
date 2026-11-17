@@ -14,6 +14,7 @@ from api.auth_cookies import (
     set_auth_cookies,
 )
 from api.errors import BillingDomainError, UIErrorScreenException
+from api.pagination import PaginationParams
 from api.templates import render_error_page, templates
 from clients.auth import (
     AuthGateway,
@@ -130,11 +131,14 @@ async def get_my_subscription_page(
     request: Request,
     user: Annotated[AuthenticatedUser, Depends(require_ui_user)],
     purchase_service: Annotated[PurchaseService, Depends(get_purchase_service)],
+    page: PaginationParams,
 ) -> HTMLResponse:
-    """Экран «Моя подписка» Э2: статус и история (BIL-FR-09, BIL-API-02)."""
+    """Экран «Моя подписка» Э2: статус и страница истории (BIL-FR-09, BIL-API-02)."""
     view = await purchase_service.get_my_subscription_view(
         user_id=user.user_id,
         user_tz=user.tz,
+        limit=page.limit,
+        offset=page.offset,
     )
     return templates.TemplateResponse(
         request=request,

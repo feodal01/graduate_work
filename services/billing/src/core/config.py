@@ -209,7 +209,7 @@ class LogstashSettings(BaseSettings):
 
 
 class PaginationSettings(BaseSettings):
-    """Размер страницы в постраничных списках внутреннего API."""
+    """Размер страницы в постраничных списках: внутреннее API и история платежей."""
 
     model_config = SettingsConfigDict(
         env_file=_ENV_FILE,

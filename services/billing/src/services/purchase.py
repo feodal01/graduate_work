@@ -82,7 +82,27 @@ class MySubscriptionView:
     action_url: str | None
     can_subscribe: bool
     subscription_ends_display: str | None
+    # Одна страница истории платежей.
     payments: list[MySubscriptionPaymentRowView]
+    payments_total: int
+    limit: int
+    offset: int
+
+    @property
+    def previous_offset(self) -> int | None:
+        """Смещение предыдущей страницы истории или `None` на первой."""
+        if self.offset <= 0:
+            return None
+        if self.offset >= self.payments_total:
+            # Смещение за концом истории: возвращаем на последнюю страницу.
+            return max(0, (self.payments_total - 1) // self.limit * self.limit)
+        return max(0, self.offset - self.limit)
+
+    @property
+    def next_offset(self) -> int | None:
+        """Смещение следующей страницы истории или `None` на последней."""
+        following = self.offset + self.limit
+        return following if following < self.payments_total else None
 
 
 class PurchaseService:
@@ -253,9 +273,15 @@ class PurchaseService:
         *,
         user_id: UUID,
         user_tz: str,
+        limit: int,
+        offset: int,
     ) -> MySubscriptionView:
-        """Возвращает статус по 7 правилам US-U-05 и историю платежей (BIL-FR-09)."""
-        overview = await self._views.get_user_billing_overview(user_id)
+        """Возвращает статус по 7 правилам US-U-05 и страницу истории (BIL-FR-09)."""
+        overview = await self._views.get_user_billing_overview(
+            user_id,
+            limit=limit,
+            offset=offset,
+        )
         tariff_price_display = (
             format_amount_rubles(overview.tariff_price_kopeks)
             if overview.tariff_price_kopeks is not None
@@ -301,6 +327,9 @@ class PurchaseService:
             can_subscribe=summary.can_subscribe,
             subscription_ends_display=summary.subscription_ends_display,
             payments=rows,
+            payments_total=overview.payments_total,
+            limit=limit,
+            offset=offset,
         )
 
     async def _verify_existing_pending_and_resolve(

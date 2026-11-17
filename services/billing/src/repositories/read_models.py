@@ -53,7 +53,9 @@ class UserBillingOverviewData:
     latest_subscription_auth_delivered: bool
     # None — активного тарифа нет, покупка недоступна.
     tariff_price_kopeks: int | None
+    # Одна страница истории и общее число платежей пользователя.
     payments: list[UserPaymentHistoryItemData]
+    payments_total: int
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

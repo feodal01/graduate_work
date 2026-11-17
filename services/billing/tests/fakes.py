@@ -265,6 +265,9 @@ class InMemoryPurchaseRepository:
     async def get_user_billing_overview(
         self,
         user_id: UUID,
+        *,
+        limit: int,
+        offset: int,
     ) -> UserBillingOverviewData:
         """Читает сводные данные для экрана Э2 «Моя подписка» (T-23)."""
         if self.db_unavailable:
@@ -298,11 +301,11 @@ class InMemoryPurchaseRepository:
             key=lambda p: p.created_at,
             reverse=True,
         )
-        pending_pid: UUID | None = None
+        pending_pid: UUID | None = next(
+            (p.id for p in user_payments if p.status == 'pending'), None
+        )
         history: list[UserPaymentHistoryItemData] = []
-        for p in user_payments:
-            if p.status == 'pending' and pending_pid is None:
-                pending_pid = p.id
+        for p in user_payments[offset : offset + limit]:
             active_refund: Literal['processing', 'succeeded'] | None = None
             for refund in self.refunds.values():
                 if refund.payment_id == p.id and refund.status in (
@@ -335,6 +338,7 @@ class InMemoryPurchaseRepository:
                 self.tariff.price_kopeks if self.tariff_active else None
             ),
             payments=history,
+            payments_total=len(user_payments),
         )
 
     async def get_payment_by_provider_id(

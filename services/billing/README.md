@@ -41,7 +41,7 @@ docker compose ps
 | `GET /billing/payments/{payment_id}` | Экран «Результат оплаты» (`Э3`, читает только локальную БД, `BIL-API-04`) |
 | `POST /billing/payments/{payment_id}/continue` | Продолжение незавершённой оплаты с проверкой статуса в ЮKassa не чаще 1 раза в 5 с (`BIL-API-04`) |
 | `POST /api/v1/billing/payments` | Создание или возврат существующего `pending`-платежа в JSON (`BIL-API-03`) |
-| `GET /api/v1/billing/me/summary` | JSON-сводка статуса подписки (по 7 правилам `US-U-05`) и истории платежей (`BIL-API-02`) |
+| `GET /api/v1/billing/me/summary` | JSON-сводка статуса подписки (по 7 правилам `US-U-05`) и страница истории платежей: `limit`, `offset`, в ответе `payments_total` (`BIL-API-02`) |
 | `POST /api/v1/billing/webhooks/yookassa` | Приём уведомлений ЮKassa (из тела берётся только `object.id`, `BIL-API-05`) |
 | `GET /billing/health` (внутри контейнера `GET /api/v1/health/`) | Проверка здоровья `billing-api` и `billing-db` (`GW-API-01`, `BIL-API-15`) |
 | `GET /billing/docs`, `GET /billing/openapi.json` | Swagger UI и OpenAPI JSON сервиса Billing |

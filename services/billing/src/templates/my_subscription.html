@@ -55,7 +55,22 @@
         {% endfor %}
     </tbody>
 </table>
+{% elif view.payments_total %}
+<p style="color: #64748b;">На этой странице платежей нет.</p>
 {% else %}
 <p style="color: #64748b;">Платежей пока не было.</p>
+{% endif %}
+{% if view.previous_offset is not none or view.next_offset is not none %}
+<nav aria-label="Страницы истории платежей" style="display: flex; gap: 16px; align-items: center; margin-top: 12px; font-size: 14px;">
+    {% if view.previous_offset is not none %}
+    <a href="/billing/?limit={{ view.limit }}&amp;offset={{ view.previous_offset }}">← Более новые</a>
+    {% endif %}
+    {% if view.payments %}
+    <span style="color: #64748b;">Платежи {{ view.offset + 1 }}–{{ view.offset + view.payments|length }} из {{ view.payments_total }}</span>
+    {% endif %}
+    {% if view.next_offset is not none %}
+    <a href="/billing/?limit={{ view.limit }}&amp;offset={{ view.next_offset }}">Более старые →</a>
+    {% endif %}
+</nav>
 {% endif %}
 {% endblock %}

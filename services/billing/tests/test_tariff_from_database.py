@@ -65,7 +65,9 @@ async def test_changed_tariff_reaches_payment_screen_and_emails() -> None:
     )
     user_id = uuid4()
 
-    view = await service.get_my_subscription_view(user_id=user_id, user_tz='UTC')
+    view = await service.get_my_subscription_view(
+        user_id=user_id, user_tz='UTC', limit=50, offset=0
+    )
     assert view.action_label == 'Оформить за 999 ₽'
 
     outcome = await service.start_or_continue_purchase(user_id)
@@ -99,7 +101,9 @@ async def test_no_active_tariff_means_no_purchase_and_no_invented_price() -> Non
     repo.tariff_active = False
     user_id = uuid4()
 
-    view = await service.get_my_subscription_view(user_id=user_id, user_tz='UTC')
+    view = await service.get_my_subscription_view(
+        user_id=user_id, user_tz='UTC', limit=50, offset=0
+    )
     assert view.can_subscribe is False
     assert view.action_label is None
 

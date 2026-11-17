@@ -1033,7 +1033,9 @@ async def test_t23_get_user_billing_overview_in_real_postgres(
     other_user_id = uuid4()
 
     # 1. Пустой пользователь -> нет подписки, пустая история
-    empty_ov = await repos.user_views.get_user_billing_overview(user_id)
+    empty_ov = await repos.user_views.get_user_billing_overview(
+        user_id, limit=50, offset=0
+    )
     assert empty_ov.pending_payment_id is None
     assert empty_ov.latest_subscription_ends_at is None
     assert empty_ov.payments == []
@@ -1052,7 +1054,9 @@ async def test_t23_get_user_billing_overview_in_real_postgres(
     pay_ok, _ = await repos.payments.get_or_create_pending_payment(user_id)
     await repos.payments.finalize_payment_succeeded(pay_ok.id, source='webhook')
 
-    ov_activating = await repos.user_views.get_user_billing_overview(user_id)
+    ov_activating = await repos.user_views.get_user_billing_overview(
+        user_id, limit=50, offset=0
+    )
     assert ov_activating.pending_payment_id is None
     assert ov_activating.latest_subscription_ends_at is not None
     assert ov_activating.latest_subscription_auth_delivered is False
@@ -1090,7 +1094,9 @@ async def test_t23_get_user_billing_overview_in_real_postgres(
         )
         await session.commit()
 
-    ov_active_ref = await repos.user_views.get_user_billing_overview(user_id)
+    ov_active_ref = await repos.user_views.get_user_billing_overview(
+        user_id, limit=50, offset=0
+    )
     assert ov_active_ref.latest_subscription_auth_delivered is True
     assert ov_active_ref.latest_subscription_has_processing_refund is True
     assert ov_active_ref.latest_subscription_has_succeeded_refund is False
@@ -1103,7 +1109,9 @@ async def test_t23_get_user_billing_overview_in_real_postgres(
         ref_row.status = 'succeeded'
         await session.commit()
 
-    ov_refunded = await repos.user_views.get_user_billing_overview(user_id)
+    ov_refunded = await repos.user_views.get_user_billing_overview(
+        user_id, limit=50, offset=0
+    )
     assert ov_refunded.latest_subscription_has_succeeded_refund is True
     assert ov_refunded.latest_subscription_has_processing_refund is False
     assert ov_refunded.payments[0].refund_status == 'succeeded'
@@ -1565,7 +1573,9 @@ async def test_payment_result_and_overview_survive_refund_access_task(
     result = await repos.user_views.get_local_payment_result_for_user(
         payment.id, user_id
     )
-    overview = await repos.user_views.get_user_billing_overview(user_id)
+    overview = await repos.user_views.get_user_billing_overview(
+        user_id, limit=50, offset=0
+    )
 
     assert result is not None
     # Флаг описывает задачу оплаты, а не pending-задачу закрытия доступа.
@@ -1860,14 +1870,16 @@ async def test_tariff_row_drives_new_payments_and_texts_in_postgres(
             )
         )
     assert subjects and all('«Годовой»' in s for s in subjects)
-    overview = await repos.user_views.get_user_billing_overview(user_id)
+    overview = await repos.user_views.get_user_billing_overview(
+        user_id, limit=50, offset=0
+    )
     assert overview.tariff_price_kopeks == 99_900
 
     async with migrated_billing_db() as session:
         await session.execute(text('UPDATE tariffs SET is_active = false'))
         await session.commit()
     assert (
-        await repos.user_views.get_user_billing_overview(uuid4())
+        await repos.user_views.get_user_billing_overview(uuid4(), limit=50, offset=0)
     ).tariff_price_kopeks is None
     with pytest.raises(DependencyUnavailableError) as exc_info:
         await repos.payments.get_or_create_pending_payment(uuid4())
@@ -2090,3 +2102,77 @@ async def test_local_payment_result_reports_refund_state(
     # Именно эти два признака раньше давали «доступ открыт».
     assert refunded.status == 'succeeded'
     assert refunded.subscription_ends_at is not None
+
+
+async def test_user_billing_overview_reads_history_by_pages(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """История платежей читается страницей, незавершённый платёж — отдельно.
+
+    Регрессия: запрос выбирал все платежи пользователя и искал незавершённый
+    перебором в Python, поэтому время ответа и память росли с историей.
+    """
+    from repositories.bundle import BillingRepositories
+
+    session_factory = migrated_billing_db
+    repos = BillingRepositories.sqlalchemy(session_factory)
+    user_id = uuid4()
+    base = datetime.now(UTC) - timedelta(days=30)
+    failed_ids = [uuid4() for _ in range(7)]
+    pending_id = uuid4()
+    async with session_factory() as session:
+        for age, payment_id in enumerate(failed_ids):
+            session.add(
+                Payment(
+                    id=payment_id,
+                    user_id=user_id,
+                    tariff_id=DEFAULT_TARIFF_ID,
+                    provider_code=DEFAULT_PROVIDER_CODE,
+                    amount_kopeks=DEFAULT_TARIFF_PRICE_KOPEKS,
+                    status='failed',
+                    idempotency_key=uuid4(),
+                    created_at=base - timedelta(days=age),
+                )
+            )
+        # Незавершённый платёж — самый старый: он на последней странице истории.
+        session.add(
+            Payment(
+                id=pending_id,
+                user_id=user_id,
+                tariff_id=DEFAULT_TARIFF_ID,
+                provider_code=DEFAULT_PROVIDER_CODE,
+                amount_kopeks=DEFAULT_TARIFF_PRICE_KOPEKS,
+                status='pending',
+                idempotency_key=uuid4(),
+                created_at=base - timedelta(days=100),
+            )
+        )
+        # Чужой платёж не входит ни в страницу, ни в общее число.
+        session.add(
+            Payment(
+                user_id=uuid4(),
+                tariff_id=DEFAULT_TARIFF_ID,
+                provider_code=DEFAULT_PROVIDER_CODE,
+                amount_kopeks=DEFAULT_TARIFF_PRICE_KOPEKS,
+                status='failed',
+                idempotency_key=uuid4(),
+            )
+        )
+        await session.commit()
+
+    first = await repos.user_views.get_user_billing_overview(user_id, limit=3, offset=0)
+    assert [item.payment_id for item in first.payments] == failed_ids[:3]
+    assert first.payments_total == 8
+    assert first.pending_payment_id == pending_id
+
+    last = await repos.user_views.get_user_billing_overview(user_id, limit=3, offset=6)
+    assert [item.payment_id for item in last.payments] == [failed_ids[6], pending_id]
+    assert last.payments_total == 8
+    assert last.pending_payment_id == pending_id
+
+    beyond = await repos.user_views.get_user_billing_overview(
+        user_id, limit=3, offset=30
+    )
+    assert beyond.payments == []
+    assert beyond.payments_total == 8
+    assert beyond.pending_payment_id == pending_id

@@ -4,6 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
+from api.pagination import PaginationParams
 from dependencies import AuthenticatedUser, get_purchase_service, require_api_user
 from services.purchase import PurchaseService
 
@@ -39,7 +40,11 @@ class MySubscriptionSummaryResponse(BaseModel):
     action_url: str | None = None
     can_subscribe: bool
     subscription_ends_display: str | None = None
+    # Одна страница истории; `payments_total` — всего платежей у пользователя.
     payments: list[MySubscriptionPaymentItemResponse]
+    payments_total: int
+    limit: int
+    offset: int
 
 
 @router.get(
@@ -50,10 +55,13 @@ class MySubscriptionSummaryResponse(BaseModel):
 async def get_my_subscription_summary(
     user: Annotated[AuthenticatedUser, Depends(require_api_user)],
     purchase_service: Annotated[PurchaseService, Depends(get_purchase_service)],
+    page: PaginationParams,
 ) -> MySubscriptionSummaryResponse:
     view = await purchase_service.get_my_subscription_view(
         user_id=user.user_id,
         user_tz=user.tz,
+        limit=page.limit,
+        offset=page.offset,
     )
     return MySubscriptionSummaryResponse(
         rule_number=view.rule_number,
@@ -79,6 +87,9 @@ async def get_my_subscription_summary(
             )
             for row in view.payments
         ],
+        payments_total=view.payments_total,
+        limit=view.limit,
+        offset=view.offset,
     )
 
 

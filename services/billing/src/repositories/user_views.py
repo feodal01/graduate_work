@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Literal, Protocol
 from uuid import UUID
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from db.sql.errors import DatabaseUnavailableError
@@ -35,6 +35,9 @@ class UserBillingViews(Protocol):
     async def get_user_billing_overview(
         self,
         user_id: UUID,
+        *,
+        limit: int,
+        offset: int,
     ) -> UserBillingOverviewData: ...
 
 
@@ -126,8 +129,16 @@ class SQLAlchemyUserBillingViews(SQLAlchemyRepository):
     async def get_user_billing_overview(
         self,
         user_id: UUID,
+        *,
+        limit: int,
+        offset: int,
     ) -> UserBillingOverviewData:
-        """Читает сводные данные для экрана Э2 «Моя подписка» (T-23, BIL-FR-09)."""
+        """Читает сводные данные для экрана Э2 «Моя подписка» (T-23, BIL-FR-09).
+
+        История платежей читается одной страницей. Незавершённый платёж ищется
+        отдельным запросом: кнопка «Продолжить оплату» не должна зависеть от
+        того, на какую страницу истории он попал.
+        """
         try:
             async with self._session_factory() as session:
                 tariff = await session.scalar(
@@ -200,10 +211,29 @@ class SQLAlchemyUserBillingViews(SQLAlchemyRepository):
                     )
                     .where(Payment.user_id == user_id)
                     .order_by(Payment.created_at.desc(), Payment.id.desc())
+                    .limit(limit)
+                    .offset(offset)
                 )
                 payment_rows = (await session.execute(payments_stmt)).all()
+                payments_total = int(
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(Payment)
+                        .where(Payment.user_id == user_id)
+                    )
+                    or 0
+                )
+                # Не больше одной строки: ожидающий платёж у пользователя один
+                # (инвариант 1, частичный уникальный индекс).
+                pending_payment_id: UUID | None = await session.scalar(
+                    select(Payment.id)
+                    .where(
+                        Payment.user_id == user_id,
+                        Payment.status == 'pending',
+                    )
+                    .limit(1)
+                )
 
-                pending_payment_id: UUID | None = None
                 history_items: list[UserPaymentHistoryItemData] = []
                 for (
                     pid,
@@ -215,8 +245,6 @@ class SQLAlchemyUserBillingViews(SQLAlchemyRepository):
                     failure_reason,
                     r_status,
                 ) in payment_rows:
-                    if p_status == 'pending' and pending_payment_id is None:
-                        pending_payment_id = pid
                     normalized_refund: Literal['processing', 'succeeded'] | None = (
                         'succeeded'
                         if r_status == 'succeeded'
@@ -245,6 +273,7 @@ class SQLAlchemyUserBillingViews(SQLAlchemyRepository):
                     latest_subscription_auth_delivered=auth_delivered,
                     tariff_price_kopeks=tariff_price_kopeks,
                     payments=history_items,
+                    payments_total=payments_total,
                 )
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
