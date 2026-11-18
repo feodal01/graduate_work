@@ -230,13 +230,15 @@ async def test_webhook_unhappy_malformed_payload_outages_and_unknown_id(
         assert r_422.status_code == 422
         assert r_422.json()['error_code'] == 'validation_error'
 
-    # 2. Неизвестный provider_payment_id -> 200 OK (безопасный игнор без ретраев)
+    # 2. Неизвестный provider_payment_id -> 200 OK без запроса в ЮKassa: нет
+    #    ожидающего платежа без номера, которому мог бы принадлежать объект
     r_unknown = await client.post(
         '/api/v1/billing/webhooks/yookassa',
         json={'event': 'payment.succeeded', 'object': {'id': 'yk-unknown-999'}},
     )
     assert r_unknown.status_code == 200
-    assert len(provider.get_calls) == 0
+    assert provider.get_calls == []
+    assert provider.get_refund_calls == []
 
     # 3. Временный сбой ЮKassa или 401 на GET -> 503 (чтобы ЮKassa повторила вебхук)
     for transient_err in (

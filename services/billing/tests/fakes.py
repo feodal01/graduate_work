@@ -34,11 +34,14 @@ from domain.subscription import (
     compute_subscription_state,
 )
 from repositories.bundle import BillingRepositories
-from repositories.outbox import (
+from repositories.outbox import OutboxDeliverFn
+from repositories.outbox_rules import (
+    LATEST_ACCESS_TASK_CLOSE_MESSAGE,
     DeliveryOutcome,
-    OutboxDeliverFn,
+    admin_can_close,
     admin_can_retry_or_close,
     compute_outbox_backoff_seconds,
+    is_latest_access_task,
     transient_failure_transition,
 )
 from repositories.payment_tasks import payment_failed_email_task_key
@@ -65,9 +68,11 @@ from repositories.records import (
     POST_OUTCOME_UNKNOWN_KEY,
     keep_detail_markers,
     lookup_not_found_marker,
-    set_divergence_marker,
     set_post_stopped_marker,
+    set_signal_kind_marker,
 )
+from repositories.stuck import payment_is_stuck, refund_is_stuck
+from repositories.user_views import ACCESS_TASK_FAILED_STATUSES
 
 
 @dataclass
@@ -176,6 +181,8 @@ class InMemoryPurchaseRepository:
             duration_days=30,
         )
         self.tariff_active = True
+        # Сколько раз вебхук спрашивал, есть ли операция без номера провайдера.
+        self.awaiting_number_queries = 0
         self.events: list[
             tuple[str, UUID, str | None, str, str, dict[str, Any] | None]
         ] = []
@@ -269,6 +276,10 @@ class InMemoryPurchaseRepository:
             subscription_ends_at=sub_ends_at,
             auth_access_delivered=auth_delivered,
             refund_status=refund_status,
+            auth_access_failed=(
+                auth_task is not None
+                and auth_task.status in ACCESS_TASK_FAILED_STATUSES
+            ),
         )
 
     async def get_user_billing_overview(
@@ -292,12 +303,17 @@ class InMemoryPurchaseRepository:
         has_succeeded_refund = False
         has_processing_refund = False
         auth_delivered = False
+        auth_failed = False
 
         if latest_sub is not None:
             auth_task = self.outbox_tasks.get(
                 f'payment_succeeded:{latest_sub.payment_id}:auth_access'
             )
             auth_delivered = auth_task is not None and auth_task.status == 'completed'
+            auth_failed = (
+                auth_task is not None
+                and auth_task.status in ACCESS_TASK_FAILED_STATUSES
+            )
             for refund in self.refunds.values():
                 if refund.payment_id == latest_sub.payment_id:
                     if refund.status == 'succeeded':
@@ -348,6 +364,7 @@ class InMemoryPurchaseRepository:
             ),
             payments=history,
             payments_total=len(user_payments),
+            latest_subscription_auth_failed=auth_failed,
         )
 
     async def get_payment_by_provider_id(
@@ -541,9 +558,21 @@ class InMemoryPurchaseRepository:
             )
         )
 
-    async def mark_payment_divergence_signaled(self, payment_id: UUID) -> bool:
-        """Отметка расхождения на завершённом платеже; True — только в первый раз."""
-        return set_divergence_marker(self.payments[payment_id])
+    async def mark_payment_signaled(self, payment_id: UUID, *, kind: str) -> bool:
+        """Отметка «сигнал вида kind по платежу поднят»; True — в первый раз."""
+        return set_signal_kind_marker(self.payments[payment_id], kind)
+
+    async def has_payment_awaiting_provider_number(self, provider_code: str) -> bool:
+        """Как SQL: есть ли ожидающий платёж провайдера без его номера."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        self.awaiting_number_queries += 1
+        return any(
+            p.status == 'pending'
+            and p.provider_code == provider_code
+            and p.provider_payment_id is None
+            for p in self.payments.values()
+        )
 
     async def claim_payment_check(
         self,
@@ -836,6 +865,7 @@ class InMemoryPurchaseRepository:
             if outcome == 'completed':
                 task.status = 'completed'
                 task.last_error = None
+                self._complete_superseded_access_tasks(task, now_after)
             elif outcome == 'permanent_error':
                 task.attempts += 1
                 task.status = 'requires_intervention'
@@ -963,13 +993,13 @@ class InMemoryPurchaseRepository:
         filters: InternalPaymentFilter,
         *,
         stuck_threshold_seconds: int = 600,
+        waiting_payment_threshold_seconds: int = 4200,
         now_utc: datetime | None = None,
     ) -> tuple[int, list[InternalPaymentItemData]]:
         """Возвращает отфильтрованный список платежей для админки (T-26)."""
         if self.db_unavailable:
             raise DatabaseUnavailableError('billing-db is down')
         now = now_utc or datetime.now(UTC)
-        stuck_cutoff = now - timedelta(seconds=stuck_threshold_seconds)
         matched: list[InternalPaymentItemData] = []
         payments = sorted(
             self.payments.values(),
@@ -983,11 +1013,21 @@ class InMemoryPurchaseRepository:
                 reverse=True,
             )
             has_ref = len(p_refunds) > 0
-            is_stuck = (pay.status == 'pending' and pay.created_at <= stuck_cutoff) or (
-                any(
-                    r.status == 'processing' and r.created_at <= stuck_cutoff
-                    for r in p_refunds
+            is_stuck = payment_is_stuck(
+                status=pay.status,
+                provider_payment_id=pay.provider_payment_id,
+                created_at=pay.created_at,
+                now=now,
+                threshold_seconds=stuck_threshold_seconds,
+                waiting_payment_threshold_seconds=waiting_payment_threshold_seconds,
+            ) or any(
+                refund_is_stuck(
+                    status=r.status,
+                    created_at=r.created_at,
+                    now=now,
+                    threshold_seconds=stuck_threshold_seconds,
                 )
+                for r in p_refunds
             )
             if filters.status is not None and pay.status != filters.status:
                 continue
@@ -1169,39 +1209,7 @@ class InMemoryPurchaseRepository:
         for t in self.outbox_tasks.values():
             if t.payment_id != payment_id:
                 continue
-            t_status: Literal[
-                'pending', 'completed', 'requires_intervention', 'closed'
-            ] = (
-                'completed'
-                if t.status == 'completed'
-                else 'requires_intervention'
-                if t.status == 'requires_intervention'
-                else 'closed'
-                if t.status == 'closed'
-                else 'pending'
-            )
-            task_items.append(
-                InternalOutboxTaskItemData(
-                    id=t.id,
-                    target_service=(
-                        'notifications'
-                        if t.target_service == 'notifications'
-                        else 'auth'
-                    ),
-                    task_type=t.task_type,
-                    access_version=t.access_version,
-                    status=t_status,
-                    attempts=t.attempts,
-                    last_error=t.last_error,
-                    created_at=t.created_at,
-                    updated_at=t.updated_at,
-                    can_retry_or_close=admin_can_retry_or_close(
-                        t.status, t.task_type, t.attempts
-                    ),
-                    payment_id=t.payment_id,
-                    user_id=t.user_id,
-                )
-            )
+            task_items.append(self._to_fake_outbox_item(t))
 
         normalized_status: Literal['pending', 'succeeded', 'failed'] = (
             'succeeded'
@@ -1288,40 +1296,32 @@ class InMemoryPurchaseRepository:
         )
         items: list[InternalOutboxTaskItemData] = []
         for t in matched_rows:
-            t_status: Literal[
-                'pending', 'completed', 'requires_intervention', 'closed'
-            ] = (
-                'requires_intervention'
-                if t.status == 'requires_intervention'
-                else 'pending'
-            )
-            items.append(
-                InternalOutboxTaskItemData(
-                    id=t.id,
-                    target_service=(
-                        'notifications'
-                        if t.target_service == 'notifications'
-                        else 'auth'
-                    ),
-                    task_type=t.task_type,
-                    access_version=t.access_version,
-                    status=t_status,
-                    attempts=t.attempts,
-                    last_error=t.last_error,
-                    created_at=t.created_at,
-                    updated_at=t.updated_at,
-                    can_retry_or_close=admin_can_retry_or_close(
-                        t.status, t.task_type, t.attempts
-                    ),
-                    payment_id=t.payment_id,
-                    user_id=t.user_id,
-                )
-            )
+            items.append(self._to_fake_outbox_item(t))
         total = len(items)
         return total, items[filters.offset : filters.offset + filters.limit]
 
-    @staticmethod
-    def _to_fake_outbox_item(t: FakeOutboxTaskRow) -> InternalOutboxTaskItemData:
+    def _complete_superseded_access_tasks(
+        self, delivered: FakeOutboxTaskRow, now_utc: datetime
+    ) -> None:
+        """Как в SQL: доставлена версия V — старые задачи доступа в ТВ выполнены."""
+        if delivered.task_type != 'sync_access' or delivered.access_version is None:
+            return
+        for old in self.outbox_tasks.values():
+            if (
+                old.user_id == delivered.user_id
+                and old.task_type == 'sync_access'
+                and old.status == 'requires_intervention'
+                and old.access_version is not None
+                and old.access_version < delivered.access_version
+            ):
+                old.status = 'completed'
+                old.last_error = (
+                    f'superseded by access version {delivered.access_version} '
+                    f'(task {delivered.id})'
+                )
+                old.updated_at = now_utc
+
+    def _to_fake_outbox_item(self, t: FakeOutboxTaskRow) -> InternalOutboxTaskItemData:
         t_status: Literal['pending', 'completed', 'requires_intervention', 'closed'] = (
             'completed'
             if t.status == 'completed'
@@ -1348,6 +1348,13 @@ class InMemoryPurchaseRepository:
             ),
             payment_id=t.payment_id,
             user_id=t.user_id,
+            can_close=admin_can_close(
+                t.status,
+                t.task_type,
+                t.attempts,
+                access_version=t.access_version,
+                latest_access_version=self.access_versions.get(t.user_id),
+            ),
         )
 
     async def get_internal_outbox_task(
@@ -1430,6 +1437,15 @@ class InMemoryPurchaseRepository:
             raise RuleConflictError(
                 'Закрытие доступно только для задачи в состоянии requires_intervention',
                 error_code='outbox_task_not_requires_intervention',
+            )
+        if is_latest_access_task(
+            found.task_type,
+            access_version=found.access_version,
+            latest_access_version=self.access_versions.get(found.user_id),
+        ):
+            raise RuleConflictError(
+                LATEST_ACCESS_TASK_CLOSE_MESSAGE,
+                error_code='outbox_task_latest_access_version',
             )
         now = now_utc or datetime.now(UTC)
         cleaned_reason = reason.strip()
@@ -1522,6 +1538,7 @@ class InMemoryPurchaseRepository:
         self,
         *,
         stuck_threshold_seconds: int = 600,
+        waiting_payment_threshold_seconds: int = 4200,
         now_utc: datetime | None = None,
     ) -> OperationalMetricsSnapshot:
         """Вычисляет операционные метрики для мониторинга (T-35, 6.4)."""
@@ -1533,12 +1550,24 @@ class InMemoryPurchaseRepository:
         stuck_payments_count = sum(
             1
             for p in self.payments.values()
-            if p.status == 'pending' and p.created_at <= stuck_cutoff
+            if payment_is_stuck(
+                status=p.status,
+                provider_payment_id=p.provider_payment_id,
+                created_at=p.created_at,
+                now=now,
+                threshold_seconds=stuck_threshold_seconds,
+                waiting_payment_threshold_seconds=waiting_payment_threshold_seconds,
+            )
         )
         stuck_refunds_count = sum(
             1
             for r in self.refunds.values()
-            if r.status == 'processing' and r.created_at <= stuck_cutoff
+            if refund_is_stuck(
+                status=r.status,
+                created_at=r.created_at,
+                now=now,
+                threshold_seconds=stuck_threshold_seconds,
+            )
         )
         outbox_pending_count = sum(
             1 for t in self.outbox_tasks.values() if t.status == 'pending'
@@ -1821,9 +1850,21 @@ class InMemoryPurchaseRepository:
                 self._add_unchanged_check_event('refund', refund_id, event_source)
         return row
 
-    async def mark_refund_divergence_signaled(self, refund_id: UUID) -> bool:
-        """Отметка расхождения на завершённом возврате; True — только в первый раз."""
-        return set_divergence_marker(self.refunds[refund_id])
+    async def mark_refund_signaled(self, refund_id: UUID, *, kind: str) -> bool:
+        """Отметка «сигнал вида kind по попытке поднят»; True — в первый раз."""
+        return set_signal_kind_marker(self.refunds[refund_id], kind)
+
+    async def has_refund_awaiting_provider_number(self, provider_code: str) -> bool:
+        """Как SQL: есть ли возврат «В обработке» провайдера без его номера."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        self.awaiting_number_queries += 1
+        return any(
+            r.status == 'processing'
+            and r.provider_code == provider_code
+            and r.provider_refund_id is None
+            for r in self.refunds.values()
+        )
 
     async def mark_refund_post_stopped(self, refund_id: UUID) -> bool:
         """Отметка «POST по попытке больше не шлём» (инв. 15); True — в первый раз."""

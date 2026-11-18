@@ -29,8 +29,8 @@ from repositories.records import (
     RefundRecordProtocol,
     keep_detail_markers,
     lookup_not_found_marker,
-    set_divergence_marker,
     set_post_stopped_marker,
+    set_signal_kind_marker,
 )
 
 
@@ -100,7 +100,9 @@ class RefundRepository(Protocol):
         event_source: ReconcileSource | None = None,
     ) -> RefundRecordProtocol: ...
 
-    async def mark_refund_divergence_signaled(self, refund_id: UUID) -> bool: ...
+    async def mark_refund_signaled(self, refund_id: UUID, *, kind: str) -> bool: ...
+
+    async def has_refund_awaiting_provider_number(self, provider_code: str) -> bool: ...
 
     async def mark_refund_post_stopped(self, refund_id: UUID) -> bool: ...
 
@@ -454,9 +456,32 @@ class SQLAlchemyRefundRepository(SQLAlchemyRepository):
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 
-    async def mark_refund_divergence_signaled(self, refund_id: UUID) -> bool:
-        """Отметка «расхождение с ЮKassa уже в мониторинге» (инв. 7, 6.4)."""
-        return await self._set_marker_once('refund', refund_id, set_divergence_marker)
+    async def mark_refund_signaled(self, refund_id: UUID, *, kind: str) -> bool:
+        """Отметка «сигнал вида kind по попытке поднят» (6.4); True — в первый раз."""
+        return await self._set_marker_once(
+            'refund', refund_id, lambda record: set_signal_kind_marker(record, kind)
+        )
+
+    async def has_refund_awaiting_provider_number(self, provider_code: str) -> bool:
+        """Есть ли возврат «В обработке» без номера провайдера (BIL-API-05).
+
+        Только такая попытка может принадлежать незнакомому номеру из вебхука.
+        Один запрос по индексу (status, created_at).
+        """
+        try:
+            async with self._session_factory() as session:
+                found = await session.scalar(
+                    select(Refund.id)
+                    .where(
+                        Refund.status == 'processing',
+                        Refund.provider_code == provider_code,
+                        Refund.provider_refund_id.is_(None),
+                    )
+                    .limit(1)
+                )
+                return found is not None
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
 
     async def mark_refund_post_stopped(self, refund_id: UUID) -> bool:
         """Останавливает POST по попытке после 400/401/403 на повтор (инв. 15).

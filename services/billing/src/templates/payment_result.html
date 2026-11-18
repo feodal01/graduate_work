@@ -26,6 +26,11 @@
     <strong>Платёж возвращён, подписка отменена</strong>
     <p style="margin: 8px 0 0 0;">Доступ по этой подписке закрывается. Оформить подписку заново можно на экране «Моя подписка».</p>
 </div>
+{% elif view.block == 'succeeded_access_problem' %}
+<div class="alert-error" role="alert">
+    <strong>Оплачено, но доступ не открылся</strong>
+    <p style="margin: 8px 0 0 0;">Оплата получена, но открыть доступ автоматически не удалось. Обратитесь в поддержку и назовите номер платежа {{ view.payment_id }}.</p>
+</div>
 {% elif view.block == 'succeeded_activating' %}
 <div class="alert-info" role="status">
     <strong>Оплачено, доступ активируется</strong>

@@ -8,16 +8,26 @@ from uuid import UUID, uuid4
 import sentry_sdk
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.config import settings
 from core.observability import correlation_request_id
 from db.sql.errors import DatabaseUnavailableError
 from domain.errors import EntityNotFoundError, RuleConflictError
 from models import (
     AdminAction,
     OutboxTask,
+    UserAccessVersion,
 )
 from repositories._sqlalchemy import SQLAlchemyRepository
+from repositories.outbox_rules import (
+    LATEST_ACCESS_TASK_CLOSE_MESSAGE,
+    DeliveryOutcome,
+    admin_can_close,
+    admin_can_retry_or_close,
+    compute_outbox_backoff_seconds,
+    is_latest_access_task,
+    transient_failure_transition,
+)
 from repositories.read_models import (
     InternalOutboxFilter,
     InternalOutboxTaskItemData,
@@ -27,9 +37,6 @@ from repositories.records import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-DeliveryOutcome = Literal['completed', 'transient_error', 'permanent_error']
 
 
 # Срок аренды задачи на время доставки. Должен быть заметно больше тайм-аутов
@@ -65,56 +72,6 @@ OutboxDeliverFn = Callable[
     [OutboxTaskRecordProtocol],
     Awaitable[tuple[DeliveryOutcome, str | None]],
 ]
-
-
-# Задачи, которые нельзя бросать по лимиту попыток. Доставка доступа в Auth
-# идемпотентна и монотонна по версии: повтор безопасен, а остановка оставляет
-# возвращённую подписку открытой (или оплаченную закрытой) до ручного
-# вмешательства. Отмена письма об окончании после возврата обязана дойти до
-# момента T, иначе пользователь с возвращёнными деньгами получит письмо
-# «срок подписки закончился» (ТЗ 6.3: «повторяется до восстановления»).
-RETRY_UNTIL_DELIVERED_TASK_TYPES = frozenset({'sync_access', 'cancel_expiration_email'})
-
-
-def admin_can_retry_or_close(status: str, task_type: str, attempts: int) -> bool:
-    """Доступны ли «Повторить» и «Закрыть с причиной» (US-A-02, BIL-API-12/13).
-
-    Обычная задача — только в `requires_intervention`. Бессрочная задача
-    (`RETRY_UNTIL_DELIVERED_TASK_TYPES`) туда по лимиту не попадает и после
-    лимита остаётся `pending` с повторами: без этого администратор не смог бы
-    ни ускорить повтор, ни закрыть задачу, которую получатель отвергает всегда.
-    """
-    if status == 'requires_intervention':
-        return True
-    return (
-        status == 'pending'
-        and task_type in RETRY_UNTIL_DELIVERED_TASK_TYPES
-        and attempts >= settings.worker.billing_outbox_max_attempts
-    )
-
-
-def transient_failure_transition(
-    task_type: str,
-    attempts: int,
-    max_attempts: int,
-) -> tuple[Literal['retry', 'requires_intervention'], bool]:
-    """Решает судьбу задачи после временной ошибки: повтор или вмешательство.
-
-    `attempts` — число попыток уже с учётом текущей. Второй элемент — нужен ли
-    алерт: для бессрочных задач он поднимается один раз, когда лимит пройден,
-    а задача продолжает повторяться с потолком backoff.
-    """
-    if task_type in RETRY_UNTIL_DELIVERED_TASK_TYPES:
-        return 'retry', attempts == max_attempts
-    if attempts >= max_attempts:
-        return 'requires_intervention', True
-    return 'retry', False
-
-
-def compute_outbox_backoff_seconds(attempts: int) -> int:
-    """Вычисляет паузу экспоненциального backoff (2^attempt с потолком 300 с)."""
-    normalized = max(1, attempts)
-    return int(min(300, 2 ** min(normalized, 9)))
 
 
 class OutboxRepository(Protocol):
@@ -330,6 +287,39 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
             await session.commit()
             return claimed
 
+    @staticmethod
+    async def _complete_superseded_access_tasks(
+        session: AsyncSession,
+        delivered: OutboxTask,
+        now_utc: datetime,
+    ) -> None:
+        """Доставлена версия V — более старые задачи доступа в ТВ больше не нужны.
+
+        Auth применяет только версию больше сохранённой (инв. 11), поэтому
+        старую задачу доставлять незачем: она выполнена без вызова Auth, в той
+        же транзакции, что и запись доставки, и уходит из «Не доставлено».
+        Ожидающие старые задачи по-прежнему закрывает взятие в работу.
+        """
+        if delivered.task_type != 'sync_access' or delivered.access_version is None:
+            return
+        superseded = await session.scalars(
+            select(OutboxTask)
+            .where(
+                OutboxTask.user_id == delivered.user_id,
+                OutboxTask.task_type == 'sync_access',
+                OutboxTask.status == 'requires_intervention',
+                OutboxTask.access_version < delivered.access_version,
+            )
+            .with_for_update()
+        )
+        for old in superseded:
+            old.status = 'completed'
+            old.last_error = (
+                f'superseded by access version {delivered.access_version} '
+                f'(task {delivered.id})'
+            )
+            old.updated_at = now_utc
+
     async def _record_delivery_outcome(
         self,
         claimed: 'ClaimedOutboxTask',
@@ -370,6 +360,7 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
             if outcome == 'completed':
                 task.status = 'completed'
                 task.last_error = None
+                await self._complete_superseded_access_tasks(session, task, now_after)
             elif outcome == 'permanent_error':
                 task.attempts += 1
                 task.status = 'requires_intervention'
@@ -489,37 +480,13 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
                     .offset(filters.offset)
                 )
                 rows = list(await session.scalars(stmt))
-                items: list[InternalOutboxTaskItemData] = []
-                for t in rows:
-                    t_status: Literal[
-                        'pending', 'completed', 'requires_intervention', 'closed'
-                    ] = (
-                        'requires_intervention'
-                        if t.status == 'requires_intervention'
-                        else 'pending'
-                    )
-                    items.append(
-                        InternalOutboxTaskItemData(
-                            id=t.id,
-                            target_service=(
-                                'notifications'
-                                if t.target_service == 'notifications'
-                                else 'auth'
-                            ),
-                            task_type=t.task_type,
-                            access_version=t.access_version,
-                            status=t_status,
-                            attempts=t.attempts,
-                            last_error=t.last_error,
-                            created_at=t.created_at,
-                            updated_at=t.updated_at,
-                            can_retry_or_close=admin_can_retry_or_close(
-                                t.status, t.task_type, t.attempts
-                            ),
-                            payment_id=t.payment_id,
-                            user_id=t.user_id,
-                        )
-                    )
+                latest = await self._latest_access_versions(
+                    session, {t.user_id for t in rows}
+                )
+                items = [
+                    self._to_internal_outbox_item(t, latest.get(t.user_id))
+                    for t in rows
+                ]
                 return total, items
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
@@ -533,7 +500,8 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
                 task = await session.get(OutboxTask, task_id)
                 if task is None:
                     return None
-                return self._to_internal_outbox_item(task)
+                latest = await self._latest_access_versions(session, {task.user_id})
+                return self._to_internal_outbox_item(task, latest.get(task.user_id))
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 
@@ -581,8 +549,9 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
                         reason=cleaned_reason,
                     )
                 )
+                latest = await self._latest_access_versions(session, {task.user_id})
                 await session.commit()
-                return self._to_internal_outbox_item(task)
+                return self._to_internal_outbox_item(task, latest.get(task.user_id))
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 
@@ -611,6 +580,16 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
                         'Закрытие доступно только для задачи, требующей вмешательства',
                         error_code='outbox_task_not_requires_intervention',
                     )
+                latest = await self._latest_access_versions(session, {task.user_id})
+                if is_latest_access_task(
+                    task.task_type,
+                    access_version=task.access_version,
+                    latest_access_version=latest.get(task.user_id),
+                ):
+                    raise RuleConflictError(
+                        LATEST_ACCESS_TASK_CLOSE_MESSAGE,
+                        error_code='outbox_task_latest_access_version',
+                    )
                 task.status = 'closed'
                 task.updated_at = now
                 session.add(
@@ -623,12 +602,28 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
                     )
                 )
                 await session.commit()
-                return self._to_internal_outbox_item(task)
+                return self._to_internal_outbox_item(task, latest.get(task.user_id))
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 
     @staticmethod
-    def _to_internal_outbox_item(t: OutboxTask) -> InternalOutboxTaskItemData:
+    async def _latest_access_versions(
+        session: AsyncSession, user_ids: set[UUID]
+    ) -> dict[UUID, int]:
+        """Последняя выданная версия доступа пользователей (инв. 11)."""
+        if not user_ids:
+            return {}
+        rows = await session.execute(
+            select(UserAccessVersion.user_id, UserAccessVersion.last_version).where(
+                UserAccessVersion.user_id.in_(user_ids)
+            )
+        )
+        return {user_id: int(version) for user_id, version in rows.all()}
+
+    @staticmethod
+    def _to_internal_outbox_item(
+        t: OutboxTask, latest_access_version: int | None
+    ) -> InternalOutboxTaskItemData:
         t_status: Literal['pending', 'completed', 'requires_intervention', 'closed'] = (
             'completed'
             if t.status == 'completed'
@@ -655,4 +650,11 @@ class SQLAlchemyOutboxRepository(SQLAlchemyRepository):
             ),
             payment_id=t.payment_id,
             user_id=t.user_id,
+            can_close=admin_can_close(
+                t.status,
+                t.task_type,
+                t.attempts,
+                access_version=t.access_version,
+                latest_access_version=latest_access_version,
+            ),
         )

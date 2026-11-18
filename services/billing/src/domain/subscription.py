@@ -13,6 +13,7 @@ ReconcileSource = Literal['webhook', 'reconcile', 'continue', 'admin']
 PaymentResultBlock = Literal[
     'succeeded_ready',
     'succeeded_activating',
+    'succeeded_access_problem',
     'succeeded_ended',
     'refunded',
     'failed',
@@ -291,6 +292,7 @@ def build_refund_succeeded_email_payload(
 MySubscriptionStatusKey = Literal[
     'pending_payment',
     'activating',
+    'access_problem',
     'active',
     'expired_refund_processing',
     'expired',
@@ -298,6 +300,10 @@ MySubscriptionStatusKey = Literal[
     'no_subscription',
 ]
 MySubscriptionActionType = Literal['continue_payment', 'subscribe', 'none']
+
+ACCESS_PROBLEM_STATUS_DISPLAY = (
+    'Оплачено, но доступ не открылся — обратитесь в поддержку'
+)
 
 _PAYMENT_STATUS_LABELS: dict[str, str] = {
     'pending': 'Ожидает оплаты',
@@ -345,6 +351,7 @@ def compute_my_subscription_summary(
     user_tz: str,
     tariff_price_display: str | None,
     now_utc: datetime | None = None,
+    latest_subscription_auth_failed: bool = False,
 ) -> MySubscriptionSummaryResult:
     """Вычисляет статус и действие экрана «Моя подписка» по 7 правилам US-U-05."""
     # Правило 1: Есть платёж в состоянии «Ожидает оплаты»
@@ -396,6 +403,19 @@ def compute_my_subscription_summary(
 
     # Правила 2 и 3: Последняя подписка активна
     if sub_state == SubscriptionState.ACTIVE:
+        if latest_subscription_auth_failed:
+            # Задача выдачи доступа ждёт администратора или закрыта: сам доступ
+            # не откроется, «активируется» было бы неправдой.
+            return MySubscriptionSummaryResult(
+                rule_number=2,
+                status_key='access_problem',
+                status_display=ACCESS_PROBLEM_STATUS_DISPLAY,
+                action_type='none',
+                action_label=None,
+                action_url=None,
+                can_subscribe=False,
+                subscription_ends_display=ends_display,
+            )
         if not latest_subscription_auth_delivered:
             return MySubscriptionSummaryResult(
                 rule_number=2,

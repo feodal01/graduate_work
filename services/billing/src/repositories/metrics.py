@@ -14,6 +14,7 @@ from repositories._sqlalchemy import SQLAlchemyRepository
 from repositories.read_models import (
     OperationalMetricsSnapshot,
 )
+from repositories.stuck import stuck_payment_clause, stuck_refund_clause
 
 
 class OperationalMetricsRepository(Protocol):
@@ -23,6 +24,7 @@ class OperationalMetricsRepository(Protocol):
         self,
         *,
         stuck_threshold_seconds: int = 600,
+        waiting_payment_threshold_seconds: int = 4200,
         now_utc: datetime | None = None,
     ) -> OperationalMetricsSnapshot: ...
 
@@ -34,6 +36,7 @@ class SQLAlchemyOperationalMetricsRepository(SQLAlchemyRepository):
         self,
         *,
         stuck_threshold_seconds: int = 600,
+        waiting_payment_threshold_seconds: int = 4200,
         now_utc: datetime | None = None,
     ) -> OperationalMetricsSnapshot:
         now = now_utc or datetime.now(UTC)
@@ -43,8 +46,13 @@ class SQLAlchemyOperationalMetricsRepository(SQLAlchemyRepository):
                 stuck_payments_count = int(
                     await session.scalar(
                         select(func.count(Payment.id)).where(
-                            Payment.status == 'pending',
-                            Payment.created_at <= stuck_cutoff,
+                            stuck_payment_clause(
+                                now,
+                                threshold_seconds=stuck_threshold_seconds,
+                                waiting_payment_threshold_seconds=(
+                                    waiting_payment_threshold_seconds
+                                ),
+                            )
                         )
                     )
                     or 0
@@ -52,8 +60,9 @@ class SQLAlchemyOperationalMetricsRepository(SQLAlchemyRepository):
                 stuck_refunds_count = int(
                     await session.scalar(
                         select(func.count(Refund.id)).where(
-                            Refund.status == 'processing',
-                            Refund.created_at <= stuck_cutoff,
+                            stuck_refund_clause(
+                                now, threshold_seconds=stuck_threshold_seconds
+                            )
                         )
                     )
                     or 0

@@ -68,6 +68,11 @@ POST_STOPPED_KEY = '_post_stopped'
 LOOKUP_NOT_FOUND_KEY = '_lookup_not_found'
 # Инв. 7: сигнал о расхождении итога с ЮKassa уже поднят (один на операцию).
 DIVERGENCE_SIGNALED_KEY = '_divergence_signaled'
+# Инв. 14, 16 и 6.4: виды аномалий ЮKassa, о которых по операции уже поднят
+# сигнал ({kind: True}). Отметка вида `status` у ожидающего платежа ещё и
+# запрещает уводить пользователя на страницу оплаты. Нормальный ответ ЮKassa
+# заменяет `provider_details` и снимает её.
+ANOMALIES_KEY = '_anomalies'
 
 _STICKY_DETAIL_KEYS = (
     POST_OUTCOME_UNKNOWN_KEY,
@@ -105,11 +110,48 @@ def set_signal_marker(
     return True
 
 
+def set_anomaly_marker(
+    record: PaymentRecordProtocol | RefundRecordProtocol,
+    kind: str,
+) -> bool:
+    """Отметка «по операции уже поднят сигнал об аномалии вида kind»."""
+    details = dict(record.provider_details or {})
+    anomalies = details.get(ANOMALIES_KEY)
+    seen = dict(anomalies) if isinstance(anomalies, dict) else {}
+    if seen.get(kind):
+        return False
+    seen[kind] = True
+    details[ANOMALIES_KEY] = seen
+    record.provider_details = details
+    return True
+
+
+def has_anomaly_marker(details: dict[str, Any] | None) -> bool:
+    """Есть ли у операции отметка хоть одной аномалии ЮKassa."""
+    anomalies = (details or {}).get(ANOMALIES_KEY)
+    return isinstance(anomalies, dict) and any(anomalies.values())
+
+
 def set_divergence_marker(record: PaymentRecordProtocol | RefundRecordProtocol) -> bool:
     """Отметка расхождения с ЮKassa на завершённой операции (инв. 7)."""
     if record.status in ('pending', 'processing'):
         return False
     return set_signal_marker(record, DIVERGENCE_SIGNALED_KEY)
+
+
+# Вид сигнала «расхождение итога с ЮKassa» (инв. 7); остальные виды —
+# аномалии ответа ЮKassa (`ProviderOperationAnomalyError.kind`).
+DIVERGENCE_SIGNAL_KIND = 'divergence'
+
+
+def set_signal_kind_marker(
+    record: PaymentRecordProtocol | RefundRecordProtocol,
+    kind: str,
+) -> bool:
+    """Отметка «сигнал вида kind по операции уже поднят»; True — в первый раз."""
+    if kind == DIVERGENCE_SIGNAL_KIND:
+        return set_divergence_marker(record)
+    return set_anomaly_marker(record, kind)
 
 
 def set_post_stopped_marker(record: RefundRecordProtocol) -> bool:

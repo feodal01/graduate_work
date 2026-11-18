@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 from uuid import UUID
 
@@ -17,9 +17,10 @@ from models import (
     Refund,
     Subscription,
     Tariff,
+    UserAccessVersion,
 )
 from repositories._sqlalchemy import SQLAlchemyRepository
-from repositories.outbox import admin_can_retry_or_close
+from repositories.outbox_rules import admin_can_close, admin_can_retry_or_close
 from repositories.read_models import (
     InternalAdminActionFilter,
     InternalAdminActionItemData,
@@ -31,6 +32,12 @@ from repositories.read_models import (
     InternalRefundItemData,
     InternalSubscriptionFilter,
     InternalSubscriptionItemData,
+)
+from repositories.stuck import (
+    payment_is_stuck,
+    refund_is_stuck,
+    stuck_payment_clause,
+    stuck_refund_clause,
 )
 
 
@@ -49,6 +56,7 @@ class AdminQueries(Protocol):
         filters: InternalPaymentFilter,
         *,
         stuck_threshold_seconds: int = 600,
+        waiting_payment_threshold_seconds: int = 4200,
         now_utc: datetime | None = None,
     ) -> tuple[int, list[InternalPaymentItemData]]: ...
 
@@ -182,20 +190,23 @@ class SQLAlchemyAdminQueries(SQLAlchemyRepository):
         filters: InternalPaymentFilter,
         *,
         stuck_threshold_seconds: int = 600,
+        waiting_payment_threshold_seconds: int = 4200,
         now_utc: datetime | None = None,
     ) -> tuple[int, list[InternalPaymentItemData]]:
         now = now_utc or datetime.now(UTC)
-        stuck_cutoff = now - timedelta(seconds=stuck_threshold_seconds)
         any_refund_exists = exists(select(1).where(Refund.payment_id == Payment.id))
         stuck_refund_exists = exists(
             select(1).where(
                 Refund.payment_id == Payment.id,
-                Refund.status == 'processing',
-                Refund.created_at <= stuck_cutoff,
+                stuck_refund_clause(now, threshold_seconds=stuck_threshold_seconds),
             )
         )
         stuck_condition = or_(
-            and_(Payment.status == 'pending', Payment.created_at <= stuck_cutoff),
+            stuck_payment_clause(
+                now,
+                threshold_seconds=stuck_threshold_seconds,
+                waiting_payment_threshold_seconds=waiting_payment_threshold_seconds,
+            ),
             stuck_refund_exists,
         )
 
@@ -302,10 +313,22 @@ class SQLAlchemyAdminQueries(SQLAlchemyRepository):
                         else:
                             ref_status = 'rejected'
 
-                    is_payment_stuck = (
-                        p_status == 'pending' and created_at <= stuck_cutoff
+                    is_payment_stuck = payment_is_stuck(
+                        status=p_status,
+                        provider_payment_id=prov_pid,
+                        created_at=created_at,
+                        now=now,
+                        threshold_seconds=stuck_threshold_seconds,
+                        waiting_payment_threshold_seconds=(
+                            waiting_payment_threshold_seconds
+                        ),
                     ) or any(
-                        r.status == 'processing' and r.created_at <= stuck_cutoff
+                        refund_is_stuck(
+                            status=r.status,
+                            created_at=r.created_at,
+                            now=now,
+                            threshold_seconds=stuck_threshold_seconds,
+                        )
                         for r in p_refunds
                     )
                     normalized_status: Literal['pending', 'succeeded', 'failed'] = (
@@ -490,6 +513,11 @@ class SQLAlchemyAdminQueries(SQLAlchemyRepository):
                     for ev in event_rows
                 ]
 
+                latest_access_version = await session.scalar(
+                    select(UserAccessVersion.last_version).where(
+                        UserAccessVersion.user_id == payment.user_id
+                    )
+                )
                 task_items: list[InternalOutboxTaskItemData] = []
                 for t in task_rows:
                     t_status: Literal[
@@ -523,6 +551,13 @@ class SQLAlchemyAdminQueries(SQLAlchemyRepository):
                             ),
                             payment_id=t.payment_id,
                             user_id=t.user_id,
+                            can_close=admin_can_close(
+                                t.status,
+                                t.task_type,
+                                t.attempts,
+                                access_version=t.access_version,
+                                latest_access_version=latest_access_version,
+                            ),
                         )
                     )
 

@@ -333,6 +333,87 @@ class PaymentCardT28Tests(TestCase):
         self.assertIn('<code>—</code> → <strong><code>pending</code></strong>', html)
         self.assertIn('<td><code>admin</code></td>', html)
 
+    def test_latest_access_task_offers_retry_but_explains_why_close_is_unavailable(
+        self,
+    ) -> None:
+        """BIL-API-13: задачу доступа с последней версией можно повторить, но не закрыть."""
+        from billing.clients import (
+            BillingOutboxTaskItem,
+            BillingPaymentCardData,
+            UserLookupProfile,
+        )
+
+        user_id = UUID('11111111-1111-4111-8111-111111111111')
+        pay_id = UUID('99999999-9999-4999-8999-999999999999')
+        latest_id = UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+        old_id = UUID('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
+        t0 = datetime(2026, 11, 5, 10, 0, tzinfo=timezone.utc)
+
+        def task(task_id: UUID, version: int, can_close: bool) -> BillingOutboxTaskItem:
+            return BillingOutboxTaskItem(
+                id=task_id,
+                target_service='auth',
+                task_type='sync_access',
+                access_version=version,
+                status='requires_intervention',
+                attempts=3,
+                last_error='Auth HTTP 404',
+                created_at=t0,
+                updated_at=t0,
+                can_retry_or_close=True,
+                can_close=can_close,
+            )
+
+        card = BillingPaymentCardData(
+            id=pay_id,
+            user_id=user_id,
+            tariff_code='premium',
+            tariff_name='Подписка',
+            provider_code='yookassa',
+            provider_payment_id='yk_card_latest_01',
+            amount_kopeks=29900,
+            currency='RUB',
+            status='succeeded',
+            failure_reason=None,
+            created_at=t0,
+            updated_at=t0,
+            can_refund=False,
+            can_reconcile_payment=False,
+            subscription=None,
+            refunds=(),
+            operation_events=(),
+            outbox_tasks=(task(latest_id, 2, False), task(old_id, 1, True)),
+        )
+
+        class CardBilling:
+            def get_payment_card(
+                self, payment_id: UUID, *, request_id: str
+            ) -> BillingPaymentCardData:
+                return card
+
+        class CardLookup:
+            def get_by_ids(
+                self, user_ids: list[UUID], *, request_id: str
+            ) -> dict[UUID, UserLookupProfile]:
+                return {
+                    user_id: UserLookupProfile(
+                        user_id=user_id, login='carol_user', tz='Europe/Moscow'
+                    )
+                }
+
+        res = self._get(
+            reverse('admin:billing_payment_detail', args=[pay_id]),
+            billing_client=CardBilling(),
+            lookup_client=CardLookup(),
+        )
+
+        self.assertEqual(res.status_code, 200)
+        html = res.content.decode()
+        self.assertIn(reverse('admin:billing_outbox_task_retry', args=[latest_id]), html)
+        self.assertNotIn(reverse('admin:billing_outbox_task_close', args=[latest_id]), html)
+        self.assertIn('Закрыть нельзя: задача несёт последнюю версию доступа', html)
+        self.assertIn(reverse('admin:billing_outbox_task_close', args=[old_id]), html)
+
     def test_payment_card_unhappy_paths_not_found_auth_down_and_billing_down(
         self,
     ) -> None:

@@ -1,8 +1,8 @@
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal, Protocol
+from typing import Literal, Protocol, TypeVar
 from uuid import UUID
 
 import sentry_sdk
@@ -13,8 +13,13 @@ from clients.payment_provider import (
     CreateProviderRefundRequest,
     PaymentProviderError,
     ProviderIntegrityMismatchError,
+    ProviderOperationAnomalyError,
+    ProviderPaymentSnapshot,
     ProviderPermanentError,
+    ProviderProtocolAnomalyError,
+    ProviderReconciliationError,
     ProviderRefundSnapshot,
+    is_safe_provider_operation_id,
 )
 from clients.payment_provider_registry import PaymentProviderRegistry
 from core.config import WorkerSettings
@@ -26,16 +31,23 @@ from domain.subscription import (
 )
 from repositories.payments import PaymentRepository
 from repositories.records import (
+    DIVERGENCE_SIGNAL_KIND,
     DIVERGENCE_SIGNALED_KEY,
     POST_OUTCOME_UNKNOWN_KEY,
     POST_STOPPED_KEY,
     PaymentRecordProtocol,
     RefundRecordProtocol,
+    has_anomaly_marker,
     lookup_not_found_state,
 )
 from repositories.refunds import RefundRepository
+from services.webhook_probe import WebhookProbeLimiter
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar('T')
+# Вид отметки для прочих аномалий ответа ЮKassa (битое тело, нет полей).
+PROTOCOL_ANOMALY_KIND = 'protocol'
 
 CHECK_THROTTLE_WINDOW = timedelta(seconds=5)
 IDEMPOTENCY_KEY_TTL = timedelta(hours=24)
@@ -94,6 +106,31 @@ def refund_post_cutoff_passed(
     return now - ensure_utc(created_at) >= cutoff
 
 
+def _parse_uuid(value: str | None) -> UUID | None:
+    try:
+        return UUID(value) if value else None
+    except ValueError:
+        return None
+
+
+def log_dropped_payment_number(
+    payment: PaymentRecordProtocol,
+    provider_payment_id: str,
+) -> None:
+    """Номер ЮKassa пришёл, когда платёж уже закрыт: не сохраняем, но пишем след.
+
+    Без записи в логе объект ЮKassa не связать с нашим платежом при разборе
+    (инв. 13: номер сохраняется только у ожидающего платежа).
+    """
+    logger.warning(
+        'Provider payment %s arrived for payment %s that is already %r; '
+        'the number is not stored',
+        provider_payment_id,
+        payment.id,
+        payment.status,
+    )
+
+
 def _raise_monitoring_signal(message: str) -> None:
     """Сигнал в мониторинг (6.4): ERROR-лог и событие в GlitchTip."""
     logger.error(message)
@@ -126,6 +163,10 @@ class ReconcileOutcome:
     failure_reason: str | None
     transitioned: bool
     throttled: bool
+    # ЮKassa отдала по платежу `waiting_for_capture`, неизвестный статус или
+    # аномальный ответ, и нормального ответа с тех пор не было (инв. 16): на
+    # оплату не уводим.
+    provider_anomaly: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +204,7 @@ class PaymentReconciler:
         public_base_url: str = 'http://localhost',
         outbox_dispatcher: OutboxDispatcherProtocol | None = None,
         refund_policy: RefundKeyPolicy | None = None,
+        webhook_probe_limiter: WebhookProbeLimiter | None = None,
     ) -> None:
         self._payments = payments
         self._refunds = refunds
@@ -170,6 +212,55 @@ class PaymentReconciler:
         self._public_base_url = public_base_url.rstrip('/')
         self._outbox_dispatcher = outbox_dispatcher
         self._refund_policy = refund_policy or RefundKeyPolicy()
+        # Один на процесс: `billing-api` передаёт общий экземпляр (dependencies).
+        self._probe_limiter = webhook_probe_limiter or WebhookProbeLimiter()
+
+    async def call_for_operation(
+        self,
+        operation_type: Literal['payment', 'refund'],
+        operation_id: UUID,
+        call: Awaitable[T],
+    ) -> T:
+        """Вызов ЮKassa по нашей операции; аномалии сигналит её владелец (6.4).
+
+        Аномалия вроде `waiting_for_capture` повторяется на каждом чтении, а
+        адаптер не знает, видели ли её раньше. Сверка отмечает вид аномалии в
+        записи операции и поднимает сигнал один раз; дальше — WARNING.
+        """
+        try:
+            return await call
+        except ProviderReconciliationError as exc:
+            # 4xx на чтение нашей операции — ошибка ключей или договора с
+            # провайдером (инв. 15). Адаптер её не сигналит: чтение без
+            # владельца (незнакомый номер из вебхука) сигнала не стоит.
+            _raise_monitoring_signal(
+                f'{operation_type.capitalize()} {operation_id}: provider answered '
+                f'HTTP {exc.status_code} on read: {exc}'
+            )
+            raise
+        except ProviderProtocolAnomalyError as exc:
+            # Прочие аномалии ответа (битое тело, нет суммы) адаптер сигналит
+            # сам; отметка нужна, чтобы не уводить пользователя на оплату.
+            kind = (
+                exc.kind
+                if isinstance(exc, ProviderOperationAnomalyError)
+                else PROTOCOL_ANOMALY_KIND
+            )
+            if operation_type == 'payment':
+                first = await self._payments.mark_payment_signaled(
+                    operation_id, kind=kind
+                )
+            else:
+                first = await self._refunds.mark_refund_signaled(
+                    operation_id, kind=kind
+                )
+            if isinstance(exc, ProviderOperationAnomalyError):
+                message = f'{operation_type.capitalize()} {operation_id}: {exc}'
+                if first:
+                    _raise_monitoring_signal(message)
+                else:
+                    logger.warning('Repeated provider anomaly: %s', message)
+            raise
 
     async def payment_description(self, payment: PaymentRecordProtocol) -> str:
         """Описание платежа в ЮKassa из тарифа платежа (название и срок из БД)."""
@@ -232,6 +323,7 @@ class PaymentReconciler:
         provider_code: str,
         source: ReconcileSource = 'webhook',
         respect_throttle: bool = False,
+        object_hint: Literal['payment', 'refund'] | None = None,
     ) -> ReconcileOutcome | RefundReconcileOutcome | None:
         """Сверяет операцию из вебхука провайдера `provider_code` (BIL-FR-07).
 
@@ -264,7 +356,195 @@ class PaymentReconciler:
                 source=source,
                 respect_throttle=respect_throttle,
             )
+        if source != 'webhook':
+            return None
+        return await self._adopt_unknown_object(
+            cleaned_id, provider_code=provider_code, object_hint=object_hint
+        )
+
+    async def _adopt_unknown_object(
+        self,
+        provider_operation_id: str,
+        *,
+        provider_code: str,
+        object_hint: Literal['payment', 'refund'] | None,
+    ) -> ReconcileOutcome | RefundReconcileOutcome | None:
+        """Вебхук с незнакомым номером: может быть, это наш объект (BIL-API-05).
+
+        Ответ на POST создания мог потеряться, и вебхук — самый ранний способ
+        узнать номер. Читаем объект у провайдера; если в его `metadata` номер
+        нашей незавершённой операции без номера провайдера, привязываем его
+        после тех же проверок, что и находку из списка (инв. 14, 17). Иначе —
+        WARNING: повторять уведомление о чужом объекте незачем, ответ 200.
+
+        Вебхук без подписи может прислать кто угодно (2.5.4), поэтому чтение
+        бывает, только если есть наша операция без номера, не чаще раза в окно
+        на номер и в пределах общего лимита (`WebhookProbeLimiter`).
+        """
+        # Без `event` уведомление не от ЮKassa (она присылает его всегда), а
+        # угадывать тип стоило бы лишнего чтения — не читаем.
+        if object_hint is None or not is_safe_provider_operation_id(
+            provider_operation_id
+        ):
+            logger.debug(
+                'Webhook object %s ignored: no type hint', provider_operation_id
+            )
+            return None
+        # Номер может принадлежать только нашей операции без номера провайдера.
+        # Нет такой — нет и запроса к ЮKassa: поддельный вебхук стоит один
+        # запрос к своей БД.
+        if object_hint == 'refund':
+            has_candidate = await self._refunds.has_refund_awaiting_provider_number(
+                provider_code
+            )
+        else:
+            has_candidate = await self._payments.has_payment_awaiting_provider_number(
+                provider_code
+            )
+        if not has_candidate:
+            logger.debug(
+                'Webhook object %s ignored: no %s awaiting a provider number',
+                provider_operation_id,
+                object_hint,
+            )
+            return None
+        if not self._probe_limiter.allow(provider_code, provider_operation_id):
+            logger.debug(
+                'Webhook object %s not read: probe limit or repeat within window',
+                provider_operation_id,
+            )
+            return None
+        try:
+            if object_hint == 'refund':
+                refund_outcome = await self._adopt_refund(
+                    provider_operation_id, provider_code=provider_code
+                )
+                if refund_outcome is not None:
+                    return refund_outcome
+            else:
+                payment_outcome = await self._adopt_payment(
+                    provider_operation_id, provider_code=provider_code
+                )
+                if payment_outcome is not None:
+                    return payment_outcome
+        except PaymentProviderError as exc:
+            # Объект не наш или ЮKassa не ответила: сигнала нет (6.4), только
+            # след в логе — число таких чтений ограничено лимитом выше.
+            logger.warning(
+                'Webhook object %s could not be read from provider %s as %s: %s',
+                provider_operation_id,
+                provider_code,
+                object_hint,
+                exc,
+            )
+            return None
+        logger.warning(
+            'Webhook for unknown provider object %s (%s) does not belong to an '
+            'unfinished operation of Billing; ignored',
+            provider_operation_id,
+            provider_code,
+        )
         return None
+
+    async def _adopt_refund(
+        self,
+        provider_refund_id: str,
+        *,
+        provider_code: str,
+    ) -> RefundReconcileOutcome | None:
+        gateway = self._providers.get(provider_code)
+        hint = await gateway.get_refund(provider_refund_id)
+        refund_id = _parse_uuid(hint.metadata_refund_id)
+        refund = (
+            None if refund_id is None else await self._refunds.get_refund(refund_id)
+        )
+        if (
+            refund is None
+            or refund.status != 'processing'
+            or refund.provider_refund_id
+            or refund.provider_code != provider_code
+        ):
+            return None
+        payment = await self._payments.get_payment(refund.payment_id)
+        if payment is None or not payment.provider_payment_id:
+            return None
+        checked = await self.call_for_operation(
+            'refund',
+            refund.id,
+            gateway.get_refund(
+                provider_refund_id,
+                expected_refund_id=refund.id,
+                expected_provider_payment_id=payment.provider_payment_id,
+                expected_amount_kopeks=refund.amount_kopeks,
+                expected_currency=refund.currency.strip(),
+            ),
+        )
+        saved = await self._save_created_refund(refund.id, checked)
+        if saved.provider_refund_id != checked.provider_refund_id:
+            return self._build_refund_outcome(
+                saved, transitioned=False, throttled=False
+            )
+        logger.info(
+            'Refund %s attached to provider refund %s from webhook',
+            refund.id,
+            checked.provider_refund_id,
+        )
+        return await self._apply_refund_snapshot(
+            saved, checked, source='webhook', audit_unchanged=False
+        )
+
+    async def _adopt_payment(
+        self,
+        provider_payment_id: str,
+        *,
+        provider_code: str,
+    ) -> ReconcileOutcome | None:
+        gateway = self._providers.get(provider_code)
+        hint = await gateway.get_payment(provider_payment_id)
+        payment_id = _parse_uuid(hint.metadata_payment_id)
+        payment = (
+            None if payment_id is None else await self._payments.get_payment(payment_id)
+        )
+        if (
+            payment is None
+            or payment.status != 'pending'
+            or payment.provider_payment_id
+            or payment.provider_code != provider_code
+        ):
+            return None
+        checked = await self.call_for_operation(
+            'payment',
+            payment.id,
+            gateway.get_payment(
+                provider_payment_id,
+                expected_payment_id=payment.id,
+                expected_amount_kopeks=payment.amount_kopeks,
+                expected_currency=payment.currency.strip(),
+            ),
+        )
+        saved = await self._payments.save_provider_payment_created(
+            payment.id,
+            provider_payment_id=checked.provider_payment_id,
+            confirmation_url=checked.confirmation_url,
+            provider_details=checked.provider_details,
+        )
+        if saved.provider_payment_id != checked.provider_payment_id:
+            log_dropped_payment_number(saved, checked.provider_payment_id)
+            return None
+        logger.info(
+            'Payment %s attached to provider payment %s from webhook',
+            payment.id,
+            checked.provider_payment_id,
+        )
+        # Номера не было, значит пользователь на страницу оплаты не попадал:
+        # при отмене письмо об отказе не нужно (BIL-FR-06).
+        return await self._apply_payment_snapshot(
+            saved,
+            checked,
+            source='webhook',
+            audit_unchanged=False,
+            notify_failure=False,
+        )
 
     async def _check_final_payment_divergence(
         self,
@@ -275,11 +555,15 @@ class PaymentReconciler:
         if not payment.provider_payment_id or details.get(DIVERGENCE_SIGNALED_KEY):
             return
         try:
-            snapshot = await self._providers.get(payment.provider_code).get_payment(
-                payment.provider_payment_id,
-                expected_payment_id=payment.id,
-                expected_amount_kopeks=payment.amount_kopeks,
-                expected_currency=payment.currency.strip(),
+            snapshot = await self.call_for_operation(
+                'payment',
+                payment.id,
+                self._providers.get(payment.provider_code).get_payment(
+                    payment.provider_payment_id,
+                    expected_payment_id=payment.id,
+                    expected_amount_kopeks=payment.amount_kopeks,
+                    expected_currency=payment.currency.strip(),
+                ),
             )
         except PaymentProviderError as exc:
             # Итог уже зафиксирован: сбой ЮKassa не повод просить повтор вебхука.
@@ -294,7 +578,9 @@ class PaymentReconciler:
             ('succeeded', 'failed'),
         ):
             return
-        if not await self._payments.mark_payment_divergence_signaled(payment.id):
+        if not await self._payments.mark_payment_signaled(
+            payment.id, kind=DIVERGENCE_SIGNAL_KIND
+        ):
             return
         _raise_monitoring_signal(
             f'Payment {payment.id} is final {payment.status!r} in Billing, but '
@@ -315,12 +601,16 @@ class PaymentReconciler:
         if payment is None or not payment.provider_payment_id:
             return
         try:
-            snapshot = await self._providers.get(refund.provider_code).get_refund(
-                refund.provider_refund_id,
-                expected_refund_id=refund.id,
-                expected_provider_payment_id=payment.provider_payment_id,
-                expected_amount_kopeks=refund.amount_kopeks,
-                expected_currency=refund.currency.strip(),
+            snapshot = await self.call_for_operation(
+                'refund',
+                refund.id,
+                self._providers.get(refund.provider_code).get_refund(
+                    refund.provider_refund_id,
+                    expected_refund_id=refund.id,
+                    expected_provider_payment_id=payment.provider_payment_id,
+                    expected_amount_kopeks=refund.amount_kopeks,
+                    expected_currency=refund.currency.strip(),
+                ),
             )
         except PaymentProviderError as exc:
             logger.warning(
@@ -334,7 +624,9 @@ class PaymentReconciler:
             ('succeeded', 'rejected'),
         ):
             return
-        if not await self._refunds.mark_refund_divergence_signaled(refund.id):
+        if not await self._refunds.mark_refund_signaled(
+            refund.id, kind=DIVERGENCE_SIGNAL_KIND
+        ):
             return
         _raise_monitoring_signal(
             f'Refund {refund.id} is final {refund.status!r} in Billing, but '
@@ -437,27 +729,30 @@ class PaymentReconciler:
             # До 24 часов: досоздаём платёж по тому же ключу и проверяем через GET
             return_url = f'{self._public_base_url}/billing/payments/{payment.id}'
             try:
-                created_snapshot = await self._providers.get(
-                    payment.provider_code
-                ).create_payment(
-                    CreateProviderPaymentRequest(
-                        payment_id=payment.id,
-                        idempotency_key=payment.idempotency_key,
-                        amount_kopeks=payment.amount_kopeks,
-                        currency=payment.currency.strip(),
-                        description=await self.payment_description(payment),
-                        return_url=return_url,
-                    )
+                created_snapshot = await self.call_for_operation(
+                    'payment',
+                    payment.id,
+                    self._providers.get(payment.provider_code).create_payment(
+                        CreateProviderPaymentRequest(
+                            payment_id=payment.id,
+                            idempotency_key=payment.idempotency_key,
+                            amount_kopeks=payment.amount_kopeks,
+                            currency=payment.currency.strip(),
+                            description=await self.payment_description(payment),
+                            return_url=return_url,
+                        )
+                    ),
                 )
             except ProviderPermanentError as exc:
+                # Инв. 15: платёж не создан, пользователь на страницу оплаты не
+                # попадал — письма об отказе нет (BIL-FR-06).
                 updated, transitioned = await self._payments.finalize_payment_failed(
                     payment.id,
                     failure_reason=exc.message,
                     source=source,
                     public_base_url=self._public_base_url,
+                    notify_user=False,
                 )
-                if transitioned and self._outbox_dispatcher is not None:
-                    await self._outbox_dispatcher.try_deliver_payment_tasks(payment.id)
                 return ReconcileOutcome(
                     payment_id=updated.id,
                     user_id=updated.user_id,
@@ -474,6 +769,10 @@ class PaymentReconciler:
                 confirmation_url=created_snapshot.confirmation_url,
                 provider_details=created_snapshot.provider_details,
             )
+            if payment.provider_payment_id != created_snapshot.provider_payment_id:
+                log_dropped_payment_number(
+                    payment, created_snapshot.provider_payment_id
+                )
 
         return await self.reconcile_payment_record(
             payment,
@@ -536,15 +835,37 @@ class PaymentReconciler:
                 failure_reason=current.failure_reason,
                 transitioned=False,
                 throttled=current.status == 'pending',
+                provider_anomaly=has_anomaly_marker(current.provider_details),
             )
 
-        snapshot = await self._providers.get(payment.provider_code).get_payment(
-            payment.provider_payment_id,
-            expected_payment_id=payment.id,
-            expected_amount_kopeks=payment.amount_kopeks,
-            expected_currency=payment.currency.strip(),
+        snapshot = await self.call_for_operation(
+            'payment',
+            payment.id,
+            self._providers.get(payment.provider_code).get_payment(
+                payment.provider_payment_id,
+                expected_payment_id=payment.id,
+                expected_amount_kopeks=payment.amount_kopeks,
+                expected_currency=payment.currency.strip(),
+            ),
+        )
+        return await self._apply_payment_snapshot(
+            payment,
+            snapshot,
+            source=source,
+            audit_unchanged=audit_unchanged,
+            notify_failure=notify_failure,
         )
 
+    async def _apply_payment_snapshot(
+        self,
+        payment: PaymentRecordProtocol,
+        snapshot: ProviderPaymentSnapshot,
+        *,
+        source: ReconcileSource,
+        audit_unchanged: bool,
+        notify_failure: bool,
+    ) -> ReconcileOutcome:
+        """Применяет проверенный снимок ЮKassa к ожидающему платежу (инв. 6, 7)."""
         if snapshot.domain_status == 'pending':
             confirmation_url = snapshot.confirmation_url or payment.confirmation_url
             updated = await self._payments.record_payment_checked(
@@ -658,17 +979,19 @@ class PaymentReconciler:
                     throttled=False,
                 )
             try:
-                created_snap = await self._providers.get(
-                    refund.provider_code
-                ).create_refund(
-                    CreateProviderRefundRequest(
-                        refund_id=refund.id,
-                        idempotency_key=refund.idempotency_key,
-                        provider_payment_id=payment.provider_payment_id,
-                        amount_kopeks=refund.amount_kopeks,
-                        currency=refund.currency.strip(),
-                        description=f'Возврат по подписке (платёж {payment.id})',
-                    )
+                created_snap = await self.call_for_operation(
+                    'refund',
+                    refund.id,
+                    self._providers.get(refund.provider_code).create_refund(
+                        CreateProviderRefundRequest(
+                            refund_id=refund.id,
+                            idempotency_key=refund.idempotency_key,
+                            provider_payment_id=payment.provider_payment_id,
+                            amount_kopeks=refund.amount_kopeks,
+                            currency=refund.currency.strip(),
+                            description=f'Возврат по подписке (платёж {payment.id})',
+                        )
+                    ),
                 )
             except ProviderPermanentError as exc:
                 if _post_outcome_was_unknown(refund):
@@ -820,13 +1143,15 @@ class PaymentReconciler:
                         transitioned=False,
                         throttled=False,
                     )
-                found_snap = await self._providers.get(
-                    refund.provider_code
-                ).find_refund_by_metadata(
-                    payment.provider_payment_id,
-                    refund_id=refund.id,
-                    expected_amount_kopeks=refund.amount_kopeks,
-                    expected_currency=refund.currency.strip(),
+                found_snap = await self.call_for_operation(
+                    'refund',
+                    refund.id,
+                    self._providers.get(refund.provider_code).find_refund_by_metadata(
+                        payment.provider_payment_id,
+                        refund_id=refund.id,
+                        expected_amount_kopeks=refund.amount_kopeks,
+                        expected_currency=refund.currency.strip(),
+                    ),
                 )
                 if found_snap is None:
                     if misses + 1 < self._refund_policy.lookup_not_found_attempts:
@@ -867,17 +1192,21 @@ class PaymentReconciler:
                 )
             else:
                 try:
-                    created_snap = await self._providers.get(
-                        refund.provider_code
-                    ).create_refund(
-                        CreateProviderRefundRequest(
-                            refund_id=refund.id,
-                            idempotency_key=refund.idempotency_key,
-                            provider_payment_id=payment.provider_payment_id,
-                            amount_kopeks=refund.amount_kopeks,
-                            currency=refund.currency.strip(),
-                            description=f'Возврат по подписке (платёж {payment.id})',
-                        )
+                    created_snap = await self.call_for_operation(
+                        'refund',
+                        refund.id,
+                        self._providers.get(refund.provider_code).create_refund(
+                            CreateProviderRefundRequest(
+                                refund_id=refund.id,
+                                idempotency_key=refund.idempotency_key,
+                                provider_payment_id=payment.provider_payment_id,
+                                amount_kopeks=refund.amount_kopeks,
+                                currency=refund.currency.strip(),
+                                description=(
+                                    f'Возврат по подписке (платёж {payment.id})'
+                                ),
+                            )
+                        ),
                     )
                 except ProviderPermanentError as exc:
                     if _post_outcome_was_unknown(refund):
@@ -1038,13 +1367,30 @@ class PaymentReconciler:
             sentry_sdk.capture_message(message, level='error')
             raise ProviderIntegrityMismatchError(message)
 
-        snapshot = await self._providers.get(refund.provider_code).get_refund(
-            refund.provider_refund_id,
-            expected_refund_id=refund.id,
-            expected_provider_payment_id=payment.provider_payment_id,
-            expected_amount_kopeks=refund.amount_kopeks,
-            expected_currency=refund.currency.strip(),
+        snapshot = await self.call_for_operation(
+            'refund',
+            refund.id,
+            self._providers.get(refund.provider_code).get_refund(
+                refund.provider_refund_id,
+                expected_refund_id=refund.id,
+                expected_provider_payment_id=payment.provider_payment_id,
+                expected_amount_kopeks=refund.amount_kopeks,
+                expected_currency=refund.currency.strip(),
+            ),
         )
+        return await self._apply_refund_snapshot(
+            refund, snapshot, source=source, audit_unchanged=audit_unchanged
+        )
+
+    async def _apply_refund_snapshot(
+        self,
+        refund: RefundRecordProtocol,
+        snapshot: ProviderRefundSnapshot,
+        *,
+        source: ReconcileSource,
+        audit_unchanged: bool,
+    ) -> RefundReconcileOutcome:
+        """Применяет проверенный снимок ЮKassa к возврату в обработке (инв. 6, 7)."""
         if snapshot.domain_status == 'processing':
             updated = await self._refunds.record_refund_checked(
                 refund.id,

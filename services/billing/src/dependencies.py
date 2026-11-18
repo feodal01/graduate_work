@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import cache
 from typing import cast
 from uuid import UUID
 
@@ -31,6 +32,7 @@ from security.service_credentials import ServiceCredentials
 from services.outbox_dispatcher import OutboxDispatcher
 from services.purchase import PurchaseService
 from services.reconciler import PaymentReconciler, RefundKeyPolicy
+from services.webhook_probe import WebhookProbeLimiter, WebhookProbePolicy
 
 AUTH_RATE_LIMITED_MESSAGE = 'Слишком много запросов, повторите через минуту'
 
@@ -130,7 +132,18 @@ async def get_payment_reconciler(
         public_base_url=str(settings.worker.billing_public_base_url),
         outbox_dispatcher=outbox_dispatcher,
         refund_policy=RefundKeyPolicy.from_settings(settings.worker),
+        webhook_probe_limiter=get_webhook_probe_limiter(),
     )
+
+
+@cache
+def get_webhook_probe_limiter() -> WebhookProbeLimiter:
+    """Один ограничитель пробных чтений на процесс `billing-api` (BIL-API-05).
+
+    Сверка создаётся на каждый запрос, а лимит должен быть общим для всех
+    вебхуков процесса — поэтому экземпляр живёт здесь, а не в сверке.
+    """
+    return WebhookProbeLimiter(WebhookProbePolicy.from_settings(settings.worker))
 
 
 async def get_purchase_service(

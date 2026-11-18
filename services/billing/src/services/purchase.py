@@ -6,6 +6,8 @@ from clients.payment_provider import (
     CreateProviderPaymentRequest,
     PaymentProviderError,
     ProviderPermanentError,
+    ProviderProtocolAnomalyError,
+    ProviderStatusAnomalyError,
 )
 from clients.payment_provider_registry import PaymentProviderRegistry
 from domain.errors import DependencyUnavailableError, EntityNotFoundError
@@ -27,6 +29,13 @@ from services.reconciler import (
     CHECK_THROTTLE_WINDOW,
     PaymentReconciler,
     idempotency_key_expired,
+    log_dropped_payment_number,
+)
+
+# Инв. 15: отказ ЮKassa в создании платежа — постоянная ошибка (ключи или
+# договор магазина), повтор через секунду не поможет.
+PAYMENT_TEMPORARILY_UNAVAILABLE_MESSAGE = (
+    'Оплата временно недоступна. Мы уже разбираемся; попробуйте оформить подписку позже'
 )
 
 __all__ = [
@@ -224,6 +233,18 @@ class PurchaseService:
                     failure_reason_display=None,
                     auto_refresh_seconds=None,
                 )
+            if local.auth_access_failed:
+                # Задача выдачи доступа ждёт администратора или закрыта:
+                # автообновление ничего не изменит (US-U-02).
+                return PaymentResultView(
+                    payment_id=local.payment_id,
+                    tariff_title=local.tariff_title,
+                    amount_display=amount_display,
+                    block='succeeded_access_problem',
+                    subscription_ends_display=None,
+                    failure_reason_display=None,
+                    auto_refresh_seconds=None,
+                )
             if local.auth_access_delivered and local.subscription_ends_at is not None:
                 return PaymentResultView(
                     payment_id=local.payment_id,
@@ -301,6 +322,7 @@ class PurchaseService:
             ),
             user_tz=user_tz,
             tariff_price_display=tariff_price_display,
+            latest_subscription_auth_failed=overview.latest_subscription_auth_failed,
         )
         rows = [
             MySubscriptionPaymentRowView(
@@ -350,11 +372,19 @@ class PurchaseService:
                 respect_throttle=respect_throttle,
                 notify_failure=False,
             )
+        except ProviderProtocolAnomalyError:
+            # Инв. 16: деньги могут быть заморожены (`waiting_for_capture`) или
+            # состояние платежа неясно — вместо страницы оплаты экран
+            # результата «Проверяем оплату…».
+            return self._checking_payment_outcome(payment.id)
         except PaymentProviderError as exc:
             raise DependencyUnavailableError(
                 'Не удалось связаться с платёжной системой, попробуйте ещё раз',
                 error_code='payment_provider_unavailable',
             ) from exc
+
+        if outcome.status == 'pending' and outcome.provider_anomaly:
+            return self._checking_payment_outcome(payment.id)
 
         if outcome.status == 'pending':
             url = outcome.confirmation_url or payment.confirmation_url
@@ -382,6 +412,16 @@ class PurchaseService:
         return PurchaseOutcome(
             payment_id=payment.id,
             status='succeeded',
+            redirect_url=result_url,
+            confirmation_url=None,
+        )
+
+    @staticmethod
+    def _checking_payment_outcome(payment_id: UUID) -> PurchaseOutcome:
+        result_url = f'/billing/payments/{payment_id}'
+        return PurchaseOutcome(
+            payment_id=payment_id,
+            status='pending',
             redirect_url=result_url,
             confirmation_url=None,
         )
@@ -433,29 +473,38 @@ class PurchaseService:
 
         return_url = f'{self._public_base_url}/billing/payments/{payment.id}'
         try:
-            snapshot = await self._providers.get(payment.provider_code).create_payment(
-                CreateProviderPaymentRequest(
-                    payment_id=payment.id,
-                    idempotency_key=payment.idempotency_key,
-                    amount_kopeks=payment.amount_kopeks,
-                    currency=payment.currency.strip(),
-                    description=await self._reconciler.payment_description(payment),
-                    return_url=return_url,
-                )
+            snapshot = await self._reconciler.call_for_operation(
+                'payment',
+                payment.id,
+                self._providers.get(payment.provider_code).create_payment(
+                    CreateProviderPaymentRequest(
+                        payment_id=payment.id,
+                        idempotency_key=payment.idempotency_key,
+                        amount_kopeks=payment.amount_kopeks,
+                        currency=payment.currency.strip(),
+                        description=await self._reconciler.payment_description(payment),
+                        return_url=return_url,
+                    )
+                ),
             )
         except ProviderPermanentError as exc:
-            _, transitioned = await self._payments.finalize_payment_failed(
+            # Инв. 15: ЮKassa отказала в создании — пользователь на страницу
+            # оплаты не попадал, письма об отказе нет (BIL-FR-06). Ошибка
+            # постоянная, поэтому текст не зовёт повторить сразу.
+            await self._payments.finalize_payment_failed(
                 payment.id,
                 failure_reason=exc.message,
                 source='continue',
                 public_base_url=self._public_base_url,
+                notify_user=False,
             )
-            if transitioned and self._reconciler is not None:
-                await self._reconciler.notify_payment_tasks(payment.id)
             raise DependencyUnavailableError(
-                'Не удалось связаться с платёжной системой, попробуйте ещё раз',
+                PAYMENT_TEMPORARILY_UNAVAILABLE_MESSAGE,
                 error_code='payment_provider_rejected',
             ) from exc
+        except ProviderStatusAnomalyError:
+            # Повтор POST вернул `waiting_for_capture` (инв. 16): не на оплату.
+            return self._checking_payment_outcome(payment.id)
         except PaymentProviderError as exc:
             raise DependencyUnavailableError(
                 'Не удалось связаться с платёжной системой, попробуйте ещё раз',
@@ -469,6 +518,7 @@ class PurchaseService:
             provider_details=snapshot.provider_details,
         )
         if payment.provider_payment_id != snapshot.provider_payment_id:
+            log_dropped_payment_number(payment, snapshot.provider_payment_id)
             # Номер не сохранён: пока шёл POST, платёж закрыла фоновая сверка
             # (например, по истечении ключа). Инв. 13 разрешает отправить на
             # оплату только после сохранения номера, иначе оплата в ЮKassa

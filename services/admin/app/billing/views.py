@@ -9,6 +9,7 @@ from django.conf import settings
 from django.contrib import messages
 from django.http import Http404, HttpRequest, HttpResponse
 from django.shortcuts import redirect, render
+from django.utils.http import url_has_allowed_host_and_scheme
 from users.models import AuthIdentity
 from users.request_id import get_request_id
 
@@ -143,6 +144,7 @@ class OutboxTaskCardRowView:
     payment_id: UUID | None = None
     user_id: UUID | None = None
     user_login: str | None = None
+    can_close: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -993,6 +995,12 @@ def operation_reconcile(
         )
     except BillingNotFoundError as exc:
         raise Http404('Операция не найдена') from exc
+    except BillingConflictError as exc:
+        # Billing ответил, но проверку нельзя завершить (например, список
+        # возвратов ЮKassa не просматривается до конца): показываем его текст,
+        # а не «не удалось связаться».
+        messages.error(request, str(exc))
+        return redirect(_safe_back_url(request))
     except BillingUnavailableError:
         return render(
             request,
@@ -1011,6 +1019,17 @@ def operation_reconcile(
             f'Статус операции в ЮKassa проверен (текущий статус: {result.status}).',
         )
     return redirect('admin:billing_payment_detail', payment_id=result.payment_id)
+
+
+def _safe_back_url(request: HttpRequest) -> str:
+    referer = request.headers.get('Referer', '')
+    if referer and url_has_allowed_host_and_scheme(
+        referer,
+        allowed_hosts={request.get_host()},
+        require_https=request.is_secure(),
+    ):
+        return referer
+    return reverse_payments_url()
 
 
 def admin_actions_list(request: HttpRequest) -> HttpResponse:
@@ -1247,6 +1266,7 @@ def _build_task_card_row(
         payment_id=item.payment_id,
         user_id=item.user_id,
         user_login=user_login,
+        can_close=(item.can_close if item.can_close is not None else item.can_retry_or_close),
     )
 
 

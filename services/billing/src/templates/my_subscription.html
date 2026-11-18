@@ -13,7 +13,7 @@
     </div>
 </div>
 
-<div class="{% if view.status_key == 'active' %}alert-success{% else %}alert-info{% endif %}" role="status">
+<div class="{% if view.status_key == 'active' %}alert-success{% elif view.status_key == 'access_problem' %}alert-error{% else %}alert-info{% endif %}" role="status">
     <p style="margin: 0;"><strong>Статус подписки:</strong> {{ view.status_display }}</p>
 </div>
 

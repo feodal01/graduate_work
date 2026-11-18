@@ -423,6 +423,9 @@ async def test_get_payment_401_403_404_raises_reconciliation_alert(
         ProviderReconciliationError,
         YooKassaProviderAdapter,
     )
+    from clients.payment_provider_registry import PaymentProviderRegistry
+    from services.reconciler import PaymentReconciler
+    from tests.fakes import FakePaymentRow, InMemoryPurchaseRepository
 
     sentry_messages: list[str] = []
     monkeypatch.setattr(
@@ -446,7 +449,35 @@ async def test_get_payment_401_403_404_raises_reconciliation_alert(
             await adapter.get_payment('yk-existing-1')
         assert not isinstance(exc_info.value, ProviderPermanentError)
         assert exc_info.value.status_code == status_code
+        # Сигнал поднимает владелец операции (сверка, 6.4): чтение объекта без
+        # владельца — например, незнакомого номера из вебхука — сигнала не стоит.
+        assert sentry_messages == []
+
+        repo = InMemoryPurchaseRepository()
+        pay_id = uuid4()
+        repo.payments[pay_id] = FakePaymentRow(
+            id=pay_id,
+            user_id=uuid4(),
+            tariff_id=repo.tariff.id,
+            provider_code='yookassa',
+            amount_kopeks=29_900,
+            currency='RUB',
+            status='pending',
+            idempotency_key=pay_id,
+            provider_payment_id='yk-existing-1',
+        )
+        reconciler = PaymentReconciler(
+            payments=repo,
+            refunds=repo,
+            payment_providers=PaymentProviderRegistry.single(adapter),
+        )
+        with pytest.raises(ProviderReconciliationError):
+            await reconciler.reconcile_payment(
+                pay_id, source='reconcile', respect_throttle=False
+            )
     assert len(sentry_messages) == 1
+    assert str(pay_id) in sentry_messages[0]
+    assert f'HTTP {status_code}' in sentry_messages[0]
 
 
 @pytest.mark.asyncio

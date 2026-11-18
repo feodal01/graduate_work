@@ -164,6 +164,10 @@ class WorkerSettings(BaseSettings):
     # ответ Auth или Notifications. Должно быть больше тайм-аутов этих клиентов.
     billing_outbox_lease_seconds: float = Field(default=60.0, gt=0)
     billing_stuck_threshold_seconds: int = Field(default=600, ge=1)
+    # Ожидающий платёж с номером ЮKassa ждёт пользователя на странице оплаты
+    # (ЮKassa держит его около часа, 2.5.4), поэтому зависшим он считается
+    # только после этого порога (6.4, US-A-02).
+    billing_stuck_waiting_payment_threshold_seconds: int = Field(default=4200, ge=1)
     # Возврат без номера ЮKassa у границы 24-часового ключа (инв. 14):
     # за сколько секунд до истечения ключа POST /v3/refunds больше не шлётся
     # (ответ у самой границы мог бы прийти после розыска по списку);
@@ -174,6 +178,23 @@ class WorkerSettings(BaseSettings):
     )
     billing_refund_lookup_not_found_attempts: int = Field(default=2, ge=1)
     billing_refund_lookup_interval_seconds: float = Field(default=300.0, gt=0)
+    # Пробное чтение ЮKassa по вебхуку с незнакомым номером (BIL-API-05):
+    # вебхук без подписи может прислать кто угодно, поэтому один номер читается
+    # не чаще раза в окно, а всех таких чтений в окне — не больше лимита.
+    billing_webhook_probe_window_seconds: float = Field(default=600.0, gt=0)
+    billing_webhook_probe_max_per_window: int = Field(default=20, ge=1)
+
+    @model_validator(mode='after')
+    def _waiting_payment_threshold_not_shorter(self) -> Self:
+        if (
+            self.billing_stuck_waiting_payment_threshold_seconds
+            < self.billing_stuck_threshold_seconds
+        ):
+            raise ValueError(
+                'billing_stuck_waiting_payment_threshold_seconds must not be less '
+                'than billing_stuck_threshold_seconds'
+            )
+        return self
 
 
 class TracingSettings(BaseSettings):

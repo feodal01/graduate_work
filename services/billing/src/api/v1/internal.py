@@ -7,7 +7,11 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 from api.errors import BillingDomainError
 from api.pagination import PaginationParams
-from clients.payment_provider import PaymentProviderError
+from clients.payment_provider import (
+    DuplicateRefundsError,
+    PaymentProviderError,
+    RefundListIncompleteError,
+)
 from core.config import settings
 from dependencies import (
     get_admin_queries,
@@ -118,6 +122,8 @@ class InternalOutboxTaskItemResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     can_retry_or_close: bool
+    # False для задачи доступа с последней версией пользователя (BIL-API-13).
+    can_close: bool = False
     payment_id: UUID | None = None
     user_id: UUID | None = None
 
@@ -352,6 +358,9 @@ async def get_internal_payments(
             offset=page.offset,
         ),
         stuck_threshold_seconds=settings.worker.billing_stuck_threshold_seconds,
+        waiting_payment_threshold_seconds=(
+            settings.worker.billing_stuck_waiting_payment_threshold_seconds
+        ),
     )
     return InternalPaymentsListResponse(
         total=total,
@@ -477,6 +486,7 @@ async def get_internal_payment_card(
                 created_at=t.created_at,
                 updated_at=t.updated_at,
                 can_retry_or_close=t.can_retry_or_close,
+                can_close=t.can_close,
                 payment_id=t.payment_id,
                 user_id=t.user_id,
             )
@@ -537,6 +547,7 @@ async def get_internal_outbox_tasks(
                 created_at=t.created_at,
                 updated_at=t.updated_at,
                 can_retry_or_close=t.can_retry_or_close,
+                can_close=t.can_close,
                 payment_id=t.payment_id,
                 user_id=t.user_id,
             )
@@ -606,6 +617,7 @@ def _to_outbox_task_response(
         created_at=t.created_at,
         updated_at=t.updated_at,
         can_retry_or_close=t.can_retry_or_close,
+        can_close=t.can_close,
         payment_id=t.payment_id,
         user_id=t.user_id,
     )
@@ -721,6 +733,12 @@ async def get_internal_admin_actions(
     responses={
         401: {'description': 'Invalid or missing service API key'},
         404: {'description': 'Operation not found'},
+        409: {
+            'description': (
+                'Refund list lookup is incomplete or ambiguous '
+                '(refund_lookup_incomplete, refund_lookup_ambiguous)'
+            )
+        },
         422: {'description': 'Invalid operation type or UUID'},
         503: {'description': 'YooKassa or database is unavailable'},
     },
@@ -744,6 +762,26 @@ async def post_internal_operation_reconcile(
             'Operation not found',
             error_code='operation_not_found',
             status_code=404,
+        ) from exc
+    except RefundListIncompleteError as exc:
+        # Инв. 14, 7.2: ЮKassa ответила, но список возвратов не удалось
+        # просмотреть до конца; это не сбой связи, повтор кнопки не поможет.
+        raise BillingDomainError(
+            'ЮKassa отдаёт список возвратов этого платежа не до конца (курсор '
+            'повторяется или страниц больше предела), поэтому попытку нельзя ни '
+            'найти, ни признать несозданной. Возврат остаётся «В обработке»; '
+            'сигнал в мониторинг уже поднят, нужен разбор вручную',
+            error_code='refund_lookup_incomplete',
+            status_code=409,
+        ) from exc
+    except DuplicateRefundsError as exc:
+        raise BillingDomainError(
+            'В ЮKassa несколько возвратов с номером этой попытки ('
+            + ', '.join(exc.provider_refund_ids)
+            + '): ни один не привязан, возврат остаётся «В обработке». '
+            'Сигнал в мониторинг уже поднят, нужен разбор вручную',
+            error_code='refund_lookup_ambiguous',
+            status_code=409,
         ) from exc
     except PaymentProviderError as exc:
         raise BillingDomainError(
@@ -774,6 +812,9 @@ async def get_internal_operational_metrics(
 ) -> OperationalMetricsResponse:
     snapshot = await repo.get_operational_metrics(
         stuck_threshold_seconds=settings.worker.billing_stuck_threshold_seconds,
+        waiting_payment_threshold_seconds=(
+            settings.worker.billing_stuck_waiting_payment_threshold_seconds
+        ),
     )
     return OperationalMetricsResponse(
         stuck_payments_count=snapshot.stuck_payments_count,

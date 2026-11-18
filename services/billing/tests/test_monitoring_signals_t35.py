@@ -18,6 +18,7 @@ from clients.payment_provider import (
     ProviderReconciliationError,
     YooKassaProviderAdapter,
 )
+from clients.payment_provider_registry import PaymentProviderRegistry
 from core.config import settings
 from core.observability import (
     NO_REQUEST_ID,
@@ -28,6 +29,7 @@ from dependencies import get_repositories, get_service_credentials
 from main import create_app
 from security.service_credentials import ServiceCredentials
 from services.monitoring import OperationalMonitor
+from services.reconciler import PaymentReconciler
 from tests.fakes import (
     FakeOutboxTaskRow,
     FakePaymentRow,
@@ -207,24 +209,77 @@ async def test_all_five_mandatory_monitoring_signals_section_6_4(
             for m, lvl in captured_sentry
         )
 
+    # 401/403 при сверке (GET) сигналит владелец операции — сверка; сам адаптер
+    # пишет WARNING: чтение чужого объекта (незнакомый номер из вебхука)
+    # сигнала не стоит.
+    captured_sentry.clear()
     with pytest.raises(ProviderReconciliationError):
         await adapter.get_payment('yk_403', expected_payment_id=pay_id)
-    assert any(
-        'YooKassa reconciliation HTTP 403' in m and lvl == 'error'
-        for m, lvl in captured_sentry
-    )
-
     with pytest.raises(ProviderReconciliationError):
         await adapter.get_refund('yk_ref_401', expected_refund_id=ref_id)
-    assert any(
-        'YooKassa reconciliation HTTP 401' in m and lvl == 'error'
-        for m, lvl in captured_sentry
-    )
-
     with pytest.raises(ProviderReconciliationError):
         await adapter.find_refund_by_metadata('yk_pay_403', refund_id=ref_id)
+    assert captured_sentry == []
 
-    # 2. Сигнал №2 (инвариант 16): статус waiting_for_capture у платежа в ЮKassa
+    owned_repo = InMemoryPurchaseRepository()
+    paid_id = uuid4()
+    for row_id, row_status, provider_pid in (
+        (pay_id, 'pending', 'yk_403'),
+        (paid_id, 'succeeded', 'yk_pay_403'),
+    ):
+        owned_repo.payments[row_id] = FakePaymentRow(
+            id=row_id,
+            user_id=uuid4(),
+            tariff_id=owned_repo.tariff.id,
+            provider_code='yookassa',
+            amount_kopeks=29900,
+            currency='RUB',
+            status=row_status,
+            idempotency_key=row_id,
+            provider_payment_id=provider_pid,
+        )
+    lost_ref_id = uuid4()
+    for refund_id, provider_rid, age in (
+        (ref_id, 'yk_ref_401', timedelta(minutes=1)),
+        (lost_ref_id, None, timedelta(hours=25)),
+    ):
+        owned_repo.refunds[refund_id] = FakeRefundRow(
+            id=refund_id,
+            payment_id=paid_id,
+            subscription_id=uuid4(),
+            provider_code='yookassa',
+            amount_kopeks=29900,
+            status='processing',
+            reason='Возврат',
+            admin_user_id=uuid4(),
+            idempotency_key=refund_id,
+            provider_refund_id=provider_rid,
+            created_at=datetime.now(UTC) - age,
+        )
+    owned_reconciler = PaymentReconciler(
+        payments=owned_repo,
+        refunds=owned_repo,
+        payment_providers=PaymentProviderRegistry.single(adapter),
+    )
+    with pytest.raises(ProviderReconciliationError):
+        await owned_reconciler.reconcile_payment(
+            pay_id, source='reconcile', respect_throttle=False
+        )
+    with pytest.raises(ProviderReconciliationError):
+        await owned_reconciler.reconcile_refund(
+            ref_id, source='reconcile', respect_throttle=False
+        )
+    with pytest.raises(ProviderReconciliationError):
+        await owned_reconciler.reconcile_operation_by_admin('refund', lost_ref_id)
+    owned_signals = [m for m, lvl in captured_sentry if lvl == 'error']
+    assert any(str(pay_id) in m and 'HTTP 403' in m for m in owned_signals)
+    assert any(str(ref_id) in m and 'HTTP 401' in m for m in owned_signals)
+    assert any(str(lost_ref_id) in m and 'HTTP 403' in m for m in owned_signals)
+
+    # 2. Сигнал №2 (инвариант 16): статус waiting_for_capture у платежа в ЮKassa.
+    # Сигнал поднимает сверка — владелец платежа, один раз на платёж; сам
+    # адаптер его не поднимает (не знает, видел ли эту аномалию раньше).
+    captured_sentry.clear()
     with pytest.raises(ProviderProtocolAnomalyError):
         await adapter.get_payment(
             'yk_wfc',
@@ -232,9 +287,33 @@ async def test_all_five_mandatory_monitoring_signals_section_6_4(
             expected_amount_kopeks=29900,
             expected_currency='RUB',
         )
-    assert any(
-        'waiting_for_capture' in m and lvl == 'error' for m, lvl in captured_sentry
+    assert captured_sentry == []
+    wfc_repo = InMemoryPurchaseRepository()
+    wfc_repo.payments[pay_id] = FakePaymentRow(
+        id=pay_id,
+        user_id=uuid4(),
+        tariff_id=wfc_repo.tariff.id,
+        provider_code='yookassa',
+        amount_kopeks=29900,
+        currency='RUB',
+        status='pending',
+        idempotency_key=pay_id,
+        provider_payment_id='yk_wfc',
     )
+    wfc_reconciler = PaymentReconciler(
+        payments=wfc_repo,
+        refunds=wfc_repo,
+        payment_providers=PaymentProviderRegistry.single(adapter),
+    )
+    for _ in range(2):
+        with pytest.raises(ProviderProtocolAnomalyError):
+            await wfc_reconciler.reconcile_payment(
+                pay_id, source='reconcile', respect_throttle=False
+            )
+    wfc_signals = [
+        m for m, lvl in captured_sentry if 'waiting_for_capture' in m and lvl == 'error'
+    ]
+    assert len(wfc_signals) == 1 and str(pay_id) in wfc_signals[0]
 
     # 3. Сигнал №3 (инвариант 17): несовпадение суммы, валюты или UUID в metadata
     for yk_pid in ('yk_mismatch_amount', 'yk_mismatch_curr', 'yk_mismatch_meta'):

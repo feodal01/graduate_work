@@ -22,6 +22,10 @@ from repositories.read_models import (
     UserPaymentHistoryItemData,
 )
 
+# Задача выдачи доступа сама уже не дойдёт до Auth: ждёт администратора или
+# закрыта им (US-U-02, US-U-05 правило 2).
+ACCESS_TASK_FAILED_STATUSES = ('requires_intervention', 'closed')
+
 
 class UserBillingViews(Protocol):
     """Чтение для экранов пользователя: результат оплаты и «Моя подписка»."""
@@ -115,6 +119,7 @@ class SQLAlchemyUserBillingViews(SQLAlchemyRepository):
                     failure_reason=failure_reason,
                     subscription_ends_at=sub_ends_at,
                     auth_access_delivered=auth_task_status == 'completed',
+                    auth_access_failed=auth_task_status in ACCESS_TASK_FAILED_STATUSES,
                     refund_status=(
                         'succeeded'
                         if refund_status == 'succeeded'
@@ -168,6 +173,7 @@ class SQLAlchemyUserBillingViews(SQLAlchemyRepository):
                 has_succeeded_refund = False
                 has_processing_refund = False
                 auth_delivered = False
+                auth_failed = False
 
                 if latest_sub_row is not None:
                     latest_sub_payment_id, latest_ends_at = latest_sub_row
@@ -178,6 +184,7 @@ class SQLAlchemyUserBillingViews(SQLAlchemyRepository):
                         )
                     )
                     auth_delivered = auth_task_status == 'completed'
+                    auth_failed = auth_task_status in ACCESS_TASK_FAILED_STATUSES
 
                     active_refund_status = await session.scalar(
                         select(Refund.status)
@@ -274,6 +281,7 @@ class SQLAlchemyUserBillingViews(SQLAlchemyRepository):
                     tariff_price_kopeks=tariff_price_kopeks,
                     payments=history_items,
                     payments_total=payments_total,
+                    latest_subscription_auth_failed=auth_failed,
                 )
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc

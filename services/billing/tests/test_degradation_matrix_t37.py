@@ -290,7 +290,12 @@ async def test_degradation_matrix_rows_1_to_4_yookassa_failures(
                 expected_amount_kopeks=29900,
                 expected_currency='RUB',
             )
-        assert len(captured_sentry) == 1 and captured_sentry[0][1] == 'error'
+        # Аномалию статуса (`waiting_for_capture`) и 401/403 на чтение сигналит
+        # сверка — владелец платежа; адаптер оставляет только WARNING, чтобы
+        # чтение чужого объекта (незнакомый номер из вебхука) не сигналило.
+        expected_signals = 0 if mode in ('wfc', '401', '403') else 1
+        assert len(captured_sentry) == expected_signals
+        assert all(level == 'error' for _, level in captured_sentry)
 
     repo = InMemoryPurchaseRepository()
     provider = FakeProviderGateway()
@@ -379,7 +384,9 @@ async def test_degradation_matrix_rows_1_to_4_yookassa_failures(
 
         # --- Строки 2 и 4 матрицы 6.3: ЮKassa GET сверки (тайм-аут, 429, 503,
         #     несовпадение суммы/валюты/metadata, waiting_for_capture, 401/403) ---
-        pending_pay.created_at = datetime.now(UTC) - timedelta(minutes=15)
+        # Платёж с номером ЮKassa зависает после порога ожидания пользователя
+        # (70 минут, BILLING_STUCK_WAITING_PAYMENT_THRESHOLD_SECONDS).
+        pending_pay.created_at = datetime.now(UTC) - timedelta(minutes=75)
         for get_err in (
             ProviderTransientError('Timeout on GET payment', status_code=None),
             ProviderTransientError('429 on GET payment', status_code=429),

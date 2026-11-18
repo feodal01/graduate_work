@@ -1165,8 +1165,10 @@ async def test_t26_internal_subscriptions_and_payments_lists_in_real_postgres(
                 status='pending',
                 idempotency_key=stuck_pay_id,
                 provider_payment_id='yk_t26_pg_stuck',
-                created_at=now_utc - timedelta(minutes=25),
-                updated_at=now_utc - timedelta(minutes=25),
+                # С номером ЮKassa платёж ждёт пользователя: зависшим он
+                # считается после 70 минут (6.4).
+                created_at=now_utc - timedelta(minutes=75),
+                updated_at=now_utc - timedelta(minutes=75),
             )
         )
         await session.commit()
@@ -1366,8 +1368,10 @@ async def test_t29_refund_lifecycle_and_atomic_outbox_in_real_postgres(
                     task_type='sync_access',
                     payment_id=payment.id,
                     user_id=user_id,
-                    access_version=3,
-                    payload={'version': 3},
+                    # Устаревшая версия (у пользователя уже 2): такую задачу
+                    # администратор может закрыть (BIL-API-13).
+                    access_version=1,
+                    payload={'version': 1},
                     status='requires_intervention',
                     attempts=20,
                     last_error='Auth HTTP 404',
@@ -2354,10 +2358,13 @@ async def test_failed_payment_without_email_and_divergence_marker_in_postgres(
     ]
 
     pending, _ = await repos.payments.get_or_create_pending_payment(uuid4())
-    assert await repos.payments.mark_payment_divergence_signaled(pending.id) is False
+    assert (
+        await repos.payments.mark_payment_signaled(pending.id, kind='divergence')
+        is False
+    )
     marks = await asyncio.gather(
-        repos.payments.mark_payment_divergence_signaled(silent.id),
-        repos.payments.mark_payment_divergence_signaled(silent.id),
+        repos.payments.mark_payment_signaled(silent.id, kind='divergence'),
+        repos.payments.mark_payment_signaled(silent.id, kind='divergence'),
     )
     assert sorted(marks) == [False, True]
     reloaded = await repos.payments.get_payment(silent.id)
@@ -2368,9 +2375,272 @@ async def test_failed_payment_without_email_and_divergence_marker_in_postgres(
     refund, _ = await repos.refunds.get_or_create_processing_refund(
         paid.id, admin_user_id=uuid4(), reason='Возврат'
     )
-    assert await repos.refunds.mark_refund_divergence_signaled(refund.id) is False
+    assert (
+        await repos.refunds.mark_refund_signaled(refund.id, kind='divergence') is False
+    )
     await repos.refunds.finalize_refund_rejected(
         refund.id, rejection_reason='canceled_by_provider', source='reconcile'
     )
-    assert await repos.refunds.mark_refund_divergence_signaled(refund.id) is True
-    assert await repos.refunds.mark_refund_divergence_signaled(refund.id) is False
+    assert (
+        await repos.refunds.mark_refund_signaled(refund.id, kind='divergence') is True
+    )
+    assert (
+        await repos.refunds.mark_refund_signaled(refund.id, kind='divergence') is False
+    )
+
+
+async def _set_task_state(
+    session_factory: async_sessionmaker[AsyncSession],
+    task_id: UUID,
+    **values: Any,
+) -> None:
+    async with session_factory() as session:
+        task = await session.get(OutboxTask, task_id)
+        assert task is not None
+        for key, value in values.items():
+            setattr(task, key, value)
+        await session.commit()
+
+
+async def test_access_task_close_rule_and_superseded_completion_in_postgres(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """BIL-API-13 и US-S-02 в PostgreSQL: закрытие последней версии и старая в ТВ."""
+    from domain.errors import RuleConflictError
+    from repositories.outbox import DeliveryOutcome
+    from repositories.read_models import InternalOutboxFilter
+    from repositories.records import OutboxTaskRecordProtocol
+
+    session_factory = migrated_billing_db
+    repos, payment_id = await _paid_payment_with_access_task(session_factory)
+    task = await _access_task(session_factory, payment_id)
+    await _set_task_state(
+        session_factory, task.id, status='requires_intervention', attempts=3
+    )
+
+    _, listed = await repos.outbox_admin.list_internal_outbox_tasks(
+        InternalOutboxFilter(limit=50, user_id=task.user_id)
+    )
+    access_item = next(i for i in listed if i.id == task.id)
+    assert (access_item.can_retry_or_close, access_item.can_close) == (True, False)
+    card = await repos.admin_queries.get_internal_payment_card(payment_id)
+    assert card is not None
+    assert next(t for t in card.outbox_tasks if t.id == task.id).can_close is False
+    with pytest.raises(RuleConflictError) as exc_info:
+        await repos.outbox_admin.close_outbox_task_by_admin(
+            task.id, admin_user_id=uuid4(), reason='Не доходит'
+        )
+    assert exc_info.value.error_code == 'outbox_task_latest_access_version'
+
+    # Выдана версия 2 (новая задача доступа), и её доставка в той же
+    # транзакции выполняет старую задачу в ТВ без вызова Auth.
+    newer_id = uuid4()
+    async with session_factory() as session:
+        version = await session.get(UserAccessVersion, task.user_id)
+        assert version is not None
+        version.last_version = 2
+        session.add(
+            OutboxTask(
+                id=newer_id,
+                dedup_key=f'refund_succeeded:{newer_id}:sync_access',
+                target_service='auth',
+                task_type='sync_access',
+                payment_id=payment_id,
+                user_id=task.user_id,
+                access_version=2,
+                payload={'version': 2},
+                next_retry_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+    delivered: list[int | None] = []
+
+    async def deliver(
+        claimed: OutboxTaskRecordProtocol,
+    ) -> tuple[DeliveryOutcome, str | None]:
+        delivered.append(claimed.access_version)
+        return 'completed', None
+
+    await repos.outbox.process_due_auth_outbox_tasks(deliver, payment_id=payment_id)
+
+    assert delivered == [2]
+    old = await _access_task(session_factory, payment_id)
+    async with session_factory() as session:
+        old_row = await session.get(OutboxTask, task.id)
+    assert old_row is not None and old_row.status == 'completed'
+    assert 'superseded by access version 2' in (old_row.last_error or '')
+    assert old.id in {task.id, newer_id}
+
+    # Устаревшую задачу (версия 1 при выданной 2) закрыть можно.
+    stale_id = uuid4()
+    async with session_factory() as session:
+        session.add(
+            OutboxTask(
+                id=stale_id,
+                dedup_key=f'stale:{stale_id}',
+                target_service='auth',
+                task_type='sync_access',
+                payment_id=payment_id,
+                user_id=task.user_id,
+                access_version=1,
+                payload={'version': 1},
+                status='requires_intervention',
+                next_retry_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+    closed = await repos.outbox_admin.close_outbox_task_by_admin(
+        stale_id, admin_user_id=uuid4(), reason='Устарела'
+    )
+    assert closed.status == 'closed'
+
+
+async def test_access_problem_and_stuck_thresholds_in_postgres(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """US-U-02 и 6.4 в PostgreSQL: недоставленный доступ и порог ожидающего платежа."""
+    from repositories.read_models import InternalPaymentFilter
+
+    session_factory = migrated_billing_db
+    repos, payment_id = await _paid_payment_with_access_task(session_factory)
+    task = await _access_task(session_factory, payment_id)
+    await _set_task_state(session_factory, task.id, status='closed')
+    result = await repos.user_views.get_local_payment_result_for_user(
+        payment_id, task.user_id
+    )
+    overview = await repos.user_views.get_user_billing_overview(
+        task.user_id, limit=10, offset=0
+    )
+    assert result is not None and result.auth_access_failed is True
+    assert overview.latest_subscription_auth_failed is True
+
+    now = datetime.now(UTC)
+    waiting, _ = await repos.payments.get_or_create_pending_payment(uuid4())
+    await repos.payments.save_provider_payment_created(
+        waiting.id,
+        provider_payment_id=f'yk_wait_{waiting.id.hex[:8]}',
+        confirmation_url='https://yookassa.test/confirm',
+        provider_details={'id': 'w'},
+    )
+    no_number, _ = await repos.payments.get_or_create_pending_payment(uuid4())
+    async with session_factory() as session:
+        for pid in (waiting.id, no_number.id):
+            row = await session.get(Payment, pid)
+            assert row is not None
+            row.created_at = now - timedelta(minutes=15)
+        await session.commit()
+
+    snapshot = await repos.metrics.get_operational_metrics(
+        stuck_threshold_seconds=600, waiting_payment_threshold_seconds=4200
+    )
+    _, stuck_items = await repos.admin_queries.list_internal_payments(
+        InternalPaymentFilter(limit=50, stuck=True),
+        stuck_threshold_seconds=600,
+        waiting_payment_threshold_seconds=4200,
+    )
+    assert snapshot.stuck_payments_count == 1
+    assert {i.id for i in stuck_items} == {no_number.id}
+
+    async with session_factory() as session:
+        row = await session.get(Payment, waiting.id)
+        assert row is not None
+        row.created_at = now - timedelta(minutes=71)
+        await session.commit()
+    later = await repos.metrics.get_operational_metrics(
+        stuck_threshold_seconds=600, waiting_payment_threshold_seconds=4200
+    )
+    _, later_items = await repos.admin_queries.list_internal_payments(
+        InternalPaymentFilter(limit=50, stuck=True),
+        stuck_threshold_seconds=600,
+        waiting_payment_threshold_seconds=4200,
+    )
+    assert later.stuck_payments_count == 2
+    assert {i.id for i in later_items} == {waiting.id, no_number.id}
+    assert all(i.is_stuck for i in later_items)
+
+
+async def test_provider_anomaly_markers_once_and_cleared_in_postgres(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """Инв. 14, 16 в PostgreSQL: отметка аномалии одна, нормальный ответ её снимает."""
+    from repositories.bundle import BillingRepositories
+    from repositories.records import ANOMALIES_KEY, has_anomaly_marker
+
+    repos = BillingRepositories.sqlalchemy(migrated_billing_db)
+    payment, _ = await repos.payments.get_or_create_pending_payment(uuid4())
+    await repos.payments.save_provider_payment_created(
+        payment.id,
+        provider_payment_id='yk_anomaly_pay',
+        confirmation_url='https://yookassa.test/confirm',
+        provider_details={'id': 'yk_anomaly_pay'},
+    )
+    marks = await asyncio.gather(
+        repos.payments.mark_payment_signaled(payment.id, kind='status'),
+        repos.payments.mark_payment_signaled(payment.id, kind='status'),
+    )
+    assert sorted(marks) == [False, True]
+    # Сбой сверки с backoff не снимает отметку: она копирует сведения.
+    await repos.payments.record_payment_reconcile_error(payment.id, error_message='x')
+    marked = await repos.payments.get_payment(payment.id)
+    assert marked is not None and has_anomaly_marker(marked.provider_details)
+    checked = await repos.payments.record_payment_checked(
+        payment.id, provider_details={'id': 'yk_anomaly_pay', 'status': 'pending'}
+    )
+    assert ANOMALIES_KEY not in (checked.provider_details or {})
+
+    paid = await _paid_payment_with_subscription(repos)
+    refund, _ = await repos.refunds.get_or_create_processing_refund(
+        paid.id, admin_user_id=uuid4(), reason='Возврат'
+    )
+    refund_marks = await asyncio.gather(
+        repos.refunds.mark_refund_signaled(refund.id, kind='refund_list_incomplete'),
+        repos.refunds.mark_refund_signaled(refund.id, kind='refund_list_incomplete'),
+        repos.refunds.mark_refund_signaled(refund.id, kind='duplicate_refunds'),
+    )
+    assert sorted(refund_marks) == [False, True, True]
+    await repos.refunds.record_refund_reconcile_error(refund.id, error_message='x')
+    reloaded = await repos.refunds.get_refund(refund.id)
+    assert reloaded is not None
+    assert (reloaded.provider_details or {})[ANOMALIES_KEY] == {
+        'refund_list_incomplete': True,
+        'duplicate_refunds': True,
+    }
+
+
+async def test_awaiting_provider_number_reads_in_postgres(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """BIL-API-05 в PostgreSQL: есть ли операция, которой может принадлежать номер."""
+    from repositories.bundle import BillingRepositories
+
+    repos = BillingRepositories.sqlalchemy(migrated_billing_db)
+    assert (
+        await repos.payments.has_payment_awaiting_provider_number('yookassa') is False
+    )
+    assert await repos.refunds.has_refund_awaiting_provider_number('yookassa') is False
+
+    payment, _ = await repos.payments.get_or_create_pending_payment(uuid4())
+    assert await repos.payments.has_payment_awaiting_provider_number('yookassa') is True
+    assert (
+        await repos.payments.has_payment_awaiting_provider_number('cloudpayments')
+        is False
+    )
+    await repos.payments.save_provider_payment_created(
+        payment.id,
+        provider_payment_id='yk_awaiting_pay',
+        confirmation_url='https://yookassa.test/confirm',
+        provider_details={'id': 'yk_awaiting_pay'},
+    )
+    assert (
+        await repos.payments.has_payment_awaiting_provider_number('yookassa') is False
+    )
+
+    paid = await _paid_payment_with_subscription(repos)
+    refund, _ = await repos.refunds.get_or_create_processing_refund(
+        paid.id, admin_user_id=uuid4(), reason='Возврат'
+    )
+    assert await repos.refunds.has_refund_awaiting_provider_number('yookassa') is True
+    await repos.refunds.save_provider_refund_created(
+        refund.id, provider_refund_id='yk_awaiting_ref', provider_details={'id': 'r'}
+    )
+    assert await repos.refunds.has_refund_awaiting_provider_number('yookassa') is False

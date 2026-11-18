@@ -136,6 +136,10 @@ class BillingOutboxTaskItem:
     can_retry_or_close: bool
     payment_id: UUID | None = None
     user_id: UUID | None = None
+    # Billing запрещает закрывать задачу доступа с последней версией
+    # пользователя; None — поле не пришло (старый Billing), решает
+    # can_retry_or_close, как раньше.
+    can_close: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -535,6 +539,7 @@ class BillingAdminClient:
                     created_at=_parse_iso_datetime(t['created_at']),
                     updated_at=_parse_iso_datetime(t['updated_at']),
                     can_retry_or_close=bool(t.get('can_retry_or_close', False)),
+                    can_close=(bool(t['can_close']) if 'can_close' in t else None),
                     payment_id=(
                         _parse_uuid(t['payment_id']) if t.get('payment_id') is not None else None
                     ),
@@ -619,6 +624,7 @@ class BillingAdminClient:
                     created_at=_parse_iso_datetime(t['created_at']),
                     updated_at=_parse_iso_datetime(t['updated_at']),
                     can_retry_or_close=bool(t.get('can_retry_or_close', False)),
+                    can_close=(bool(t['can_close']) if 'can_close' in t else None),
                     payment_id=(
                         _parse_uuid(t['payment_id']) if t.get('payment_id') is not None else None
                     ),
@@ -732,6 +738,7 @@ class BillingAdminClient:
                 created_at=_parse_iso_datetime(t['created_at']),
                 updated_at=_parse_iso_datetime(t['updated_at']),
                 can_retry_or_close=bool(t.get('can_retry_or_close', False)),
+                can_close=(bool(t['can_close']) if 'can_close' in t else None),
                 payment_id=(
                     _parse_uuid(t['payment_id']) if t.get('payment_id') is not None else None
                 ),

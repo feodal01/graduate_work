@@ -221,7 +221,11 @@
             {% csrf_token %}
             <button type="submit" class="button">Повторить</button>
           </form>
+          {% if task.can_close %}
           <a class="button" href="{% url 'admin:billing_outbox_task_close' task.id %}">Закрыть с причиной</a>
+          {% else %}
+          <p class="help">Закрыть нельзя: задача несёт последнюю версию доступа пользователя, без неё Auth не узнает о подписке. Используйте «Повторить».</p>
+          {% endif %}
         {% else %}
           —
         {% endif %}

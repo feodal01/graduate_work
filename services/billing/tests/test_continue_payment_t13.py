@@ -641,8 +641,9 @@ async def test_continue_queues_old_payment_email_when_provider_rejects_new_one(
     assert _failed_email_tasks(repo, payment.id) == 1
     new_ids = [pid for pid in repo.payments if pid != payment.id]
     assert len(new_ids) == 1
-    # У нового платежа своё письмо об отказе ЮKassa (BIL-FR-06).
-    assert _failed_email_tasks(repo, new_ids[0]) == 1
+    # Новый платёж ЮKassa не создала, на его оплату пользователь не попадал:
+    # письма по нему нет (BIL-FR-06, инв. 15).
+    assert _failed_email_tasks(repo, new_ids[0]) == 0
 
 
 async def test_continue_without_email_when_new_payment_is_created(

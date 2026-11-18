@@ -191,7 +191,11 @@ async def test_webhook_lookup_is_scoped_to_provider_code() -> None:
     assert foreign is None
     assert own is not None
     assert second.get_calls == ['shared-id-1']
+    # Незнакомый номер без `event` не читается ни у одного провайдера
+    # (BIL-API-05) и не привязывается к операции другого провайдера.
+    assert yookassa.get_refund_calls == []
     assert yookassa.get_calls == []
+    assert repo.payments[payment.id].provider_code == 'cloudpayments'
 
 
 async def test_refund_goes_to_provider_of_the_paid_payment() -> None:

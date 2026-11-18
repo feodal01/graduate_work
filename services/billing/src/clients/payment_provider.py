@@ -52,6 +52,43 @@ class ProviderProtocolAnomalyError(PaymentProviderError):
     """Аномалия протокола провайдера (например, waiting_for_capture — инв. 16)."""
 
 
+class ProviderOperationAnomalyError(ProviderProtocolAnomalyError):
+    """Аномалия, которая повторяется на каждом чтении одной и той же операции.
+
+    Адаптер не знает, читали ли эту операцию раньше, поэтому только пишет
+    WARNING. Сигнал в мониторинг поднимает сверка — владелец операции —
+    один раз на операцию (6.4). `kind` различает виды аномалий.
+    """
+
+    kind: str = 'anomaly'
+
+
+class ProviderStatusAnomalyError(ProviderOperationAnomalyError):
+    """`waiting_for_capture` или неизвестный статус операции (инв. 16)."""
+
+    kind = 'status'
+
+    def __init__(self, message: str, *, provider_status: str) -> None:
+        self.provider_status = provider_status
+        super().__init__(message)
+
+
+class RefundListIncompleteError(ProviderOperationAnomalyError):
+    """Обход списка возвратов не дошёл до последней страницы (инв. 14)."""
+
+    kind = 'refund_list_incomplete'
+
+
+class DuplicateRefundsError(ProviderOperationAnomalyError):
+    """В списке возвратов несколько объектов с UUID одной попытки (инв. 14)."""
+
+    kind = 'duplicate_refunds'
+
+    def __init__(self, message: str, *, provider_refund_ids: list[str]) -> None:
+        self.provider_refund_ids = provider_refund_ids
+        super().__init__(message)
+
+
 class ProviderIntegrityMismatchError(PaymentProviderError):
     """Несовпадение суммы, валюты или UUID в metadata ответа провайдера (инв. 17)."""
 
@@ -150,6 +187,12 @@ def _raise_protocol_anomaly(message: str) -> None:
     raise ProviderProtocolAnomalyError(message)
 
 
+def _raise_operation_anomaly(exc: ProviderOperationAnomalyError) -> None:
+    # Сигнал — за владельцем операции (сверкой), здесь только след в логе.
+    logger.warning('%s', exc)
+    raise exc
+
+
 def _raise_integrity_mismatch(message: str) -> None:
     logger.error(message)
     sentry_sdk.capture_message(message, level='error')
@@ -183,9 +226,15 @@ def parse_decimal_to_kopeks(value: str) -> int:
     return kopeks
 
 
+def is_safe_provider_operation_id(provider_id: str) -> bool:
+    """Безопасен ли номер для подстановки в путь запроса (без сигнала)."""
+    cleaned = provider_id.strip()
+    return bool(cleaned) and _SAFE_PROVIDER_ID_RE.fullmatch(cleaned) is not None
+
+
 def validate_provider_operation_id(provider_id: str) -> str:
     cleaned = provider_id.strip()
-    if not cleaned or not _SAFE_PROVIDER_ID_RE.fullmatch(cleaned):
+    if not is_safe_provider_operation_id(cleaned):
         _raise_protocol_anomaly(
             f'Unsafe or empty provider operation id: {provider_id!r}'
         )
@@ -364,6 +413,9 @@ class YooKassaProviderAdapter:
         target_id = str(refund_id)
         seen_cursors: set[str] = set()
         cursor: str | None = None
+        # Просматриваем все страницы: два возврата с UUID одной попытки —
+        # двойной возврат у провайдера, привязка «первого» его скрыла бы.
+        matches: list[dict[str, Any]] = []
         for _ in range(self._refund_list_max_pages):
             query: dict[str, str | int] = {
                 'payment_id': safe_pay_id,
@@ -380,39 +432,70 @@ class YooKassaProviderAdapter:
             if not isinstance(items, list):
                 _raise_protocol_anomaly('Missing items list in YooKassa GET /refunds')
             assert isinstance(items, list)
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                meta = item.get('metadata')
-                if (
-                    isinstance(meta, dict)
-                    and str(meta.get('refund_id') or '').strip() == target_id
-                ):
-                    return self._to_refund_snapshot(
-                        item,
-                        expected_refund_id=refund_id,
-                        expected_provider_payment_id=safe_pay_id,
-                        expected_amount_kopeks=expected_amount_kopeks,
-                        expected_currency=expected_currency,
-                    )
+            matches.extend(
+                item
+                for item in items
+                if isinstance(item, dict)
+                and isinstance(item.get('metadata'), dict)
+                and str(item['metadata'].get('refund_id') or '').strip() == target_id
+            )
             next_cursor = data.get('next_cursor')
             if next_cursor is None:
                 # Последняя страница: ЮKassa не прислала `next_cursor`.
-                return None
+                return self._single_refund_match(
+                    matches,
+                    refund_id=refund_id,
+                    provider_payment_id=safe_pay_id,
+                    expected_amount_kopeks=expected_amount_kopeks,
+                    expected_currency=expected_currency,
+                )
             if not isinstance(next_cursor, str) or not next_cursor.strip():
                 _raise_protocol_anomaly('Invalid next_cursor in YooKassa GET /refunds')
             assert isinstance(next_cursor, str)
             if next_cursor in seen_cursors:
-                _raise_protocol_anomaly(
-                    f'Repeated next_cursor in YooKassa GET /refunds for {safe_pay_id}'
+                _raise_operation_anomaly(
+                    RefundListIncompleteError(
+                        f'Repeated next_cursor in YooKassa GET /refunds '
+                        f'for {safe_pay_id}; search is incomplete'
+                    )
                 )
             seen_cursors.add(next_cursor)
             cursor = next_cursor
-        _raise_protocol_anomaly(
-            f'Refund list for {safe_pay_id} exceeds '
-            f'{self._refund_list_max_pages} pages; search is incomplete'
+        _raise_operation_anomaly(
+            RefundListIncompleteError(
+                f'Refund list for {safe_pay_id} exceeds '
+                f'{self._refund_list_max_pages} pages; search is incomplete'
+            )
         )
         return None
+
+    def _single_refund_match(
+        self,
+        matches: list[dict[str, Any]],
+        *,
+        refund_id: UUID,
+        provider_payment_id: str,
+        expected_amount_kopeks: int | None,
+        expected_currency: str | None,
+    ) -> ProviderRefundSnapshot | None:
+        if not matches:
+            return None
+        if len(matches) > 1:
+            ids = [str(item.get('id') or '?') for item in matches]
+            _raise_operation_anomaly(
+                DuplicateRefundsError(
+                    f'Refund list for {provider_payment_id} has {len(ids)} refunds '
+                    f'with attempt {refund_id}: {", ".join(ids)}',
+                    provider_refund_ids=ids,
+                )
+            )
+        return self._to_refund_snapshot(
+            matches[0],
+            expected_refund_id=refund_id,
+            expected_provider_payment_id=provider_payment_id,
+            expected_amount_kopeks=expected_amount_kopeks,
+            expected_currency=expected_currency,
+        )
 
     async def _request(
         self,
@@ -469,12 +552,15 @@ class YooKassaProviderAdapter:
 
         if not is_creation and 400 <= response.status_code < 500:
             description = self._extract_error_description(response)
-            msg = (
-                f'YooKassa reconciliation HTTP {response.status_code} '
-                f'on {method} {path}: {description}'
+            # Сигнал поднимает владелец операции (сверка): чтение незнакомого
+            # объекта по вебхуку с 404 сигнала не стоит.
+            logger.warning(
+                'YooKassa reconciliation HTTP %s on %s %s: %s',
+                response.status_code,
+                method,
+                path,
+                description,
             )
-            logger.error(msg)
-            sentry_sdk.capture_message(msg, level='error')
             raise ProviderReconciliationError(response.status_code, description)
 
         if response.status_code != 200:
@@ -529,9 +615,12 @@ class YooKassaProviderAdapter:
             _raise_protocol_anomaly('Missing payment id or status in YooKassa response')
 
         if raw_status == 'waiting_for_capture':
-            _raise_protocol_anomaly(
-                f'YooKassa returned anomalous status waiting_for_capture '
-                f'for payment {provider_payment_id} (invariant 16)'
+            _raise_operation_anomaly(
+                ProviderStatusAnomalyError(
+                    f'YooKassa returned anomalous status waiting_for_capture '
+                    f'for payment {provider_payment_id} (invariant 16)',
+                    provider_status=raw_status,
+                )
             )
 
         status_map: dict[str, DomainPaymentStatus] = {
@@ -540,9 +629,12 @@ class YooKassaProviderAdapter:
             'canceled': 'failed',
         }
         if raw_status not in status_map:
-            _raise_protocol_anomaly(
-                f'Unknown YooKassa payment status {raw_status!r} '
-                f'for {provider_payment_id}'
+            _raise_operation_anomaly(
+                ProviderStatusAnomalyError(
+                    f'Unknown YooKassa payment status {raw_status!r} '
+                    f'for {provider_payment_id}',
+                    provider_status=raw_status,
+                )
             )
         domain_status = status_map[raw_status]
 
@@ -631,9 +723,12 @@ class YooKassaProviderAdapter:
             'canceled': 'rejected',
         }
         if raw_status not in status_map:
-            _raise_protocol_anomaly(
-                f'Unknown YooKassa refund status {raw_status!r} '
-                f'for {provider_refund_id}'
+            _raise_operation_anomaly(
+                ProviderStatusAnomalyError(
+                    f'Unknown YooKassa refund status {raw_status!r} '
+                    f'for {provider_refund_id}',
+                    provider_status=raw_status,
+                )
             )
         domain_status = status_map[raw_status]
 

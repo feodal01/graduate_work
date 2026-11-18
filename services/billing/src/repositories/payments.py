@@ -27,7 +27,7 @@ from repositories.payment_tasks import (
 from repositories.read_models import TariffData
 from repositories.records import (
     PaymentRecordProtocol,
-    set_divergence_marker,
+    set_signal_kind_marker,
 )
 
 
@@ -126,7 +126,11 @@ class PaymentRepository(Protocol):
         public_base_url: str = 'http://localhost',
     ) -> bool: ...
 
-    async def mark_payment_divergence_signaled(self, payment_id: UUID) -> bool: ...
+    async def mark_payment_signaled(self, payment_id: UUID, *, kind: str) -> bool: ...
+
+    async def has_payment_awaiting_provider_number(
+        self, provider_code: str
+    ) -> bool: ...
 
 
 class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
@@ -630,6 +634,30 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 
-    async def mark_payment_divergence_signaled(self, payment_id: UUID) -> bool:
-        """Отметка «расхождение с ЮKassa уже в мониторинге» (инв. 7, 6.4)."""
-        return await self._set_marker_once('payment', payment_id, set_divergence_marker)
+    async def mark_payment_signaled(self, payment_id: UUID, *, kind: str) -> bool:
+        """Отметка «сигнал вида kind по платежу поднят» (6.4); True — в первый раз."""
+        return await self._set_marker_once(
+            'payment', payment_id, lambda record: set_signal_kind_marker(record, kind)
+        )
+
+    async def has_payment_awaiting_provider_number(self, provider_code: str) -> bool:
+        """Есть ли ожидающий платёж без номера провайдера (BIL-API-05).
+
+        Только такой платёж может принадлежать незнакомому номеру из вебхука;
+        без него вебхук не стоит ни одного запроса к провайдеру. Один запрос
+        по индексу (status, created_at): ожидающих платежей немного.
+        """
+        try:
+            async with self._session_factory() as session:
+                found = await session.scalar(
+                    select(Payment.id)
+                    .where(
+                        Payment.status == 'pending',
+                        Payment.provider_code == provider_code,
+                        Payment.provider_payment_id.is_(None),
+                    )
+                    .limit(1)
+                )
+                return found is not None
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc

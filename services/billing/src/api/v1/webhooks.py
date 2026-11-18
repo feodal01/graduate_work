@@ -1,5 +1,5 @@
 import re
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -43,6 +43,20 @@ class YooKassaWebhookRequest(BaseModel):
     object: YooKassaWebhookObject
 
 
+def _object_hint(event: str | None) -> Literal['payment', 'refund'] | None:
+    """Тип объекта по `event` («payment.succeeded», «refund.succeeded»).
+
+    Статус из тела не используется (BIL-NFR-SEC-04); тип нужен только чтобы
+    незнакомый номер прочитать у ЮKassa одним запросом.
+    """
+    prefix = (event or '').split('.', 1)[0]
+    if prefix == 'payment':
+        return 'payment'
+    if prefix == 'refund':
+        return 'refund'
+    return None
+
+
 class YooKassaWebhookResponse(BaseModel):
     status: str = 'ok'
 
@@ -63,9 +77,11 @@ async def handle_yookassa_webhook(
             provider_code=YooKassaProviderAdapter.provider_code,
             source='webhook',
             respect_throttle=False,
+            object_hint=_object_hint(payload.event),
         )
     except (ProviderIntegrityMismatchError, ProviderProtocolAnomalyError):
-        # Аномалия уже отправлена в мониторинг, повторы вебхука не нужны
+        # Аномалию отмечает адаптер или сверка (один сигнал на операцию),
+        # повторы вебхука ничего не изменят
         return YooKassaWebhookResponse(status='ok')
     except PaymentProviderError as exc:
         raise BillingDomainError(

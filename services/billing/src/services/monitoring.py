@@ -19,10 +19,12 @@ class OperationalMonitor:
         *,
         repository: OperationalMetricsRepository,
         stuck_threshold_seconds: int = 600,
+        waiting_payment_threshold_seconds: int = 4200,
         alert_cooldown_seconds: float = 300.0,
     ) -> None:
         self._repo = repository
         self._stuck_threshold_seconds = stuck_threshold_seconds
+        self._waiting_payment_threshold_seconds = waiting_payment_threshold_seconds
         self._alert_cooldown = timedelta(seconds=alert_cooldown_seconds)
         self._last_stuck_payments = 0
         self._last_stuck_refunds = 0
@@ -41,6 +43,7 @@ class OperationalMonitor:
             now = now_utc or datetime.now(UTC)
             snapshot = await self._repo.get_operational_metrics(
                 stuck_threshold_seconds=self._stuck_threshold_seconds,
+                waiting_payment_threshold_seconds=self._waiting_payment_threshold_seconds,
                 now_utc=now,
             )
 
@@ -87,7 +90,8 @@ class OperationalMonitor:
                     msg = (
                         f'Сигнал мониторинга «Зависшие операции»: обнаружено '
                         f'{snapshot.stuck_operations_count} операций старше '
-                        f'{self._stuck_threshold_seconds} с '
+                        f'{self._stuck_threshold_seconds} с (платёж с номером '
+                        f'ЮKassa — {self._waiting_payment_threshold_seconds} с) '
                         f'(платежей pending: {snapshot.stuck_payments_count}, '
                         f'возвратов processing: {snapshot.stuck_refunds_count})'
                     )

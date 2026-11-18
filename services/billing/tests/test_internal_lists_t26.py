@@ -1,5 +1,5 @@
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -133,7 +133,8 @@ def _seed_subscriptions_and_payments(
         currency='RUB',
         status='pending',
         idempotency_key=pay_stuck_pending_id,
-        provider_payment_id='yk_pay_stuck_04',
+        # Номера ЮKassa нет: платёж завис по общему порогу (6.4).
+        provider_payment_id=None,
         created_at=now_utc - timedelta(minutes=15),
         updated_at=now_utc - timedelta(minutes=15),
     )
@@ -458,6 +459,22 @@ async def test_internal_payments_filters_stuck_and_unhappy_paths(
             str(ids['pay_stuck_refund_id']),
         }
         assert all(i['is_stuck'] is True for i in stuck_resp.json()['items'])
+
+        # 4a. Платёж с номером ЮKassa ждёт пользователя на странице оплаты: в
+        # 15 минут он ещё не завис (порог 70 минут); без номера — завис (6.4).
+        stuck_pay_id = ids['pay_stuck_pending_id']
+        assert isinstance(stuck_pay_id, UUID)
+        stuck_pay = repo.payments[stuck_pay_id]
+        stuck_pay.provider_payment_id = 'yk_pay_waiting_user'
+        waiting_resp = await client.get(PAYMENTS_PATH, params={'stuck': 'true'})
+        assert str(ids['pay_stuck_pending_id']) not in {
+            i['id'] for i in waiting_resp.json()['items']
+        }
+        stuck_pay.created_at = now_utc - timedelta(minutes=71)
+        late_resp = await client.get(PAYMENTS_PATH, params={'stuck': 'true'})
+        assert str(ids['pay_stuck_pending_id']) in {
+            i['id'] for i in late_resp.json()['items']
+        }
 
         # 5. Unhappy paths: невалидные параметры -> 422
         invalid_pay_params: list[dict[str, str | int]] = [

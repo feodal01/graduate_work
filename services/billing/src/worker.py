@@ -189,6 +189,9 @@ async def main() -> None:
     monitor = OperationalMonitor(
         repository=repos.metrics,
         stuck_threshold_seconds=settings.worker.billing_stuck_threshold_seconds,
+        waiting_payment_threshold_seconds=(
+            settings.worker.billing_stuck_waiting_payment_threshold_seconds
+        ),
     )
 
     runner_ref: list[BillingWorkerRunner] = []

@@ -30,6 +30,9 @@ class LocalPaymentResultData:
     # Действующий возврат платежа: исходная задача выдачи доступа после него
     # остаётся выполненной, поэтому открыт ли доступ, по ней одной не понять.
     refund_status: Literal['processing', 'succeeded'] | None = None
+    # Задача выдачи доступа требует вмешательства или закрыта: доступ сам не
+    # откроется, и «доступ активируется» было бы неправдой (US-U-02).
+    auth_access_failed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +59,9 @@ class UserBillingOverviewData:
     # Одна страница истории и общее число платежей пользователя.
     payments: list[UserPaymentHistoryItemData]
     payments_total: int
+    # Задача выдачи доступа по последней подписке требует вмешательства или
+    # закрыта (правило 2 таблицы US-U-05).
+    latest_subscription_auth_failed: bool = False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -163,6 +169,9 @@ class InternalOutboxTaskItemData:
     can_retry_or_close: bool
     payment_id: UUID | None = None
     user_id: UUID | None = None
+    # «Закрыть с причиной»: недоступно для задачи доступа с последней версией
+    # пользователя, даже когда «Повторить» доступно (BIL-API-13).
+    can_close: bool = False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

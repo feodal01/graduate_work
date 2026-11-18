@@ -212,3 +212,44 @@ class ManualReconcileT34AdminTests(TestCase):
         mode = '503'
         with self.assertRaises(BillingUnavailableError):
             client.reconcile_operation('payment', pid, request_id='r3')
+
+    def test_reconcile_conflict_from_billing_shows_its_message(self) -> None:
+        """Инв. 14, 7.2: незавершённый обход списка — текст Billing, а не «нет связи».
+
+        Billing отвечает 409 `refund_lookup_incomplete`: ЮKassa доступна, но
+        список возвратов не просматривается до конца. Администратор должен
+        увидеть эту причину, а не страницу «Billing недоступен».
+        """
+        from billing.clients import BillingConflictError
+
+        refund_id = uuid4()
+        payment_id = UUID('12121212-1212-4121-8121-121212121212')
+        detail = 'ЮKassa отдаёт список возвратов этого платежа не до конца'
+
+        class ConflictBilling:
+            def reconcile_operation(
+                self, operation_type: str, operation_id: UUID, *, request_id: str
+            ) -> object:
+                raise BillingConflictError(detail)
+
+        card_url = reverse('admin:billing_payment_detail', args=[payment_id])
+        url = reverse('admin:billing_operation_reconcile', args=['refund', refund_id])
+        with (
+            patch('users.auth_middleware.get_auth_client', return_value=self.auth_client),
+            patch('billing.views.get_billing_client', return_value=ConflictBilling()),
+        ):
+            res = self.client.post(
+                url,
+                headers={'X-Request-Id': 't34-conflict', 'Referer': f'http://testserver{card_url}'},
+            )
+            foreign = self.client.post(
+                url,
+                headers={'X-Request-Id': 't34-conflict', 'Referer': 'https://evil.example/'},
+            )
+
+        self.assertEqual(res.status_code, 302)
+        self.assertEqual(res['Location'], f'http://testserver{card_url}')
+        self.assertEqual(foreign.status_code, 302)
+        self.assertEqual(foreign['Location'], reverse('admin:billing_payments'))
+        stored = [str(m) for m in res.wsgi_request._messages]  # type: ignore[attr-defined]
+        self.assertIn(detail, stored)

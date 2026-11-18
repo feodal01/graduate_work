@@ -245,16 +245,24 @@ async def test_purchase_marks_payment_failed_when_yookassa_returns_400_401_403(
         AuthenticatedUser,
     ],
 ) -> None:
-    """BIL-FR-06, инв. 15: при 400/401/403 от ЮKassa платёж переводится в failed."""
+    """BIL-FR-06, инв. 15: при 400/401/403 от ЮKassa платёж переводится в failed.
+
+    Пользователь на страницу оплаты не попадал: письма об отказе нет, а текст
+    ошибки не зовёт повторить сразу (код 503 и `payment_provider_rejected`).
+    """
     client, _, repo, provider, _ = purchase_test_env
     provider.create_error = ProviderPermanentError(401, 'Invalid shopId or key')
 
     resp = await client.post('/api/v1/billing/payments')
     assert resp.status_code == 503
+    assert resp.json()['error_code'] == 'payment_provider_rejected'
+    assert 'Оплата временно недоступна' in resp.text
+    assert 'попробуйте ещё раз' not in resp.text
     saved = next(iter(repo.payments.values()))
     assert saved.status == 'failed'
     assert saved.failure_reason is not None
-    assert f'payment_failed:{saved.id}:notify_failed' in repo.outbox_tasks
+    assert f'payment_failed:{saved.id}:notify_failed' not in repo.outbox_tasks
+    assert [t for t in repo.outbox_tasks.values() if t.payment_id == saved.id] == []
 
 
 @pytest.mark.asyncio
