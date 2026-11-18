@@ -173,7 +173,11 @@
       <td>{{ ev.created_utc_display }}</td>
       <td>{{ ev.created_local_display }}</td>
       <td>{{ ev.operation_type_label }} (<code>{{ ev.operation_id }}</code>)</td>
+      {% if ev.status_unchanged %}
+      <td><code>{{ ev.to_status }}</code> — Проверка в ЮKassa: статус не изменился</td>
+      {% else %}
       <td><code>{{ ev.from_status }}</code> → <strong><code>{{ ev.to_status }}</code></strong></td>
+      {% endif %}
       <td><code>{{ ev.source }}</code></td>
       <td><code>{{ ev.details_display }}</code></td>
     </tr>

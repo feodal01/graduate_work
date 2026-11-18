@@ -244,6 +244,95 @@ class PaymentCardT28Tests(TestCase):
         self.assertContains(res, 'Повторить')
         self.assertContains(res, 'Закрыть с причиной')
 
+    def test_payment_card_labels_admin_check_without_status_change(self) -> None:
+        """US-A-06, BIL-FR-13: ручная проверка без смены статуса читается как проверка.
+
+        Billing пишет такую проверку записью с одинаковыми старым и новым
+        статусом и источником `admin`; поддержка должна видеть, что статус
+        не менялся, а не «переход pending → pending».
+        """
+        from billing.clients import (
+            BillingOperationEventItem,
+            BillingPaymentCardData,
+            UserLookupProfile,
+        )
+
+        user_id = UUID('11111111-1111-4111-8111-111111111111')
+        pay_id = UUID('88888888-8888-4888-8888-888888888888')
+        t0 = datetime(2026, 11, 5, 10, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 11, 5, 10, 7, tzinfo=timezone.utc)
+        card = BillingPaymentCardData(
+            id=pay_id,
+            user_id=user_id,
+            tariff_code='premium',
+            tariff_name='Подписка',
+            provider_code='yookassa',
+            provider_payment_id='yk_card_check_01',
+            amount_kopeks=29900,
+            currency='RUB',
+            status='pending',
+            failure_reason=None,
+            created_at=t0,
+            updated_at=t1,
+            can_refund=False,
+            can_reconcile_payment=True,
+            subscription=None,
+            refunds=(),
+            operation_events=(
+                BillingOperationEventItem(
+                    id=uuid4(),
+                    operation_type='payment',
+                    operation_id=pay_id,
+                    from_status=None,
+                    to_status='pending',
+                    source='continue',
+                    details={'created': True},
+                    created_at=t0,
+                ),
+                BillingOperationEventItem(
+                    id=uuid4(),
+                    operation_type='payment',
+                    operation_id=pay_id,
+                    from_status='pending',
+                    to_status='pending',
+                    source='admin',
+                    details={'check': 'status_unchanged'},
+                    created_at=t1,
+                ),
+            ),
+            outbox_tasks=(),
+        )
+
+        class CardBilling:
+            def get_payment_card(
+                self, payment_id: UUID, *, request_id: str
+            ) -> BillingPaymentCardData:
+                return card
+
+        class CardLookup:
+            def get_by_ids(
+                self, user_ids: list[UUID], *, request_id: str
+            ) -> dict[UUID, UserLookupProfile]:
+                return {
+                    user_id: UserLookupProfile(
+                        user_id=user_id, login='bob_check_user', tz='Europe/Moscow'
+                    )
+                }
+
+        res = self._get(
+            reverse('admin:billing_payment_detail', args=[pay_id]),
+            billing_client=CardBilling(),
+            lookup_client=CardLookup(),
+        )
+
+        self.assertEqual(res.status_code, 200)
+        html = res.content.decode()
+        self.assertIn('Проверка в ЮKassa: статус не изменился', html)
+        self.assertNotIn('<code>pending</code> → <strong><code>pending</code></strong>', html)
+        # Обычный переход по-прежнему показывается стрелкой.
+        self.assertIn('<code>—</code> → <strong><code>pending</code></strong>', html)
+        self.assertIn('<td><code>admin</code></td>', html)
+
     def test_payment_card_unhappy_paths_not_found_auth_down_and_billing_down(
         self,
     ) -> None:

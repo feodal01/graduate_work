@@ -147,7 +147,10 @@ async def test_repeat_purchase_when_pending_was_canceled_creates_new_payment(
         AuthenticatedUser,
     ],
 ) -> None:
-    """BIL-FR-02: если pending отменён в ЮKassa, он закрывается и создаётся новый."""
+    """BIL-FR-02: если pending отменён в ЮKassa, он закрывается и создаётся новый.
+
+    BIL-FR-06: письма об отказе по старому платежу нет — новый создан в том же запросе.
+    """
     client, _, repo, provider, _ = purchase_test_env
 
     first = await client.post('/api/v1/billing/payments')
@@ -163,7 +166,7 @@ async def test_repeat_purchase_when_pending_was_canceled_creates_new_payment(
         == 'https://yoomoney.ru/checkout/payments/v2/contract?orderId=yk-pay-2'
     )
     assert repo.payments[first_id].status == 'failed'
-    assert f'payment_failed:{first_id}:notify_failed' in repo.outbox_tasks
+    assert f'payment_failed:{first_id}:notify_failed' not in repo.outbox_tasks
     assert len(repo.payments) == 2
     assert len(provider.create_calls) == 2
 

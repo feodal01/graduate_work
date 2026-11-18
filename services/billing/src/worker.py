@@ -19,7 +19,7 @@ from db.sql.postgres import PostgresDatabase
 from repositories.bundle import BillingRepositories
 from services.monitoring import OperationalMonitor
 from services.outbox_dispatcher import OutboxDispatcher
-from services.reconciler import PaymentReconciler
+from services.reconciler import PaymentReconciler, RefundKeyPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +184,7 @@ async def main() -> None:
         payment_providers=payment_providers,
         public_base_url=str(settings.worker.billing_public_base_url),
         outbox_dispatcher=outbox_dispatcher,
+        refund_policy=RefundKeyPolicy.from_settings(settings.worker),
     )
     monitor = OperationalMonitor(
         repository=repos.metrics,

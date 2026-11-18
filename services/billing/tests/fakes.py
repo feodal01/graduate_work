@@ -41,6 +41,7 @@ from repositories.outbox import (
     compute_outbox_backoff_seconds,
     transient_failure_transition,
 )
+from repositories.payment_tasks import payment_failed_email_task_key
 from repositories.read_models import (
     InternalAdminActionFilter,
     InternalAdminActionItemData,
@@ -58,6 +59,14 @@ from repositories.read_models import (
     TariffData,
     UserBillingOverviewData,
     UserPaymentHistoryItemData,
+)
+from repositories.records import (
+    LOOKUP_NOT_FOUND_KEY,
+    POST_OUTCOME_UNKNOWN_KEY,
+    keep_detail_markers,
+    lookup_not_found_marker,
+    set_divergence_marker,
+    set_post_stopped_marker,
 )
 
 
@@ -171,7 +180,7 @@ class InMemoryPurchaseRepository:
             tuple[str, UUID, str | None, str, str, dict[str, Any] | None]
         ] = []
 
-    async def check_purchase_allowed(self, user_id: UUID) -> tuple[bool, str | None]:
+    async def _check_purchase_allowed(self, user_id: UUID) -> tuple[bool, str | None]:
         """Проверяет отсутствие активной подписки и возврата в обработке."""
         if self.db_unavailable:
             raise DatabaseUnavailableError('billing-db is down')
@@ -357,7 +366,7 @@ class InMemoryPurchaseRepository:
                 return payment
         return None
 
-    async def list_due_pending_payments(
+    async def _due_pending_payments(
         self,
         *,
         min_age_seconds: float,
@@ -394,7 +403,7 @@ class InMemoryPurchaseRepository:
         throttle_seconds: float = 5.0,
     ) -> FakePaymentRow | None:
         """Атомарно захватывает один pending-платёж на сверку."""
-        due = await self.list_due_pending_payments(
+        due = await self._due_pending_payments(
             min_age_seconds=min_age_seconds,
             throttle_seconds=throttle_seconds,
             limit=1,
@@ -438,7 +447,7 @@ class InMemoryPurchaseRepository:
         provider_code: str = 'yookassa',
     ) -> tuple[FakePaymentRow, bool]:
         """Возвращает существующий или создаёт новый pending-платёж."""
-        allowed, block_code = await self.check_purchase_allowed(user_id)
+        allowed, block_code = await self._check_purchase_allowed(user_id)
         if not allowed:
             if block_code == 'subscription_already_active':
                 raise RuleConflictError(
@@ -497,6 +506,7 @@ class InMemoryPurchaseRepository:
         *,
         confirmation_url: str | None = None,
         provider_details: dict[str, Any] | None = None,
+        event_source: ReconcileSource | None = None,
     ) -> FakePaymentRow:
         """Фиксирует время последней сверки GET для pending-платежа."""
         row = self.payments[payment_id]
@@ -508,7 +518,32 @@ class InMemoryPurchaseRepository:
             row.last_checked_at = datetime.now(UTC)
             row.next_reconcile_at = None
             row.updated_at = row.last_checked_at
+            if event_source is not None:
+                self._add_unchanged_check_event('payment', payment_id, event_source)
         return row
+
+    def _add_unchanged_check_event(
+        self,
+        operation_type: str,
+        operation_id: UUID,
+        source: ReconcileSource,
+    ) -> None:
+        """Как в SQL: проверка без смены статуса пишет переход X -> X."""
+        status = 'pending' if operation_type == 'payment' else 'processing'
+        self.events.append(
+            (
+                operation_type,
+                operation_id,
+                status,
+                status,
+                source,
+                {'check': 'status_unchanged'},
+            )
+        )
+
+    async def mark_payment_divergence_signaled(self, payment_id: UUID) -> bool:
+        """Отметка расхождения на завершённом платеже; True — только в первый раз."""
+        return set_divergence_marker(self.payments[payment_id])
 
     async def claim_payment_check(
         self,
@@ -641,6 +676,7 @@ class InMemoryPurchaseRepository:
         source: ReconcileSource,
         provider_details: dict[str, Any] | None = None,
         public_base_url: str = 'http://localhost',
+        notify_user: bool = True,
     ) -> tuple[FakePaymentRow, bool]:
         """Атомарно переводит pending -> failed и ставит задачу письма отказа."""
         row = self.payments[payment_id]
@@ -663,24 +699,50 @@ class InMemoryPurchaseRepository:
         self.events.append(
             ('payment', payment_id, old_status, 'failed', source, event_details)
         )
-        dedup_key = f'payment_failed:{payment_id}:notify_failed'
+        if notify_user:
+            self._add_payment_failed_email(row, public_base_url)
+        return row, True
+
+    def _add_payment_failed_email(
+        self,
+        row: FakePaymentRow,
+        public_base_url: str,
+    ) -> bool:
+        """Ставит письмо об отказе, если его ещё нет (как уникальный dedup_key)."""
+        dedup_key = payment_failed_email_task_key(row.id)
+        if dedup_key in self.outbox_tasks:
+            return False
         self.outbox_tasks[dedup_key] = FakeOutboxTaskRow(
             id=uuid4(),
             dedup_key=dedup_key,
             target_service='notifications',
             task_type='payment_failed_email',
-            payment_id=payment_id,
+            payment_id=row.id,
             user_id=row.user_id,
             access_version=None,
             payload=build_payment_failed_email_payload(
-                payment_id=payment_id,
+                payment_id=row.id,
                 user_id=row.user_id,
-                failure_reason=failure_reason,
+                failure_reason=row.failure_reason or 'canceled_by_provider',
                 public_base_url=public_base_url,
                 tariff_title=self.tariff.title,
             ),
         )
-        return row, True
+        return True
+
+    async def enqueue_payment_failed_email(
+        self,
+        payment_id: UUID,
+        *,
+        public_base_url: str = 'http://localhost',
+    ) -> bool:
+        """Досылает письмо об отказе по закрытому платежу; второй раз — False."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        row = self.payments[payment_id]
+        if row.status != 'failed':
+            return False
+        return self._add_payment_failed_email(row, public_base_url)
 
     async def process_due_outbox_tasks(
         self,
@@ -1671,7 +1733,9 @@ class InMemoryPurchaseRepository:
         row = self.refunds[refund_id]
         if row.status == 'processing':
             row.provider_refund_id = provider_refund_id
-            row.provider_details = provider_details
+            row.provider_details = keep_detail_markers(
+                row.provider_details, provider_details
+            )
             row.updated_at = datetime.now(UTC)
         return row
 
@@ -1680,6 +1744,7 @@ class InMemoryPurchaseRepository:
         refund_id: UUID,
         *,
         provider_details: dict[str, Any] | None = None,
+        event_source: ReconcileSource | None = None,
     ) -> FakeRefundRow:
         """Обновляет last_checked_at при сверке возврата в processing (T-29)."""
         if self.db_unavailable:
@@ -1690,7 +1755,11 @@ class InMemoryPurchaseRepository:
             row.last_checked_at = now_utc
             row.updated_at = now_utc
             if provider_details is not None:
-                row.provider_details = provider_details
+                row.provider_details = keep_detail_markers(
+                    row.provider_details, provider_details
+                )
+            if event_source is not None:
+                self._add_unchanged_check_event('refund', refund_id, event_source)
         return row
 
     async def record_refund_reconcile_error(
@@ -1718,6 +1787,48 @@ class InMemoryPurchaseRepository:
             row.updated_at = now_utc
         return row
 
+    async def mark_refund_post_outcome_unknown(self, refund_id: UUID) -> FakeRefundRow:
+        """Отметка: был POST /v3/refunds с неизвестным исходом (инв. 15)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        row = self.refunds[refund_id]
+        details = row.provider_details or {}
+        if row.status == 'processing' and not details.get(POST_OUTCOME_UNKNOWN_KEY):
+            row.provider_details = {**details, POST_OUTCOME_UNKNOWN_KEY: True}
+            row.updated_at = datetime.now(UTC)
+        return row
+
+    async def record_refund_lookup_not_found(
+        self,
+        refund_id: UUID,
+        *,
+        event_source: ReconcileSource | None = None,
+    ) -> FakeRefundRow:
+        """Отметка: розыск по списку ЮKassa ничего не нашёл (инв. 14)."""
+        if self.db_unavailable:
+            raise DatabaseUnavailableError('billing-db is down')
+        now_utc = datetime.now(UTC)
+        row = self.refunds[refund_id]
+        if row.status == 'processing':
+            details = dict(row.provider_details or {})
+            details[LOOKUP_NOT_FOUND_KEY] = lookup_not_found_marker(
+                details.get(LOOKUP_NOT_FOUND_KEY), now_utc
+            )
+            row.provider_details = details
+            row.last_checked_at = now_utc
+            row.updated_at = now_utc
+            if event_source is not None:
+                self._add_unchanged_check_event('refund', refund_id, event_source)
+        return row
+
+    async def mark_refund_divergence_signaled(self, refund_id: UUID) -> bool:
+        """Отметка расхождения на завершённом возврате; True — только в первый раз."""
+        return set_divergence_marker(self.refunds[refund_id])
+
+    async def mark_refund_post_stopped(self, refund_id: UUID) -> bool:
+        """Отметка «POST по попытке больше не шлём» (инв. 15); True — в первый раз."""
+        return set_post_stopped_marker(self.refunds[refund_id])
+
     async def finalize_refund_succeeded(
         self,
         refund_id: UUID,
@@ -1737,7 +1848,9 @@ class InMemoryPurchaseRepository:
         old_status = row.status
         row.status = 'succeeded'
         if provider_details is not None:
-            row.provider_details = provider_details
+            row.provider_details = keep_detail_markers(
+                row.provider_details, provider_details
+            )
         row.last_checked_at = now_utc
         row.updated_at = now_utc
 
@@ -1812,7 +1925,9 @@ class InMemoryPurchaseRepository:
         row.status = 'rejected'
         row.rejection_reason = rejection_reason
         if provider_details is not None:
-            row.provider_details = provider_details
+            row.provider_details = keep_detail_markers(
+                row.provider_details, provider_details
+            )
         row.last_checked_at = now_utc
         row.updated_at = now_utc
         self.events.append(

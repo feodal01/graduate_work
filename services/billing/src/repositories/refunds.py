@@ -24,7 +24,13 @@ from models import (
 )
 from repositories._sqlalchemy import SQLAlchemyRepository
 from repositories.records import (
+    LOOKUP_NOT_FOUND_KEY,
+    POST_OUTCOME_UNKNOWN_KEY,
     RefundRecordProtocol,
+    keep_detail_markers,
+    lookup_not_found_marker,
+    set_divergence_marker,
+    set_post_stopped_marker,
 )
 
 
@@ -72,6 +78,7 @@ class RefundRepository(Protocol):
         refund_id: UUID,
         *,
         provider_details: dict[str, Any] | None = None,
+        event_source: ReconcileSource | None = None,
     ) -> RefundRecordProtocol: ...
 
     async def record_refund_reconcile_error(
@@ -80,6 +87,22 @@ class RefundRepository(Protocol):
         *,
         error_message: str,
     ) -> RefundRecordProtocol: ...
+
+    async def mark_refund_post_outcome_unknown(
+        self,
+        refund_id: UUID,
+    ) -> RefundRecordProtocol: ...
+
+    async def record_refund_lookup_not_found(
+        self,
+        refund_id: UUID,
+        *,
+        event_source: ReconcileSource | None = None,
+    ) -> RefundRecordProtocol: ...
+
+    async def mark_refund_divergence_signaled(self, refund_id: UUID) -> bool: ...
+
+    async def mark_refund_post_stopped(self, refund_id: UUID) -> bool: ...
 
     async def finalize_refund_succeeded(
         self,
@@ -312,7 +335,9 @@ class SQLAlchemyRefundRepository(SQLAlchemyRepository):
                 refund, _ = await self._lock_user_and_refund(session, refund_id)
                 if refund.status == 'processing':
                     refund.provider_refund_id = provider_refund_id
-                    refund.provider_details = provider_details
+                    refund.provider_details = keep_detail_markers(
+                        refund.provider_details, provider_details
+                    )
                     refund.updated_at = now_utc
                     await session.commit()
                 return refund
@@ -324,6 +349,7 @@ class SQLAlchemyRefundRepository(SQLAlchemyRepository):
         refund_id: UUID,
         *,
         provider_details: dict[str, Any] | None = None,
+        event_source: ReconcileSource | None = None,
     ) -> Refund:
         now_utc = datetime.now(UTC)
         try:
@@ -333,7 +359,13 @@ class SQLAlchemyRefundRepository(SQLAlchemyRepository):
                     refund.last_checked_at = now_utc
                     refund.updated_at = now_utc
                     if provider_details is not None:
-                        refund.provider_details = provider_details
+                        refund.provider_details = keep_detail_markers(
+                            refund.provider_details, provider_details
+                        )
+                    if event_source is not None:
+                        self._add_unchanged_check_event(
+                            session, 'refund', refund.id, 'processing', event_source
+                        )
                     await session.commit()
                 return refund
         except (SQLAlchemyError, OSError) as exc:
@@ -371,6 +403,70 @@ class SQLAlchemyRefundRepository(SQLAlchemyRepository):
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 
+    async def mark_refund_post_outcome_unknown(self, refund_id: UUID) -> Refund:
+        """Отмечает POST /v3/refunds с неизвестным исходом (инв. 15).
+
+        После такой отправки возврат в ЮKassa мог быть создан, поэтому
+        400/401/403 на повтор уже не доказывает отказ.
+        """
+        try:
+            async with self._session_factory() as session:
+                refund, _ = await self._lock_user_and_refund(session, refund_id)
+                details = refund.provider_details or {}
+                if refund.status == 'processing' and not details.get(
+                    POST_OUTCOME_UNKNOWN_KEY
+                ):
+                    refund.provider_details = {
+                        **details,
+                        POST_OUTCOME_UNKNOWN_KEY: True,
+                    }
+                    refund.updated_at = datetime.now(UTC)
+                    await session.commit()
+                return refund
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def record_refund_lookup_not_found(
+        self,
+        refund_id: UUID,
+        *,
+        event_source: ReconcileSource | None = None,
+    ) -> Refund:
+        """Фиксирует пустой розыск возврата по списку ЮKassa (инв. 14)."""
+        now_utc = datetime.now(UTC)
+        try:
+            async with self._session_factory() as session:
+                refund, _ = await self._lock_user_and_refund(session, refund_id)
+                if refund.status == 'processing':
+                    details = dict(refund.provider_details or {})
+                    details[LOOKUP_NOT_FOUND_KEY] = lookup_not_found_marker(
+                        details.get(LOOKUP_NOT_FOUND_KEY), now_utc
+                    )
+                    refund.provider_details = details
+                    refund.last_checked_at = now_utc
+                    refund.updated_at = now_utc
+                    if event_source is not None:
+                        self._add_unchanged_check_event(
+                            session, 'refund', refund.id, 'processing', event_source
+                        )
+                    await session.commit()
+                return refund
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def mark_refund_divergence_signaled(self, refund_id: UUID) -> bool:
+        """Отметка «расхождение с ЮKassa уже в мониторинге» (инв. 7, 6.4)."""
+        return await self._set_marker_once('refund', refund_id, set_divergence_marker)
+
+    async def mark_refund_post_stopped(self, refund_id: UUID) -> bool:
+        """Останавливает POST по попытке после 400/401/403 на повтор (инв. 15).
+
+        Ответ пришёл после отправки с неизвестным исходом, поэтому это не
+        отказ: попытка ждёт розыска после 24 ч. True — только в первый раз,
+        чтобы сигнал в мониторинг был один на попытку.
+        """
+        return await self._set_marker_once('refund', refund_id, set_post_stopped_marker)
+
     async def finalize_refund_succeeded(
         self,
         refund_id: UUID,
@@ -389,7 +485,9 @@ class SQLAlchemyRefundRepository(SQLAlchemyRepository):
                 old_status = refund.status
                 refund.status = 'succeeded'
                 if provider_details is not None:
-                    refund.provider_details = provider_details
+                    refund.provider_details = keep_detail_markers(
+                        refund.provider_details, provider_details
+                    )
                 refund.last_checked_at = now_utc
                 refund.updated_at = now_utc
 
@@ -495,7 +593,9 @@ class SQLAlchemyRefundRepository(SQLAlchemyRepository):
                 refund.status = 'rejected'
                 refund.rejection_reason = rejection_reason
                 if provider_details is not None:
-                    refund.provider_details = provider_details
+                    refund.provider_details = keep_detail_markers(
+                        refund.provider_details, provider_details
+                    )
                 refund.last_checked_at = now_utc
                 refund.updated_at = now_utc
 

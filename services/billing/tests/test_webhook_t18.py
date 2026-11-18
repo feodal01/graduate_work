@@ -141,8 +141,10 @@ async def test_webhook_happy_path_bypasses_throttle_and_reconciles_via_get(
         'webhook',
     )
     assert len(auth.synced_access_calls) == 1
+    events_before_dup = len(repo.events)
 
-    # Повторная доставка того же вебхука идемпотентна (200 OK, 0 новых вызовов GET)
+    # Повторная доставка того же вебхука идемпотентна: 200 OK, итог не меняется;
+    # единственный новый GET — проверка расхождения с ЮKassa (инв. 7)
     resp_dup = await client.post(
         '/api/v1/billing/webhooks/yookassa',
         json={
@@ -152,7 +154,9 @@ async def test_webhook_happy_path_bypasses_throttle_and_reconciles_via_get(
         },
     )
     assert resp_dup.status_code == 200
-    assert len(provider.get_calls) == 1
+    assert provider.get_calls == ['yk-wh-101', 'yk-wh-101']
+    assert repo.payments[payment.id].status == 'succeeded'
+    assert len(repo.events) == events_before_dup
 
 
 @pytest.mark.asyncio

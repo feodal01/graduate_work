@@ -30,7 +30,7 @@ from repositories.outbox import OutboxAdminRepository
 from security.service_credentials import ServiceCredentials
 from services.outbox_dispatcher import OutboxDispatcher
 from services.purchase import PurchaseService
-from services.reconciler import PaymentReconciler
+from services.reconciler import PaymentReconciler, RefundKeyPolicy
 
 AUTH_RATE_LIMITED_MESSAGE = 'Слишком много запросов, повторите через минуту'
 
@@ -129,6 +129,7 @@ async def get_payment_reconciler(
         payment_providers=payment_providers,
         public_base_url=str(settings.worker.billing_public_base_url),
         outbox_dispatcher=outbox_dispatcher,
+        refund_policy=RefundKeyPolicy.from_settings(settings.worker),
     )
 
 

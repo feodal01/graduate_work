@@ -340,10 +340,15 @@ class PurchaseService:
         respect_throttle: bool,
     ) -> PurchaseOutcome:
         try:
+            # BIL-FR-06: если ЮKassa отменила платёж, ниже в этом же запросе
+            # создаётся новый и пользователь уходит на оплату — письмо об
+            # отказе по старому платежу было бы лишним (если новый создать не
+            # удастся, письмо дошлёт `_replace_failed_payment`).
             outcome = await self._reconciler.reconcile_payment_record(
                 payment,
                 source='continue',
                 respect_throttle=respect_throttle,
+                notify_failure=False,
             )
         except PaymentProviderError as exc:
             raise DependencyUnavailableError(
@@ -366,7 +371,11 @@ class PurchaseService:
             )
 
         if outcome.status == 'failed':
-            return await self.start_or_continue_purchase(user_id)
+            return await self._replace_failed_payment(
+                user_id,
+                payment.id,
+                closed_here=outcome.transitioned,
+            )
 
         # succeeded -> редирект на экран результата (подписка создана в Reconciler)
         result_url = f'/billing/payments/{payment.id}'
@@ -377,6 +386,30 @@ class PurchaseService:
             confirmation_url=None,
         )
 
+    async def _replace_failed_payment(
+        self,
+        user_id: UUID,
+        failed_payment_id: UUID,
+        *,
+        closed_here: bool,
+    ) -> PurchaseOutcome:
+        """Создаёт новый платёж вместо отменённого в ЮKassa (инв. 1, BIL-FR-06).
+
+        Старый платёж этот запрос закрыл без письма: пользователь сразу уходит
+        на новую оплату. Если новый платёж создать не удалось (нет тарифа,
+        отказ ЮKassa, конфликт), письмо об отказе всё-таки ставится, иначе
+        пользователь остался бы без платежа и без письма.
+        """
+        try:
+            return await self.start_or_continue_purchase(user_id)
+        except Exception:
+            if closed_here and await self._payments.enqueue_payment_failed_email(
+                failed_payment_id,
+                public_base_url=self._public_base_url,
+            ):
+                await self._reconciler.notify_payment_tasks(failed_payment_id)
+            raise
+
     async def _create_in_provider(
         self,
         user_id: UUID,
@@ -385,12 +418,14 @@ class PurchaseService:
         if idempotency_key_expired(payment.created_at):
             # Инв. 13: ключ идемпотентности в ЮKassa жив 24 ч. POST с истёкшим
             # ключом создал бы в ЮKassa второй платёж. Номера нет, значит
-            # пользователь не платил: закрываем платёж и начинаем новый.
+            # пользователь не платил: закрываем платёж без письма (BIL-FR-06)
+            # и начинаем новый.
             _, transitioned = await self._payments.finalize_payment_failed(
                 payment.id,
                 failure_reason='idempotency_key_expired',
                 source='continue',
                 public_base_url=self._public_base_url,
+                notify_user=False,
             )
             if transitioned and self._reconciler is not None:
                 await self._reconciler.notify_payment_tasks(payment.id)

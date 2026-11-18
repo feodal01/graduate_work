@@ -446,11 +446,9 @@ async def test_sqlalchemy_purchase_repository_concurrent_and_blocking_rules(
     repos = BillingRepositories.sqlalchemy(session_factory)
     user_id = uuid4()
 
-    # 1. Изначально покупка разрешена
-    allowed, code = await repos.payments.check_purchase_allowed(user_id)
-    assert allowed is True and code is None
-
-    # 2. Два конкурентных вызова возвращают один и тот же pending-платёж
+    # 1–2. Изначально покупка разрешена (запреты проверяет сама
+    # get_or_create_pending_payment): два конкурентных вызова возвращают
+    # один и тот же pending-платёж
     res_a, res_b = await asyncio.gather(
         repos.payments.get_or_create_pending_payment(user_id),
         repos.payments.get_or_create_pending_payment(user_id),
@@ -548,11 +546,8 @@ async def test_sqlalchemy_purchase_repository_concurrent_and_blocking_rules(
         )
         await session.commit()
 
-    allowed_sub, code_sub = await repos.payments.check_purchase_allowed(user_id)
-    assert allowed_sub is False
-    assert code_sub == 'subscription_already_active'
-
-    # И внутри транзакции get_or_create_pending_payment под lock выбрасывается 409
+    # Запрет проверяет get_or_create_pending_payment под lock: 409 с кодом
+    # подписки, а не возврата
     from domain.errors import RuleConflictError
 
     with pytest.raises(RuleConflictError) as exc_info:
@@ -785,7 +780,7 @@ async def test_t12_t13_t16_and_t17_repository_queries_and_skip_locked(
     )
     assert local_after is not None and local_after.auth_access_delivered is True
 
-    # 4. T-17: проверяем list_due_pending_payments с отступом min_age_seconds
+    # 4. T-17: фоновая сверка берёт pending-платежи с отступом min_age_seconds
     now_t17 = datetime.now(UTC)
     young_pay_id = uuid4()
     mature_pay_id = uuid4()
@@ -828,18 +823,9 @@ async def test_t12_t13_t16_and_t17_repository_queries_and_skip_locked(
         )
         await session.commit()
 
-    due_rows = await repos.payments.list_due_pending_payments(
-        min_age_seconds=5.0,
-        throttle_seconds=5.0,
-        limit=10,
-    )
-    due_ids = {r.id for r in due_rows}
-    assert mature_pay_id in due_ids
-    assert young_pay_id not in due_ids
-    assert throttled_pay_id not in due_ids
-
     # Два параллельных воркера через claim_next_due_pending_payment (SKIP LOCKED)
-    # захватывают mature_pay_id ровно один раз без дублей (BIL-NFR-S-01)
+    # захватывают mature_pay_id ровно один раз без дублей (BIL-NFR-S-01); молодой
+    # платёж (отступ) и недавно проверенный (лимит 5 с) не захватываются
     claimed_1, claimed_2 = await asyncio.gather(
         repos.payments.claim_next_due_pending_payment(
             min_age_seconds=5.0, throttle_seconds=5.0
@@ -2176,3 +2162,215 @@ async def test_user_billing_overview_reads_history_by_pages(
     assert beyond.payments == []
     assert beyond.payments_total == 8
     assert beyond.pending_payment_id == pending_id
+
+
+async def _operation_events(
+    session_factory: async_sessionmaker[AsyncSession], operation_id: UUID
+) -> list[tuple[str | None, str, str]]:
+    async with session_factory() as session:
+        rows = await session.scalars(
+            select(OperationEvent)
+            .where(OperationEvent.operation_id == operation_id)
+            .order_by(OperationEvent.created_at, OperationEvent.id)
+        )
+        return [(ev.from_status, ev.to_status, ev.source) for ev in rows]
+
+
+async def test_refund_markers_survive_rewrites_and_lookup_count_in_postgres(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """Инв. 14, 15 в PostgreSQL: отметки в JSONB переживают новые снимки ЮKassa."""
+    from repositories.bundle import BillingRepositories
+    from repositories.records import (
+        LOOKUP_NOT_FOUND_KEY,
+        POST_OUTCOME_UNKNOWN_KEY,
+        POST_STOPPED_KEY,
+        lookup_not_found_state,
+    )
+
+    repos = BillingRepositories.sqlalchemy(migrated_billing_db)
+    paid = await _paid_payment_with_subscription(repos)
+    refund, _ = await repos.refunds.get_or_create_processing_refund(
+        paid.id, admin_user_id=uuid4(), reason='Возврат'
+    )
+
+    marked = await repos.refunds.mark_refund_post_outcome_unknown(refund.id)
+    assert (marked.provider_details or {})[POST_OUTCOME_UNKNOWN_KEY] is True
+    errored = await repos.refunds.record_refund_reconcile_error(
+        refund.id, error_message='YooKassa 503'
+    )
+    assert (errored.provider_details or {})[POST_OUTCOME_UNKNOWN_KEY] is True
+
+    # Остановка POST после 400/401/403 на повтор: отметка ставится один раз
+    # (по ней сверка поднимает единственный сигнал на попытку).
+    stopped = await asyncio.gather(
+        repos.refunds.mark_refund_post_stopped(refund.id),
+        repos.refunds.mark_refund_post_stopped(refund.id),
+    )
+    assert sorted(stopped) == [False, True]
+    assert await repos.refunds.mark_refund_post_stopped(refund.id) is False
+
+    first = await repos.refunds.record_refund_lookup_not_found(refund.id)
+    second = await repos.refunds.record_refund_lookup_not_found(refund.id)
+    assert lookup_not_found_state(first.provider_details)[0] == 1
+    count, last_at = lookup_not_found_state(second.provider_details)
+    assert count == 2 and last_at is not None
+    assert datetime.now(UTC) - last_at < timedelta(minutes=1)
+
+    await repos.refunds.save_provider_refund_created(
+        refund.id, provider_refund_id='yk_marker_ref', provider_details={'id': 'r'}
+    )
+    await repos.refunds.record_refund_checked(
+        refund.id, provider_details={'id': 'r', 'status': 'pending'}
+    )
+    reloaded = await repos.refunds.get_refund(refund.id)
+    assert reloaded is not None
+    details = reloaded.provider_details or {}
+    assert details['status'] == 'pending'
+    assert details[POST_OUTCOME_UNKNOWN_KEY] is True
+    assert details[POST_STOPPED_KEY] is True
+    assert details[LOOKUP_NOT_FOUND_KEY]['count'] == 2
+
+
+async def test_unchanged_admin_check_events_in_postgres(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """US-A-06 в PostgreSQL: схема принимает from = to, карточка его показывает."""
+    from clients.payment_provider_registry import PaymentProviderRegistry
+    from repositories.bundle import BillingRepositories
+    from services.reconciler import PaymentReconciler
+    from tests.fakes import FakeProviderGateway
+
+    repos = BillingRepositories.sqlalchemy(migrated_billing_db)
+    provider = FakeProviderGateway()
+    provider.get_status = 'pending'
+    provider.next_get_refund_status = 'processing'
+    reconciler = PaymentReconciler(
+        payments=repos.payments,
+        refunds=repos.refunds,
+        payment_providers=PaymentProviderRegistry.single(provider),
+    )
+
+    pending, _ = await repos.payments.get_or_create_pending_payment(uuid4())
+    await repos.payments.save_provider_payment_created(
+        pending.id,
+        provider_payment_id='yk_p30_pg_pay',
+        confirmation_url='https://yookassa.test/confirm',
+        provider_details={'id': 'yk_p30_pg_pay'},
+    )
+    # Фоновая сверка без перехода журнал не пишет.
+    await reconciler.reconcile_payment(pending.id, source='reconcile')
+    await reconciler.reconcile_operation_by_admin('payment', pending.id)
+    assert await _operation_events(migrated_billing_db, pending.id) == [
+        (None, 'pending', 'continue'),
+        ('pending', 'pending', 'admin'),
+    ]
+
+    paid = await _paid_payment_with_subscription(repos)
+    refund, _ = await repos.refunds.get_or_create_processing_refund(
+        paid.id, admin_user_id=uuid4(), reason='Возврат'
+    )
+    await repos.refunds.save_provider_refund_created(
+        refund.id, provider_refund_id='yk_p30_pg_ref', provider_details={'id': 'r'}
+    )
+    await reconciler.reconcile_operation_by_admin('refund', refund.id)
+    # Пустой розыск при ручной проверке тоже пишется как X -> X; ошибка сверки
+    # (фоновая отсрочка) записи не даёт.
+    await repos.refunds.record_refund_reconcile_error(refund.id, error_message='503')
+    await repos.refunds.record_refund_lookup_not_found(refund.id, event_source='admin')
+    assert await _operation_events(migrated_billing_db, refund.id) == [
+        (None, 'processing', 'admin'),
+        ('processing', 'processing', 'admin'),
+        ('processing', 'processing', 'admin'),
+    ]
+
+    card = await repos.admin_queries.get_internal_payment_card(
+        pending.id, now_utc=datetime.now(UTC)
+    )
+    assert card is not None
+    assert [
+        (ev.from_status, ev.to_status, ev.source, ev.details)
+        for ev in card.operation_events
+    ][-1] == ('pending', 'pending', 'admin', {'check': 'status_unchanged'})
+
+
+async def test_failed_payment_without_email_and_divergence_marker_in_postgres(
+    migrated_billing_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """BIL-FR-06 и инв. 7 в PostgreSQL: отказ без письма; отметка расхождения одна."""
+    from repositories.bundle import BillingRepositories
+    from repositories.records import DIVERGENCE_SIGNALED_KEY
+
+    repos = BillingRepositories.sqlalchemy(migrated_billing_db)
+
+    silent, _ = await repos.payments.get_or_create_pending_payment(uuid4())
+    _, moved = await repos.payments.finalize_payment_failed(
+        silent.id,
+        failure_reason='idempotency_key_expired',
+        source='reconcile',
+        notify_user=False,
+    )
+    assert moved is True
+    notified, _ = await repos.payments.get_or_create_pending_payment(uuid4())
+    await repos.payments.finalize_payment_failed(
+        notified.id, failure_reason='canceled_by_provider', source='webhook'
+    )
+    async with migrated_billing_db() as session:
+        failed_tasks = list(
+            await session.scalars(
+                select(OutboxTask.payment_id).where(
+                    OutboxTask.task_type == 'payment_failed_email',
+                    OutboxTask.payment_id.in_([silent.id, notified.id]),
+                )
+            )
+        )
+    assert failed_tasks == [notified.id]
+
+    # Досылка письма по закрытому без письма платежу идемпотентна: тот же
+    # dedup_key, что у finalize_payment_failed, второй задачи не будет.
+    queued = await asyncio.gather(
+        repos.payments.enqueue_payment_failed_email(silent.id),
+        repos.payments.enqueue_payment_failed_email(silent.id),
+    )
+    assert sorted(queued) == [False, True]
+    assert await repos.payments.enqueue_payment_failed_email(notified.id) is False
+    pending_check, _ = await repos.payments.get_or_create_pending_payment(uuid4())
+    assert await repos.payments.enqueue_payment_failed_email(pending_check.id) is False
+    async with migrated_billing_db() as session:
+        silent_tasks = list(
+            await session.scalars(
+                select(OutboxTask).where(
+                    OutboxTask.task_type == 'payment_failed_email',
+                    OutboxTask.payment_id.in_([silent.id, pending_check.id]),
+                )
+            )
+        )
+    assert [t.payment_id for t in silent_tasks] == [silent.id]
+    assert silent_tasks[0].dedup_key == f'payment_failed:{silent.id}:notify_failed'
+    assert 'idempotency_key_expired' in str(silent_tasks[0].payload)
+    assert await _operation_events(migrated_billing_db, silent.id) == [
+        (None, 'pending', 'continue'),
+        ('pending', 'failed', 'reconcile'),
+    ]
+
+    pending, _ = await repos.payments.get_or_create_pending_payment(uuid4())
+    assert await repos.payments.mark_payment_divergence_signaled(pending.id) is False
+    marks = await asyncio.gather(
+        repos.payments.mark_payment_divergence_signaled(silent.id),
+        repos.payments.mark_payment_divergence_signaled(silent.id),
+    )
+    assert sorted(marks) == [False, True]
+    reloaded = await repos.payments.get_payment(silent.id)
+    assert reloaded is not None and reloaded.status == 'failed'
+    assert (reloaded.provider_details or {})[DIVERGENCE_SIGNALED_KEY] is True
+
+    paid = await _paid_payment_with_subscription(repos)
+    refund, _ = await repos.refunds.get_or_create_processing_refund(
+        paid.id, admin_user_id=uuid4(), reason='Возврат'
+    )
+    assert await repos.refunds.mark_refund_divergence_signaled(refund.id) is False
+    await repos.refunds.finalize_refund_rejected(
+        refund.id, rejection_reason='canceled_by_provider', source='reconcile'
+    )
+    assert await repos.refunds.mark_refund_divergence_signaled(refund.id) is True
+    assert await repos.refunds.mark_refund_divergence_signaled(refund.id) is False

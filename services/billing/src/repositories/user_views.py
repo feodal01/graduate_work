@@ -15,7 +15,7 @@ from models import (
     Tariff,
 )
 from repositories._sqlalchemy import SQLAlchemyRepository
-from repositories.payments import payment_access_task_key
+from repositories.payment_tasks import payment_access_task_key
 from repositories.read_models import (
     LocalPaymentResultData,
     UserBillingOverviewData,

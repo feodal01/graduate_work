@@ -122,6 +122,9 @@ class OperationEventCardRowView:
     details_display: str
     created_utc_display: str
     created_local_display: str
+    # Billing пишет ручную проверку в ЮKassa без смены статуса записью X → X
+    # (US-A-06); показываем её как проверку, а не как переход.
+    status_unchanged: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1219,6 +1222,7 @@ def _build_event_card_row(
         details_display=str(item.details) if item.details else '—',
         created_utc_display=format_utc_datetime(item.created_at),
         created_local_display=format_user_tz_datetime(item.created_at, user_tz),
+        status_unchanged=item.from_status == item.to_status,
     )
 
 

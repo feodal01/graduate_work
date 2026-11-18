@@ -164,6 +164,16 @@ class WorkerSettings(BaseSettings):
     # ответ Auth или Notifications. Должно быть больше тайм-аутов этих клиентов.
     billing_outbox_lease_seconds: float = Field(default=60.0, gt=0)
     billing_stuck_threshold_seconds: int = Field(default=600, ge=1)
+    # Возврат без номера ЮKassa у границы 24-часового ключа (инв. 14):
+    # за сколько секунд до истечения ключа POST /v3/refunds больше не шлётся
+    # (ответ у самой границы мог бы прийти после розыска по списку);
+    # сколько пустых розысков подряд нужно для отказа «не создан» и пауза
+    # между ними (возврат может появиться в списке ЮKassa не сразу).
+    billing_refund_post_stop_before_key_expiry_seconds: float = Field(
+        default=3600.0, ge=0, lt=24 * 3600
+    )
+    billing_refund_lookup_not_found_attempts: int = Field(default=2, ge=1)
+    billing_refund_lookup_interval_seconds: float = Field(default=300.0, gt=0)
 
 
 class TracingSettings(BaseSettings):

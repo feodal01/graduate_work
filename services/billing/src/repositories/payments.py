@@ -1,19 +1,14 @@
-from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from sqlalchemy import or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from db.sql.errors import DatabaseUnavailableError
 from domain.errors import DependencyUnavailableError, RuleConflictError
-from domain.subscription import (
-    ReconcileSource,
-    build_payment_failed_email_payload,
-    build_payment_succeeded_email_payload,
-    build_subscription_expiration_email_payload,
-)
+from domain.subscription import ReconcileSource
 from models import (
     DEFAULT_PROVIDER_CODE,
     DEFAULT_TARIFF_CODE,
@@ -25,28 +20,19 @@ from models import (
     Tariff,
 )
 from repositories._sqlalchemy import SQLAlchemyRepository, tariff_data
+from repositories.payment_tasks import (
+    payment_failed_email_task,
+    payment_succeeded_tasks,
+)
 from repositories.read_models import TariffData
 from repositories.records import (
     PaymentRecordProtocol,
+    set_divergence_marker,
 )
-
-
-def payment_access_task_key(payment_id: UUID) -> str:
-    """Ключ задачи «открыть доступ» после оплаты; у платежа она ровно одна.
-
-    После возврата у того же платежа появляется вторая задача `sync_access`
-    (закрыть доступ), поэтому экраны ищут задачу оплаты по этому ключу.
-    """
-    return f'payment_succeeded:{payment_id}:auth_access'
 
 
 class PaymentRepository(Protocol):
     """Платежи: создание, сверка и атомарная фиксация итога (T-10, T-11, T-17)."""
-
-    async def check_purchase_allowed(
-        self,
-        user_id: UUID,
-    ) -> tuple[bool, str | None]: ...
 
     async def get_payment(
         self,
@@ -66,14 +52,6 @@ class PaymentRepository(Protocol):
         provider_code: str,
         provider_payment_id: str,
     ) -> PaymentRecordProtocol | None: ...
-
-    async def list_due_pending_payments(
-        self,
-        *,
-        min_age_seconds: float,
-        throttle_seconds: float = 5.0,
-        limit: int = 20,
-    ) -> Sequence[PaymentRecordProtocol]: ...
 
     async def claim_next_due_pending_payment(
         self,
@@ -118,6 +96,7 @@ class PaymentRepository(Protocol):
         *,
         confirmation_url: str | None = None,
         provider_details: dict[str, Any] | None = None,
+        event_source: ReconcileSource | None = None,
     ) -> PaymentRecordProtocol: ...
 
     async def finalize_payment_succeeded(
@@ -137,19 +116,21 @@ class PaymentRepository(Protocol):
         source: ReconcileSource,
         provider_details: dict[str, Any] | None = None,
         public_base_url: str = 'http://localhost',
+        notify_user: bool = True,
     ) -> tuple[PaymentRecordProtocol, bool]: ...
+
+    async def enqueue_payment_failed_email(
+        self,
+        payment_id: UUID,
+        *,
+        public_base_url: str = 'http://localhost',
+    ) -> bool: ...
+
+    async def mark_payment_divergence_signaled(self, payment_id: UUID) -> bool: ...
 
 
 class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
     """Платежи: создание, сверка и атомарная фиксация итога (T-10, T-11, T-17)."""
-
-    async def check_purchase_allowed(self, user_id: UUID) -> tuple[bool, str | None]:
-        """Проверяет отсутствие активной подписки и возврата в обработке (BIL-FR-03)."""
-        try:
-            async with self._session_factory() as session:
-                return await self._check_allowed_in_session(session, user_id)
-        except (SQLAlchemyError, OSError) as exc:
-            raise DatabaseUnavailableError() from exc
 
     async def get_payment(self, payment_id: UUID) -> Payment | None:
         """Возвращает платёж по его внутреннему UUID."""
@@ -199,43 +180,6 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
                         Payment.provider_payment_id == provider_payment_id,
                     )
                 )
-        except (SQLAlchemyError, OSError) as exc:
-            raise DatabaseUnavailableError() from exc
-
-    async def list_due_pending_payments(
-        self,
-        *,
-        min_age_seconds: float,
-        throttle_seconds: float = 5.0,
-        limit: int = 20,
-    ) -> list[Payment]:
-        """Возвращает pending-платежи старше min_age_seconds (BIL-FR-05)."""
-        now_utc = datetime.now(UTC)
-        created_cutoff = now_utc - timedelta(seconds=min_age_seconds)
-        checked_cutoff = now_utc - timedelta(seconds=throttle_seconds)
-        try:
-            async with self._session_factory() as session:
-                stmt = (
-                    select(Payment)
-                    .where(
-                        Payment.status == 'pending',
-                        Payment.created_at <= created_cutoff,
-                        or_(
-                            Payment.last_checked_at.is_(None),
-                            Payment.last_checked_at <= checked_cutoff,
-                        ),
-                        or_(
-                            Payment.next_reconcile_at.is_(None),
-                            Payment.next_reconcile_at <= now_utc,
-                        ),
-                    )
-                    .order_by(
-                        Payment.last_checked_at.asc().nulls_first(),
-                        Payment.created_at.asc(),
-                    )
-                    .limit(limit)
-                )
-                return list((await session.scalars(stmt)).all())
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
 
@@ -482,6 +426,7 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
         *,
         confirmation_url: str | None = None,
         provider_details: dict[str, Any] | None = None,
+        event_source: ReconcileSource | None = None,
     ) -> Payment:
         now_utc = datetime.now(UTC)
         try:
@@ -495,6 +440,10 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
                     payment.last_checked_at = now_utc
                     payment.next_reconcile_at = None
                     payment.updated_at = now_utc
+                    if event_source is not None:
+                        self._add_unchanged_check_event(
+                            session, 'payment', payment.id, 'pending', event_source
+                        )
                     await session.commit()
                 return payment
         except (SQLAlchemyError, OSError) as exc:
@@ -559,55 +508,15 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
                 )
 
                 session.add_all(
-                    [
-                        OutboxTask(
-                            dedup_key=payment_access_task_key(payment.id),
-                            target_service='auth',
-                            task_type='sync_access',
-                            payment_id=payment.id,
-                            user_id=payment.user_id,
-                            access_version=access_version,
-                            payload={
-                                'user_id': str(payment.user_id),
-                                'version': access_version,
-                                'expires_at': ends_at.isoformat(),
-                            },
-                            next_retry_at=now_utc,
-                        ),
-                        OutboxTask(
-                            dedup_key=f'payment_succeeded:{payment.id}:notify_paid',
-                            target_service='notifications',
-                            task_type='payment_succeeded_email',
-                            payment_id=payment.id,
-                            user_id=payment.user_id,
-                            access_version=None,
-                            payload=build_payment_succeeded_email_payload(
-                                payment_id=payment.id,
-                                subscription_id=sub_id,
-                                user_id=payment.user_id,
-                                ends_at=ends_at,
-                                public_base_url=public_base_url,
-                                tariff_title=tariff.title,
-                            ),
-                            next_retry_at=now_utc,
-                        ),
-                        OutboxTask(
-                            dedup_key=f'subscription_expiration:{sub_id}:notify_expiring',
-                            target_service='notifications',
-                            task_type='subscription_expiration_email',
-                            payment_id=payment.id,
-                            user_id=payment.user_id,
-                            access_version=None,
-                            payload=build_subscription_expiration_email_payload(
-                                subscription_id=sub_id,
-                                user_id=payment.user_id,
-                                ends_at=ends_at,
-                                public_base_url=public_base_url,
-                                tariff_title=tariff.title,
-                            ),
-                            next_retry_at=now_utc,
-                        ),
-                    ]
+                    payment_succeeded_tasks(
+                        payment,
+                        subscription_id=sub_id,
+                        ends_at=ends_at,
+                        access_version=access_version,
+                        tariff_title=tariff.title,
+                        public_base_url=public_base_url,
+                        now_utc=now_utc,
+                    )
                 )
                 await session.commit()
                 return payment, True
@@ -622,8 +531,14 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
         source: ReconcileSource,
         provider_details: dict[str, Any] | None = None,
         public_base_url: str = 'http://localhost',
+        notify_user: bool = True,
     ) -> tuple[Payment, bool]:
-        """Атомарно переводит платёж в failed и ставит письмо (BIL-FR-06, BIL-FR-11)."""
+        """Атомарно переводит платёж в failed и ставит письмо (BIL-FR-06, BIL-FR-11).
+
+        `notify_user=False` — без письма: пользователь сразу получает новый
+        платёж или так и не попал на страницу оплаты (BIL-FR-06). Если новый
+        платёж создать не удалось, письмо досылает `enqueue_payment_failed_email`.
+        """
         now_utc = datetime.now(UTC)
         try:
             async with self._session_factory() as session:
@@ -654,27 +569,67 @@ class SQLAlchemyPaymentRepository(SQLAlchemyRepository):
                     )
                 )
 
-                session.add(
-                    OutboxTask(
-                        dedup_key=f'payment_failed:{payment.id}:notify_failed',
-                        target_service='notifications',
-                        task_type='payment_failed_email',
-                        payment_id=payment.id,
-                        user_id=payment.user_id,
-                        access_version=None,
-                        payload=build_payment_failed_email_payload(
-                            payment_id=payment.id,
-                            user_id=payment.user_id,
+                if notify_user:
+                    session.add(
+                        payment_failed_email_task(
+                            payment,
                             failure_reason=failure_reason,
-                            public_base_url=public_base_url,
                             tariff_title=await self._tariff_title(
                                 session, payment.tariff_id
                             ),
-                        ),
-                        next_retry_at=now_utc,
+                            public_base_url=public_base_url,
+                            now_utc=now_utc,
+                        )
                     )
-                )
                 await session.commit()
                 return payment, True
         except (SQLAlchemyError, OSError) as exc:
             raise DatabaseUnavailableError() from exc
+
+    async def enqueue_payment_failed_email(
+        self,
+        payment_id: UUID,
+        *,
+        public_base_url: str = 'http://localhost',
+    ) -> bool:
+        """Досылает письмо об отказе по уже закрытому платежу (BIL-FR-06).
+
+        Ключ тот же, что у `finalize_payment_failed`, а вставка идёт через
+        `ON CONFLICT DO NOTHING`: второе письмо поставить нельзя. True — задача
+        поставлена этим вызовом.
+        """
+        now_utc = datetime.now(UTC)
+        try:
+            async with self._session_factory() as session:
+                payment = await self._lock_user_and_payment(session, payment_id)
+                if payment.status != 'failed':
+                    return False
+                task = payment_failed_email_task(
+                    payment,
+                    failure_reason=payment.failure_reason or 'canceled_by_provider',
+                    tariff_title=await self._tariff_title(session, payment.tariff_id),
+                    public_base_url=public_base_url,
+                    now_utc=now_utc,
+                )
+                inserted = await session.scalar(
+                    pg_insert(OutboxTask)
+                    .values(
+                        dedup_key=task.dedup_key,
+                        target_service=task.target_service,
+                        task_type=task.task_type,
+                        payment_id=task.payment_id,
+                        user_id=task.user_id,
+                        payload=task.payload,
+                        next_retry_at=now_utc,
+                    )
+                    .on_conflict_do_nothing(index_elements=[OutboxTask.dedup_key])
+                    .returning(OutboxTask.id)
+                )
+                await session.commit()
+                return inserted is not None
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
+
+    async def mark_payment_divergence_signaled(self, payment_id: UUID) -> bool:
+        """Отметка «расхождение с ЮKassa уже в мониторинге» (инв. 7, 6.4)."""
+        return await self._set_marker_once('payment', payment_id, set_divergence_marker)

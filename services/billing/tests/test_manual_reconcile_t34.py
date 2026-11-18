@@ -207,3 +207,167 @@ async def test_manual_reconcile_payment_and_refund_bypass_throttle() -> None:
         )
         assert r_db_503.status_code == 503
         assert r_db_503.json()['error_code'] == 'database_unavailable'
+
+
+def _unchanged_admin_events(
+    repo: InMemoryPurchaseRepository,
+) -> list[tuple[str, object, str | None, str, str]]:
+    return [e[:5] for e in repo.events if e[2] == e[3]]
+
+
+def _seed_check_targets(
+    repo: InMemoryPurchaseRepository,
+) -> tuple[FakePaymentRow, FakeRefundRow]:
+    now_utc = datetime.now(UTC)
+    pay_id = uuid4()
+    payment = FakePaymentRow(
+        id=pay_id,
+        user_id=uuid4(),
+        tariff_id=uuid4(),
+        provider_code='yookassa',
+        amount_kopeks=29900,
+        currency='RUB',
+        status='pending',
+        idempotency_key=pay_id,
+        provider_payment_id='yk_p30_pay',
+        created_at=now_utc - timedelta(minutes=1),
+    )
+    repo.payments[pay_id] = payment
+    paid_id = uuid4()
+    repo.payments[paid_id] = FakePaymentRow(
+        id=paid_id,
+        user_id=uuid4(),
+        tariff_id=uuid4(),
+        provider_code='yookassa',
+        amount_kopeks=29900,
+        currency='RUB',
+        status='succeeded',
+        idempotency_key=paid_id,
+        provider_payment_id='yk_p30_paid',
+    )
+    ref_id = uuid4()
+    refund = FakeRefundRow(
+        id=ref_id,
+        payment_id=paid_id,
+        subscription_id=uuid4(),
+        provider_code='yookassa',
+        amount_kopeks=29900,
+        status='processing',
+        reason='Возврат',
+        admin_user_id=uuid4(),
+        idempotency_key=ref_id,
+        provider_refund_id='yk_p30_ref',
+    )
+    repo.refunds[ref_id] = refund
+    return payment, refund
+
+
+async def test_admin_check_without_status_change_writes_admin_event() -> None:
+    """US-A-06, BIL-FR-13: проверка без смены статуса — запись X -> X от admin."""
+    repo = InMemoryPurchaseRepository()
+    provider = FakeProviderGateway()
+    provider.get_status = 'pending'
+    provider.next_get_refund_status = 'processing'
+    reconciler = PaymentReconciler(
+        payments=repo,
+        refunds=repo,
+        payment_providers=PaymentProviderRegistry.single(provider),
+    )
+    payment, refund = _seed_check_targets(repo)
+
+    await reconciler.reconcile_operation_by_admin('payment', payment.id)
+    await reconciler.reconcile_operation_by_admin('refund', refund.id)
+
+    assert _unchanged_admin_events(repo) == [
+        ('payment', payment.id, 'pending', 'pending', 'admin'),
+        ('refund', refund.id, 'processing', 'processing', 'admin'),
+    ]
+    assert repo.events[0][5] == {'check': 'status_unchanged'}
+
+
+async def test_admin_first_empty_lookup_after_key_expiry_writes_admin_event() -> None:
+    """Розыск по списку ЮKassa — тоже запрос к провайдеру: запись X -> X."""
+    repo = InMemoryPurchaseRepository()
+    provider = FakeProviderGateway()
+    reconciler = PaymentReconciler(
+        payments=repo,
+        refunds=repo,
+        payment_providers=PaymentProviderRegistry.single(provider),
+    )
+    _, refund = _seed_check_targets(repo)
+    refund.provider_refund_id = None
+    refund.created_at = datetime.now(UTC) - timedelta(hours=25)
+
+    await reconciler.reconcile_operation_by_admin('refund', refund.id)
+
+    assert refund.status == 'processing'
+    assert _unchanged_admin_events(repo) == [
+        ('refund', refund.id, 'processing', 'processing', 'admin')
+    ]
+
+
+async def test_checks_without_provider_query_or_not_by_admin_write_no_event() -> None:
+    """Без запроса к ЮKassa или не по кнопке администратора записи X -> X нет."""
+    repo = InMemoryPurchaseRepository()
+    provider = FakeProviderGateway()
+    provider.get_status = 'pending'
+    provider.next_get_refund_status = 'processing'
+    reconciler = PaymentReconciler(
+        payments=repo,
+        refunds=repo,
+        payment_providers=PaymentProviderRegistry.single(provider),
+    )
+    payment, refund = _seed_check_targets(repo)
+
+    # Фоновая сверка, вебхук и /continue пишут журнал только при переходе.
+    await reconciler.reconcile_payment(payment.id, source='reconcile')
+    await reconciler.reconcile_by_provider_operation_id(
+        'yk_p30_ref', provider_code='yookassa'
+    )
+    await reconciler.reconcile_payment_record(
+        payment, source='continue', respect_throttle=False
+    )
+    # Попытка возврата в последний час ключа ждёт розыска без запросов (инв. 14).
+    refund.provider_refund_id = None
+    refund.created_at = datetime.now(UTC) - timedelta(hours=23, minutes=30)
+    await reconciler.reconcile_operation_by_admin('refund', refund.id)
+    # Завершённый платёж кнопка не сверяет (инв. 7).
+    payment.status = 'failed'
+    await reconciler.reconcile_operation_by_admin('payment', payment.id)
+    # Сбой ЮKassa: администратор видит ошибку, записи нет.
+    payment.status = 'pending'
+    provider.get_error = ProviderTransientError('YooKassa 503', status_code=503)
+    with pytest.raises(ProviderTransientError):
+        await reconciler.reconcile_operation_by_admin('payment', payment.id)
+
+    assert _unchanged_admin_events(repo) == []
+
+
+async def test_admin_check_with_permanent_error_after_unknown_post_writes_event() -> (
+    None
+):
+    """Инв. 15, US-A-06: 401 на повтор POST после тайм-аута — статус тот же."""
+    from clients.payment_provider import ProviderPermanentError
+    from repositories.records import POST_OUTCOME_UNKNOWN_KEY
+
+    repo = InMemoryPurchaseRepository()
+    provider = FakeProviderGateway()
+    provider.create_refund_error = ProviderPermanentError(401, 'invalid credentials')
+    reconciler = PaymentReconciler(
+        payments=repo,
+        refunds=repo,
+        payment_providers=PaymentProviderRegistry.single(provider),
+    )
+    _, refund = _seed_check_targets(repo)
+    refund.provider_refund_id = None
+    refund.provider_details = {POST_OUTCOME_UNKNOWN_KEY: True}
+
+    _, status, transitioned = await reconciler.reconcile_operation_by_admin(
+        'refund', refund.id
+    )
+
+    assert (status, transitioned) == ('processing', False)
+    assert len(provider.create_refund_calls) == 1
+    assert _unchanged_admin_events(repo) == [
+        ('refund', refund.id, 'processing', 'processing', 'admin')
+    ]

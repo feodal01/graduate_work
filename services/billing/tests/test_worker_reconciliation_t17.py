@@ -127,7 +127,10 @@ async def test_background_reconcile_recreates_missing_provider_id_within_24h() -
 
 @pytest.mark.asyncio
 async def test_background_reconcile_closes_payment_older_than_24h() -> None:
-    """BIL-FR-05, BIL-FR-06, инв. 13: через 24 часа без номера платёж -> failed."""
+    """BIL-FR-05, BIL-FR-06, инв. 13: через 24 часа без номера платёж -> failed.
+
+    BIL-FR-06: без письма об отказе — пользователь не попадал на страницу оплаты.
+    """
     now = datetime.now(UTC)
     repo = InMemoryPurchaseRepository()
     provider = FakeProviderGateway()
@@ -154,7 +157,7 @@ async def test_background_reconcile_closes_payment_older_than_24h() -> None:
     assert len(provider.get_calls) == 0
     assert repo.payments[expired_payment.id].status == 'failed'
     assert repo.payments[expired_payment.id].failure_reason == 'idempotency_key_expired'
-    assert f'payment_failed:{expired_payment.id}:notify_failed' in repo.outbox_tasks
+    assert f'payment_failed:{expired_payment.id}:notify_failed' not in repo.outbox_tasks
 
 
 @pytest.mark.asyncio

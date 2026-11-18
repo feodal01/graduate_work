@@ -1,11 +1,17 @@
+from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import exists, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from db.sql.errors import DatabaseUnavailableError
+from domain.subscription import ReconcileSource
 from models import (
+    OperationEvent,
     Payment,
     Refund,
     Subscription,
@@ -39,6 +45,50 @@ class SQLAlchemyRepository:
         if title is None:
             raise LookupError(f'Tariff {tariff_id} not found')
         return title
+
+    @staticmethod
+    def _add_unchanged_check_event(
+        session: AsyncSession,
+        operation_type: str,
+        operation_id: UUID,
+        status: str,
+        source: ReconcileSource,
+    ) -> None:
+        """Проверка в ЮKassa без смены статуса тоже видна в истории (US-A-06)."""
+        session.add(
+            OperationEvent(
+                operation_type=operation_type,
+                operation_id=operation_id,
+                from_status=status,
+                to_status=status,
+                source=source,
+                details={'check': 'status_unchanged'},
+            )
+        )
+
+    async def _set_marker_once(
+        self,
+        operation_type: str,
+        operation_id: UUID,
+        setter: Callable[[Any], bool],
+    ) -> bool:
+        """Ставит отметку «сигнал поднят» под блокировкой строки.
+
+        Сигнал остаётся единственным даже при гонке вебхуков или сверок.
+        """
+        try:
+            async with self._session_factory() as session:
+                record: Payment | Refund
+                if operation_type == 'payment':
+                    record = await self._lock_user_and_payment(session, operation_id)
+                else:
+                    record, _ = await self._lock_user_and_refund(session, operation_id)
+                marked = setter(record)
+                if marked:
+                    await session.commit()
+                return marked
+        except (SQLAlchemyError, OSError) as exc:
+            raise DatabaseUnavailableError() from exc
 
     @staticmethod
     async def _acquire_user_lock(session: AsyncSession, user_id: UUID) -> None:

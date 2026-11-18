@@ -211,7 +211,11 @@ async def test_continue_pending_when_canceled_in_yookassa_marks_failed_and_creat
         UUID,
     ],
 ) -> None:
-    """BIL-FR-02, BIL-FR-04, BIL-FR-06: canceled в ЮKassa -> failed + новый платёж."""
+    """BIL-FR-02, BIL-FR-04, BIL-FR-06: canceled в ЮKassa -> failed + новый платёж.
+
+    BIL-FR-06: письма об отказе нет — пользователь в том же запросе ушёл на новую
+    оплату.
+    """
     client, _, repo, provider, _, user_id = continue_test_env
     payment = _seed_payment(repo, user_id=user_id, status='pending')
     provider.get_status = 'failed'
@@ -224,7 +228,10 @@ async def test_continue_pending_when_canceled_in_yookassa_marks_failed_and_creat
     )
     assert repo.payments[payment.id].status == 'failed'
     assert repo.payments[payment.id].failure_reason == 'expired_on_confirmation'
-    assert f'payment_failed:{payment.id}:notify_failed' in repo.outbox_tasks
+    assert f'payment_failed:{payment.id}:notify_failed' not in repo.outbox_tasks
+    assert ('payment', payment.id, 'pending', 'failed', 'continue') in [
+        e[:5] for e in repo.events
+    ]
     assert len(provider.get_calls) == 1
     assert len(provider.create_calls) == 1
     assert len(repo.payments) == 2
@@ -463,6 +470,8 @@ async def test_continue_after_key_expiry_closes_payment_instead_of_stale_post(
     assert resp.status_code == 303
     new_payment = repo.payments[provider.create_calls[-1].payment_id]
     assert resp.headers['location'] == new_payment.confirmation_url
+    # BIL-FR-06: пользователь не попадал на страницу оплаты — письма об отказе нет.
+    assert f'payment_failed:{payment.id}:notify_failed' not in repo.outbox_tasks
 
 
 async def test_user_is_not_sent_to_payment_page_whose_number_was_not_saved(
@@ -573,3 +582,96 @@ async def test_cross_site_continue_form_is_rejected(
     assert resp.status_code == 403
     assert len(repo.payments) == 1
     assert len(provider.create_calls) == 0
+
+
+ContinueEnv = tuple[
+    httpx.AsyncClient,
+    FastAPI,
+    InMemoryPurchaseRepository,
+    FakeProviderGateway,
+    ConfigurableAuthGateway,
+    UUID,
+]
+
+
+def _failed_email_tasks(repo: InMemoryPurchaseRepository, payment_id: UUID) -> int:
+    return sum(
+        1
+        for t in repo.outbox_tasks.values()
+        if t.payment_id == payment_id and t.task_type == 'payment_failed_email'
+    )
+
+
+async def test_continue_queues_old_payment_email_when_no_active_tariff(
+    continue_test_env: ContinueEnv,
+) -> None:
+    """BIL-FR-06: новый платёж создать не удалось — письмо по старому всё же уходит.
+
+    Регрессия: старый платёж закрывался без письма в расчёте на новый платёж,
+    а при отказе в его создании пользователь оставался без платежа и письма.
+    """
+    client, _, repo, provider, _, user_id = continue_test_env
+    payment = _seed_payment(repo, user_id=user_id, status='pending')
+    provider.get_status = 'failed'
+    repo.tariff_active = False
+
+    resp = await client.post(f'/billing/payments/{payment.id}/continue')
+    again = await client.post(f'/billing/payments/{payment.id}/continue')
+
+    assert resp.status_code >= 400 and again.status_code >= 400
+    assert repo.payments[payment.id].status == 'failed'
+    assert len(repo.payments) == 1
+    assert _failed_email_tasks(repo, payment.id) == 1
+
+
+async def test_continue_queues_old_payment_email_when_provider_rejects_new_one(
+    continue_test_env: ContinueEnv,
+) -> None:
+    """Отказ ЮKassa на создание нового платежа: письмо по старому ставится один раз."""
+    from clients.payment_provider import ProviderPermanentError
+
+    client, _, repo, provider, _, user_id = continue_test_env
+    payment = _seed_payment(repo, user_id=user_id, status='pending')
+    provider.get_status = 'failed'
+    provider.create_error = ProviderPermanentError(401, 'Invalid shopId or key')
+
+    resp = await client.post(f'/billing/payments/{payment.id}/continue')
+
+    assert resp.status_code >= 400
+    assert _failed_email_tasks(repo, payment.id) == 1
+    new_ids = [pid for pid in repo.payments if pid != payment.id]
+    assert len(new_ids) == 1
+    # У нового платежа своё письмо об отказе ЮKassa (BIL-FR-06).
+    assert _failed_email_tasks(repo, new_ids[0]) == 1
+
+
+async def test_continue_without_email_when_new_payment_is_created(
+    continue_test_env: ContinueEnv,
+) -> None:
+    """Новый платёж создан в том же запросе — письма по старому нет."""
+    client, _, repo, provider, _, user_id = continue_test_env
+    payment = _seed_payment(repo, user_id=user_id, status='pending')
+    provider.get_status = 'failed'
+
+    resp = await client.post(f'/billing/payments/{payment.id}/continue')
+
+    assert resp.status_code == 303
+    assert len(repo.payments) == 2
+    assert _failed_email_tasks(repo, payment.id) == 0
+
+
+async def test_enqueue_failed_email_is_idempotent_and_only_for_failed() -> None:
+    """Досылка письма: только для «Не оплачен» и не больше одного раза."""
+    repo = InMemoryPurchaseRepository()
+    pending = _seed_payment(repo, user_id=uuid4(), status='pending')
+    assert await repo.enqueue_payment_failed_email(pending.id) is False
+
+    await repo.finalize_payment_failed(
+        pending.id,
+        failure_reason='canceled_by_provider',
+        source='continue',
+        notify_user=False,
+    )
+    assert await repo.enqueue_payment_failed_email(pending.id) is True
+    assert await repo.enqueue_payment_failed_email(pending.id) is False
+    assert _failed_email_tasks(repo, pending.id) == 1

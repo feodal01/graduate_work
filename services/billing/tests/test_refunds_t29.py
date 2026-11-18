@@ -465,8 +465,14 @@ async def test_background_refund_reconcile_24h_metadata_lookup_and_webhook() -> 
     await reconciler.reconcile_due_pending_payments(min_age_seconds=5.0)
     assert repo.refunds[ref_1.id].status == 'processing'
 
-    # 2b. Если возврат не найден в списке (>24ч) -> переводится в rejected (инв. 14)
+    # 2b. Возврат не найден в списке (>24ч): первый пустой розыск лишь
+    #     отмечается, отказ — после второго через интервал (инв. 14)
     provider.find_refund_error = None
+    ref_1.last_checked_at = None
+    await reconciler.reconcile_due_pending_payments(min_age_seconds=5.0)
+    assert repo.refunds[ref_1.id].status == 'processing'
+    marker = (repo.refunds[ref_1.id].provider_details or {})['_lookup_not_found']
+    marker['last_at'] = (now_utc - timedelta(minutes=6)).isoformat()
     ref_1.last_checked_at = None
     await reconciler.reconcile_due_pending_payments(min_age_seconds=5.0)
     assert repo.refunds[ref_1.id].status == 'rejected'
